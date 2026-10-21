@@ -77,3 +77,7 @@ For older Claude Code without `claude agents`, hooks can report the same states 
   }
 }
 ```
+
+## Trademarks
+
+lemen is an independent project, not affiliated with or endorsed by Anthropic. Claude, Claude Code and the Claude logo are trademarks of Anthropic.
