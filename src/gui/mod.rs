@@ -10,18 +10,19 @@ mod terminal_view;
 use crate::actions;
 use crate::attach::Active;
 use crate::config::{Config, ThemeChoice};
-use crate::snapshot::{self, Session, Snapshot};
+use crate::snapshot::{self, Activity, Session, Snapshot};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, IconName, Sizable, StyledExt, Theme, ThemeMode, h_flex, v_flex,
 };
 use gpui_kit::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use terminal_view::TerminalView;
 
@@ -64,6 +65,10 @@ struct Muxbox {
     confirm_kill: Option<Key>,
     /// A session being renamed keeps its terminal while its old name disappears.
     renaming: Option<Key>,
+    /// Sessions whose Claude was working at the last refresh.
+    working: HashSet<Key>,
+    /// Sessions that finished while you were looking at another one.
+    done: HashSet<Key>,
     status: Option<(String, bool)>,
     _refresh: Task<()>,
     _appearance: Option<Subscription>,
@@ -159,6 +164,8 @@ impl Muxbox {
             prompt: None,
             confirm_kill: None,
             renaming: None,
+            working: HashSet::new(),
+            done: HashSet::new(),
             status: None,
             _refresh: refresh,
             _appearance: appearance,
@@ -179,6 +186,24 @@ impl Muxbox {
         {
             self.active = None;
         }
+        // Working -> idle while you're elsewhere means "done, unseen".
+        let activity: HashMap<Key, Activity> = sessions(&snap)
+            .map(|(h, s)| ((h.to_string(), s.name.clone()), s.activity))
+            .collect();
+        let working: HashSet<Key> = activity
+            .iter()
+            .filter(|(_, a)| **a == Activity::Working)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in self.working.difference(&working) {
+            let finished = matches!(activity.get(k), Some(Activity::Idle | Activity::Unknown));
+            if finished && self.active.as_ref() != Some(k) {
+                self.done.insert(k.clone());
+            }
+        }
+        self.done
+            .retain(|k| live.contains(k) && !working.contains(k));
+        self.working = working;
         self.snap = snap;
         self.loaded = true;
         cx.notify();
@@ -208,6 +233,7 @@ impl Muxbox {
         if view.read(cx).exited() {
             view.update(cx, |v, cx| v.connect(cx));
         }
+        self.done.remove(&key);
         self.active = Some(key);
         self.confirm_kill = None;
         let _ = Active { host, session }.save();
@@ -502,10 +528,22 @@ impl Muxbox {
         let active = self.active.as_ref() == Some(&key);
         let arming = self.confirm_kill.as_ref() == Some(&key);
         let label = s.name.strip_prefix(prefix).unwrap_or(&s.name).to_string();
-        let dot = match s.state.as_deref() {
-            Some("working") => cx.theme().success,
-            Some("needs_input") => cx.theme().warning,
-            _ => cx.theme().muted_foreground.opacity(0.5),
+        let working = s.activity == Activity::Working;
+        let (dot, tip): (Hsla, SharedString) = match s.activity {
+            Activity::NeedsInput => (
+                cx.theme().warning,
+                match &s.waiting_for {
+                    Some(what) => format!("Needs input: {what}").into(),
+                    None => "Needs input".into(),
+                },
+            ),
+            Activity::Working => (cx.theme().success, "Working".into()),
+            _ if self.done.contains(&key) => (cx.theme().info, "Done".into()),
+            Activity::Idle => (cx.theme().muted_foreground.opacity(0.5), "Idle".into()),
+            Activity::Unknown => (
+                cx.theme().muted_foreground.opacity(0.5),
+                "No Claude found".into(),
+            ),
         };
         let detail = age(s.idle_secs);
         let muted = cx.theme().muted_foreground;
@@ -545,6 +583,7 @@ impl Muxbox {
         let suffix = move |_: &mut Window, _: &mut App| {
             let this = this.clone();
             let key = key.clone();
+            let status = status_dot(&key, dot, working, tip.clone());
             let kill = Button::new("kill")
                 .ghost()
                 .xsmall()
@@ -562,7 +601,7 @@ impl Muxbox {
                 .gap_1()
                 .items_center()
                 .child(div().text_xs().text_color(muted).child(detail.clone()))
-                .child(div().size_2().rounded_full().bg(dot))
+                .child(status)
                 .child(kill)
         };
         SidebarMenuItem::new(label)
@@ -701,6 +740,29 @@ fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
     })
 }
 
+/// A session's status dot; it breathes while Claude works.
+fn status_dot(key: &Key, color: Hsla, working: bool, tip: SharedString) -> AnyElement {
+    let id = SharedString::from(format!("status-{}-{}", key.0, key.1));
+    let dot = div()
+        .id(id.clone())
+        .size_2()
+        .rounded_full()
+        .bg(color)
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
+    if working {
+        dot.with_animation(
+            id,
+            Animation::new(Duration::from_millis(1600))
+                .repeat()
+                .with_easing(pulsating_between(0.35, 1.0)),
+            |dot, delta| dot.opacity(delta),
+        )
+        .into_any_element()
+    } else {
+        dot.into_any_element()
+    }
+}
+
 fn age(secs: u64) -> String {
     match secs {
         0..60 => "now".into(),
@@ -774,5 +836,78 @@ mod tests {
             large.cols > small.cols && large.lines > small.lines,
             "{small:?} -> {large:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
+    use super::{Key, Muxbox};
+    use crate::config::Config;
+    use crate::snapshot::{Activity, HostView, Session, Snapshot};
+
+    fn snapshot(sessions: &[(&str, Activity)]) -> Snapshot {
+        let other = sessions
+            .iter()
+            .map(|(name, activity)| Session {
+                name: name.to_string(),
+                path: "/tmp".into(),
+                attached: false,
+                idle_secs: 0,
+                state: None,
+                activity: *activity,
+                waiting_for: None,
+            })
+            .collect();
+        Snapshot {
+            hosts: vec![HostView {
+                name: "local".into(),
+                error: None,
+                bases: vec![],
+                other,
+            }],
+        }
+    }
+
+    #[gpui::test]
+    fn a_session_that_finishes_elsewhere_is_marked_done(cx: &mut gpui::TestAppContext) {
+        // No hosts, so the background refresh has nothing to fetch.
+        let cfg: Config = toml::from_str("").unwrap();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| Muxbox::new(cfg, window, cx));
+        let key = |s: &str| -> Key { ("local".into(), s.into()) };
+        app.update(cx, |app, cx| {
+            app.active = Some(key("shown"));
+            app.set_snapshot(
+                snapshot(&[
+                    ("shown", Activity::Working),
+                    ("elsewhere", Activity::Working),
+                    ("asking", Activity::Working),
+                ]),
+                cx,
+            );
+            assert!(app.done.is_empty());
+            app.set_snapshot(
+                snapshot(&[
+                    ("shown", Activity::Idle),
+                    ("elsewhere", Activity::Idle),
+                    ("asking", Activity::NeedsInput),
+                ]),
+                cx,
+            );
+            assert!(app.working.is_empty(), "{:?}", app.working);
+            assert!(app.done.contains(&key("elsewhere")), "{:?}", app.done);
+            assert!(
+                !app.done.contains(&key("shown")),
+                "the shown session isn't news"
+            );
+            assert!(
+                !app.done.contains(&key("asking")),
+                "waiting on you isn't done"
+            );
+            // Working again clears it.
+            app.set_snapshot(snapshot(&[("elsewhere", Activity::Working)]), cx);
+            assert!(app.done.is_empty(), "{:?}", app.done);
+        });
     }
 }

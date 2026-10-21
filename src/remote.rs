@@ -31,10 +31,14 @@ impl<'a> Remote<'a> {
     }
 
     /// The `tmux` command for this host, as shell words.
+    ///
+    /// `-u` makes tmux use UTF-8 even when the locale doesn't say so (apps
+    /// started outside a shell, minimal remote locales); otherwise it prints
+    /// non-ASCII text, like Claude's status glyphs, as `_`.
     pub fn tmux(&self) -> String {
         match &self.host.tmux_socket {
-            Some(s) => format!("tmux -L {}", quote(s)),
-            None => "tmux".into(),
+            Some(s) => format!("tmux -u -L {}", quote(s)),
+            None => "tmux -u".into(),
         }
     }
 

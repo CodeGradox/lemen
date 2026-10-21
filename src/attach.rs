@@ -8,13 +8,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// argv for a terminal attached to `session` on `host`.
-///
-/// `-u` makes tmux send UTF-8 even when the locale doesn't say so, which is
-/// common for apps started outside a shell.
 pub fn attach_argv(host: &Host, session: &str) -> Vec<String> {
     let r = Remote::new(host);
     r.interactive(&format!(
-        "unset TMUX; exec {} -u attach -t ={}",
+        "unset TMUX; exec {} attach -t ={}",
         r.tmux(),
         quote(session)
     ))

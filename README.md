@@ -52,7 +52,16 @@ CLI: `muxbox ls`, `muxbox new <base> <name> [--worktree <path>]`, `muxbox attach
 
 ### Status dots
 
-The sidebar shows working / needs input / idle from a `@muxbox_state` tmux option. Set it with Claude Code hooks in `~/.claude/settings.json` on the host:
+Each session's dot comes from Claude Code itself: every refresh runs `claude agents --json` on the host, which lists each running Claude with its process and status, and muxbox matches the process to its tmux session. No setup needed; it needs Claude Code 2.1.139 or later (when `claude agents` arrived), on `PATH` or in `~/.local/bin`.
+
+- **Green, breathing:** Claude is working.
+- **Yellow:** Claude needs input (a question or permission prompt); hover the dot for what it's asking.
+- **Blue:** it finished while you were looking at another session; opening it clears that.
+- **Grey:** idle, or no Claude running.
+
+The refresh runs every 3 seconds, so a turn shorter than that can go unnoticed.
+
+For older Claude Code without `claude agents`, hooks can report the same states through a `@muxbox_state` tmux option. Put this in `~/.claude/settings.json` on the host:
 
 ```json
 {

@@ -160,7 +160,12 @@ fn print_tree(cfg: &Config, snap: &snapshot::Snapshot) {
 }
 
 fn print_session(s: &snapshot::Session, indent: &str) {
-    let state = s.state.as_deref().unwrap_or("-");
+    let state = match s.activity {
+        snapshot::Activity::NeedsInput => "needs input",
+        snapshot::Activity::Working => "working",
+        snapshot::Activity::Idle => "idle",
+        snapshot::Activity::Unknown => "-",
+    };
     let attached = if s.attached { ", attached" } else { "" };
     println!(
         "{indent}{}  ({state}, idle {}s{attached})",

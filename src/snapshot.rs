@@ -1,7 +1,10 @@
-//! One round trip per host: worktrees of every base plus all tmux sessions.
+//! One round trip per host: worktrees of every base, all tmux sessions, and
+//! what Claude is doing in each.
 
 use crate::config::{Config, Host};
 use crate::remote::{Remote, quote, sh_path};
+use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -42,12 +45,28 @@ pub struct Session {
     pub idle_secs: u64,
     /// Set by Claude Code hooks through the `@muxbox_state` tmux option.
     pub state: Option<String>,
+    /// What Claude in this session is doing.
+    pub activity: Activity,
+    /// What Claude is waiting on, when it needs input.
+    pub waiting_for: Option<String>,
+}
+
+/// Ordered by urgency, so a session with several Claudes shows the most
+/// pressing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Activity {
+    /// No Claude found in the session.
+    Unknown,
+    Idle,
+    Working,
+    NeedsInput,
 }
 
 /// tmux prints control characters such as tabs as `_`, and session names
 /// can't contain `:`, so fields are split on a printable marker instead.
 const SEP: &str = "|::|";
 const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{@muxbox_state}|::|#{@muxbox_worktree}";
+const PANES: &str = "#{session_name}|::|#{pane_pid}";
 
 pub fn fetch(cfg: &Config) -> Snapshot {
     Snapshot {
@@ -82,10 +101,15 @@ fn script(cfg: &Config, host: &Host, remote: &Remote) -> String {
         );
     }
     s += &format!(
-        "echo '@@now'\ndate +%s\necho '@@tmux'\n{} list-sessions -F {} 2>/dev/null || true\n",
-        remote.tmux(),
-        quote(FIELDS)
+        "echo '@@now'\ndate +%s\necho '@@tmux'\n{tmux} list-sessions -F {} 2>/dev/null || true\necho '@@panes'\n{tmux} list-panes -a -F {} 2>/dev/null || true\n",
+        quote(FIELDS),
+        quote(PANES),
+        tmux = remote.tmux(),
     );
+    // Claude Code lists every running session with its pid and status; the
+    // process tree ties each one to the tmux pane it runs in. A
+    // non-interactive shell may not have ~/.local/bin on PATH.
+    s += "echo '@@ps'\nps -A -o pid= -o ppid=\necho '@@agents'\nfor c in claude \"$HOME/.local/bin/claude\"; do if command -v \"$c\" >/dev/null 2>&1; then \"$c\" agents --json 2>/dev/null; break; fi; done\n";
     s
 }
 
@@ -93,6 +117,9 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
     let mut bases: Vec<BaseView> = vec![];
     let mut sessions: Vec<Session> = vec![];
     let mut now = 0u64;
+    let mut panes: HashMap<u32, String> = HashMap::new();
+    let mut parents: HashMap<u32, u32> = HashMap::new();
+    let mut agents = String::new();
     let mut section = "";
     for line in out.lines() {
         if let Some(i) = line.strip_prefix("@@base ") {
@@ -113,12 +140,48 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
         match line {
             "@@now" => section = "now",
             "@@tmux" => section = "tmux",
+            "@@panes" => section = "panes",
+            "@@ps" => section = "ps",
+            "@@agents" => section = "agents",
             _ => match section {
                 "base" => parse_worktree_line(bases.last_mut().expect("base section"), line),
                 "now" => now = line.trim().parse().unwrap_or(0),
                 "tmux" => sessions.extend(parse_session(line, now)),
+                "panes" => {
+                    if let Some((name, pid)) = line.split_once(SEP)
+                        && let Ok(pid) = pid.trim().parse()
+                    {
+                        panes.insert(pid, name.to_string());
+                    }
+                }
+                "ps" => {
+                    let mut f = line.split_whitespace().map(str::parse::<u32>);
+                    if let (Some(Ok(pid)), Some(Ok(ppid))) = (f.next(), f.next()) {
+                        parents.insert(pid, ppid);
+                    }
+                }
+                "agents" => {
+                    agents.push_str(line);
+                    agents.push('\n');
+                }
                 _ => {}
             },
+        }
+    }
+
+    let claude = claude_activity(&agents, &panes, &parents);
+    for s in &mut sessions {
+        if let Some((activity, waiting_for)) = claude.get(&s.name) {
+            s.activity = *activity;
+            s.waiting_for = waiting_for.clone();
+        } else {
+            // Without `claude agents`, fall back to what hooks reported.
+            s.activity = match s.state.as_deref() {
+                Some("needs_input") => Activity::NeedsInput,
+                Some("working") => Activity::Working,
+                Some("idle") => Activity::Idle,
+                _ => Activity::Unknown,
+            };
         }
     }
 
@@ -169,7 +232,61 @@ fn parse_session(line: &str, now: u64) -> Option<Session> {
         attached: f[2] != "0",
         idle_secs: now.saturating_sub(activity),
         state: (!f[4].is_empty()).then(|| f[4].to_string()),
+        activity: Activity::Unknown,
+        waiting_for: None,
     })
+}
+
+#[derive(Deserialize)]
+struct Agent {
+    kind: Option<String>,
+    pid: Option<u32>,
+    status: Option<String>,
+    #[serde(rename = "waitingFor")]
+    waiting_for: Option<serde_json::Value>,
+}
+
+/// Maps `claude agents --json` output to tmux sessions: each interactive
+/// Claude's pid is walked up the process tree to the pane it runs in.
+fn claude_activity(
+    agents: &str,
+    panes: &HashMap<u32, String>,
+    parents: &HashMap<u32, u32>,
+) -> HashMap<String, (Activity, Option<String>)> {
+    let agents: Vec<Agent> = serde_json::from_str(agents.trim()).unwrap_or_default();
+    let mut found: HashMap<String, (Activity, Option<String>)> = HashMap::new();
+    for agent in agents {
+        let (Some("interactive"), Some(pid)) = (agent.kind.as_deref(), agent.pid) else {
+            continue;
+        };
+        let activity = match agent.status.as_deref() {
+            Some("busy") => Activity::Working,
+            Some("waiting") => Activity::NeedsInput,
+            Some("idle") => Activity::Idle,
+            _ => continue,
+        };
+        let waiting_for = agent.waiting_for.map(|v| match v {
+            serde_json::Value::String(s) => s,
+            other => other.to_string(),
+        });
+        let mut p = pid;
+        for _ in 0..32 {
+            if let Some(session) = panes.get(&p) {
+                let entry = found
+                    .entry(session.clone())
+                    .or_insert((Activity::Unknown, None));
+                if activity > entry.0 {
+                    *entry = (activity, waiting_for);
+                }
+                break;
+            }
+            match parents.get(&p) {
+                Some(&parent) if parent > 1 => p = parent,
+                _ => break,
+            }
+        }
+    }
+    found
 }
 
 /// The worktree containing `path`, preferring the deepest match: linked
@@ -215,7 +332,15 @@ mod tests {
             @@now\n1000\n@@tmux\n\
             api/auth|::|/home/agent/projects/api|::|1|::|990|::|needs_input|::|/home/agent/projects/api/.claude/worktrees/auth\n\
             api/tests|::|/home/agent/projects/api|::|0|::|400|::||::|\n\
-            scratch|::|/tmp|::|0|::|1000|::||::|\n";
+            scratch|::|/tmp|::|0|::|1000|::||::|\n\
+            @@panes\napi/auth|::|90\napi/tests|::|100\nscratch|::|110\n\
+            @@ps\n  90     1\n 100     1\n 110     1\n 200   100\n 250   100\n 300   250\n 400     1\n\
+            @@agents\n[\n\
+              {\"kind\":\"interactive\",\"pid\":200,\"status\":\"busy\"},\n\
+              {\"kind\":\"interactive\",\"pid\":300,\"status\":\"waiting\",\"waitingFor\":\"Allow Bash(rm -rf build)?\"},\n\
+              {\"kind\":\"interactive\",\"pid\":400,\"status\":\"busy\"},\n\
+              {\"kind\":\"background\",\"state\":\"working\"}\n\
+            ]\n";
         let h = parse(&cfg, &cfg.hosts[0], out);
         let wts = &h.bases[0].worktrees;
         assert_eq!(wts.len(), 2);
@@ -233,6 +358,17 @@ mod tests {
         assert_eq!(wts[1].sessions[0].idle_secs, 10);
         assert!(wts[1].sessions[0].attached);
         assert_eq!(h.other[0].name, "scratch");
+        // Two Claudes in one session: the one waiting (two levels below the
+        // pane's shell) outranks the busy one.
+        let tests = &wts[0].sessions[0];
+        assert_eq!(tests.activity, Activity::NeedsInput);
+        assert_eq!(
+            tests.waiting_for.as_deref(),
+            Some("Allow Bash(rm -rf build)?")
+        );
+        // No Claude found: hooks state, else unknown. pid 400 is in no pane.
+        assert_eq!(wts[1].sessions[0].activity, Activity::NeedsInput);
+        assert_eq!(h.other[0].activity, Activity::Unknown);
     }
 
     #[test]
