@@ -119,27 +119,62 @@ impl Drop for Pty {
     }
 }
 
-// A dark palette. Programs can override any entry with OSC 4/10/11.
-const ANSI: [Rgb; 16] = [
-    rgb(0x282c34),
-    rgb(0xe06c75),
-    rgb(0x98c379),
-    rgb(0xe5c07b),
-    rgb(0x61afef),
-    rgb(0xc678dd),
-    rgb(0x56b6c2),
-    rgb(0xabb2bf),
-    rgb(0x5c6370),
-    rgb(0xef7b85),
-    rgb(0xa5d68a),
-    rgb(0xf0cd8a),
-    rgb(0x74bdf7),
-    rgb(0xd38be8),
-    rgb(0x67c9d6),
-    rgb(0xe6e6e6),
-];
-pub const FOREGROUND: Rgb = rgb(0xd4d4d4);
-pub const BACKGROUND: Rgb = rgb(0x1e1e1e);
+/// Terminal colors for one appearance. Programs can override any entry
+/// with OSC 4/10/11.
+pub struct Palette {
+    ansi: [Rgb; 16],
+    pub foreground: Rgb,
+    pub background: Rgb,
+    cursor: Rgb,
+}
+
+pub const DARK: Palette = Palette {
+    ansi: [
+        rgb(0x282c34),
+        rgb(0xe06c75),
+        rgb(0x98c379),
+        rgb(0xe5c07b),
+        rgb(0x61afef),
+        rgb(0xc678dd),
+        rgb(0x56b6c2),
+        rgb(0xabb2bf),
+        rgb(0x5c6370),
+        rgb(0xef7b85),
+        rgb(0xa5d68a),
+        rgb(0xf0cd8a),
+        rgb(0x74bdf7),
+        rgb(0xd38be8),
+        rgb(0x67c9d6),
+        rgb(0xe6e6e6),
+    ],
+    foreground: rgb(0xd4d4d4),
+    background: rgb(0x1e1e1e),
+    cursor: rgb(0xd4d4d4),
+};
+
+pub const LIGHT: Palette = Palette {
+    ansi: [
+        rgb(0x383a42),
+        rgb(0xe45649),
+        rgb(0x50a14f),
+        rgb(0xc18401),
+        rgb(0x4078f2),
+        rgb(0xa626a4),
+        rgb(0x0184bc),
+        rgb(0xa0a1a7),
+        rgb(0x696c77),
+        rgb(0xca1243),
+        rgb(0x3d8f3c),
+        rgb(0x986801),
+        rgb(0x2a63d9),
+        rgb(0x8a1d8a),
+        rgb(0x0f7493),
+        rgb(0xd4d4d4),
+    ],
+    foreground: rgb(0x383a42),
+    background: rgb(0xfafafa),
+    cursor: rgb(0x526fff),
+};
 
 const fn rgb(hex: u32) -> Rgb {
     Rgb {
@@ -149,49 +184,60 @@ const fn rgb(hex: u32) -> Rgb {
     }
 }
 
-fn dim(c: Rgb) -> Rgb {
-    Rgb {
-        r: (c.r as u16 * 2 / 3) as u8,
-        g: (c.g as u16 * 2 / 3) as u8,
-        b: (c.b as u16 * 2 / 3) as u8,
+impl Palette {
+    pub fn for_appearance(dark: bool) -> &'static Palette {
+        if dark { &DARK } else { &LIGHT }
     }
-}
 
-/// Resolves a cell color: program overrides first, then the palette.
-pub fn resolve(color: Color, colors: &Colors) -> Rgb {
-    match color {
-        Color::Spec(rgb) => rgb,
-        Color::Named(n) => indexed(n as usize, colors),
-        Color::Indexed(i) => indexed(i as usize, colors),
+    /// Faint text: a third of the way toward the background, so it works on
+    /// light and dark alike.
+    pub fn dim(&self, c: Rgb) -> Rgb {
+        let mix = |a: u8, b: u8| ((a as u16 * 2 + b as u16) / 3) as u8;
+        let bg = self.background;
+        Rgb {
+            r: mix(c.r, bg.r),
+            g: mix(c.g, bg.g),
+            b: mix(c.b, bg.b),
+        }
     }
-}
 
-pub fn indexed(i: usize, colors: &Colors) -> Rgb {
-    colors[i].unwrap_or_else(|| palette(i))
-}
+    /// Resolves a cell color: program overrides first, then the palette.
+    pub fn resolve(&self, color: Color, colors: &Colors) -> Rgb {
+        match color {
+            Color::Spec(rgb) => rgb,
+            Color::Named(n) => self.indexed(n as usize, colors),
+            Color::Indexed(i) => self.indexed(i as usize, colors),
+        }
+    }
 
-/// xterm's 256 colors, then alacritty's named slots (foreground = 256, ...).
-fn palette(i: usize) -> Rgb {
-    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-    match i {
-        0..16 => ANSI[i],
-        16..232 => {
-            let i = i - 16;
-            Rgb {
-                r: LEVELS[i / 36],
-                g: LEVELS[(i / 6) % 6],
-                b: LEVELS[i % 6],
+    pub fn indexed(&self, i: usize, colors: &Colors) -> Rgb {
+        colors[i].unwrap_or_else(|| self.slot(i))
+    }
+
+    /// xterm's 256 colors, then alacritty's named slots (foreground = 256, ...).
+    fn slot(&self, i: usize) -> Rgb {
+        const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        match i {
+            0..16 => self.ansi[i],
+            16..232 => {
+                let i = i - 16;
+                Rgb {
+                    r: LEVELS[i / 36],
+                    g: LEVELS[(i / 6) % 6],
+                    b: LEVELS[i % 6],
+                }
             }
+            232..=255 => {
+                let v = 8 + 10 * (i - 232) as u8;
+                Rgb { r: v, g: v, b: v }
+            }
+            257 => self.background,
+            258 => self.cursor,
+            259..=266 => self.dim(self.ansi[i - 259]),
+            268 => self.dim(self.foreground),
+            // Foreground (256) and bright foreground (267).
+            _ => self.foreground,
         }
-        232..=255 => {
-            let v = 8 + 10 * (i - 232) as u8;
-            Rgb { r: v, g: v, b: v }
-        }
-        257 => BACKGROUND,
-        259..=266 => dim(ANSI[i - 259]),
-        268 => dim(FOREGROUND),
-        // Foreground (256), cursor (258) and bright foreground (267).
-        _ => FOREGROUND,
     }
 }
 
@@ -204,12 +250,13 @@ mod tests {
     #[test]
     fn palette_covers_the_xterm_ranges() {
         let colors = Colors::default();
+        let p = &DARK;
         assert_eq!(
-            resolve(Color::Indexed(16), &colors),
+            p.resolve(Color::Indexed(16), &colors),
             Rgb { r: 0, g: 0, b: 0 }
         );
         assert_eq!(
-            resolve(Color::Indexed(231), &colors),
+            p.resolve(Color::Indexed(231), &colors),
             Rgb {
                 r: 255,
                 g: 255,
@@ -217,14 +264,29 @@ mod tests {
             }
         );
         assert_eq!(
-            resolve(Color::Indexed(232), &colors),
+            p.resolve(Color::Indexed(232), &colors),
             Rgb { r: 8, g: 8, b: 8 }
         );
         assert_eq!(
-            resolve(Color::Named(NamedColor::Background), &colors),
-            BACKGROUND
+            p.resolve(Color::Named(NamedColor::Background), &colors),
+            DARK.background
         );
-        assert_eq!(resolve(Color::Named(NamedColor::Red), &colors), ANSI[1]);
+        assert_eq!(
+            p.resolve(Color::Named(NamedColor::Red), &colors),
+            DARK.ansi[1]
+        );
+    }
+
+    #[test]
+    fn light_palette_and_dimming() {
+        let colors = Colors::default();
+        assert_eq!(
+            Palette::for_appearance(false).resolve(Color::Named(NamedColor::Background), &colors),
+            LIGHT.background
+        );
+        // Dimming moves toward the background in both appearances.
+        assert!(LIGHT.dim(rgb(0x000000)).r > 0);
+        assert!(DARK.dim(rgb(0xffffff)).r < 255);
     }
 
     fn screen_text(pty: &Pty) -> String {
@@ -271,5 +333,42 @@ mod tests {
         assert!(wait_for("hello"), "output: {:?}", screen_text(&pty));
         pty.write(b"abc\r".as_slice());
         assert!(wait_for("got abc"), "output: {:?}", screen_text(&pty));
+    }
+
+    #[test]
+    fn a_running_program_sees_resizes() {
+        let size = Size {
+            cols: 40,
+            lines: 5,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        // Prints its size at start and on every SIGWINCH.
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            "trap 'stty size' WINCH; stty size; while :; do sleep 0.05; done",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (mut pty, _events) = Pty::spawn(&argv, size).unwrap();
+        let wait_for = |pty: &Pty, needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if screen_text(pty).contains(needle) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        assert!(wait_for(&pty, "5 40"), "output: {:?}", screen_text(&pty));
+        pty.resize(Size {
+            cols: 60,
+            lines: 8,
+            ..size
+        });
+        assert!(wait_for(&pty, "8 60"), "output: {:?}", screen_text(&pty));
     }
 }

@@ -16,6 +16,44 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+const ADJECTIVES: &[&str] = &[
+    "amber", "bold", "brave", "bright", "calm", "clever", "cosmic", "crisp", "daring", "eager",
+    "gentle", "glad", "golden", "happy", "hidden", "jolly", "keen", "kind", "lively", "lucky",
+    "merry", "mighty", "misty", "nimble", "noble", "plucky", "proud", "quiet", "rapid", "rustic",
+    "shiny", "silent", "silver", "snowy", "sunny", "swift", "tidy", "witty", "wild", "zesty",
+];
+
+const NOUNS: &[&str] = &[
+    "badger", "beaver", "bison", "cedar", "comet", "crane", "falcon", "fern", "finch", "fjord",
+    "fox", "glacier", "harbor", "heron", "lynx", "maple", "meadow", "moose", "nebula", "orca",
+    "otter", "owl", "panda", "pebble", "pine", "puffin", "quasar", "raven", "reef", "river",
+    "robin", "salmon", "spruce", "summit", "thistle", "tiger", "walrus", "willow", "wren", "yak",
+];
+
+/// A random `adjective-noun` name, like `calm-heron`, that `taken` accepts.
+pub fn random_name(taken: impl Fn(&str) -> bool) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut name = String::new();
+    for attempt in 0..100 {
+        // A fresh RandomState hashes nothing into a random u64.
+        let n = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish() as usize;
+        name = format!(
+            "{}-{}",
+            ADJECTIVES[n % ADJECTIVES.len()],
+            NOUNS[(n >> 32) % NOUNS.len()]
+        );
+        if attempt >= 50 {
+            name = format!("{name}-{}", n % 100);
+        }
+        if !taken(&name) {
+            break;
+        }
+    }
+    name
+}
+
 /// Starts Claude in a new worktree of `base`. Returns (host, session).
 pub fn new_worktree_thread(cfg: &Config, base: usize, name: &str) -> Result<(String, String)> {
     validate_name(name)?;
@@ -91,6 +129,34 @@ pub fn kill_session(cfg: &Config, host: &str, session: &str) -> Result<()> {
     let r = Remote::new(cfg.host_or_err(host)?);
     r.run(&format!("{} kill-session -t ={}", r.tmux(), quote(session)))?;
     Ok(())
+}
+
+/// The session name for a thread renamed to `name`. The `base/` prefix
+/// stays, so the thread stays under its base.
+pub fn renamed(session: &str, name: &str) -> String {
+    match session.rsplit_once('/') {
+        Some((prefix, _)) => format!("{prefix}/{name}"),
+        None => name.to_string(),
+    }
+}
+
+/// Renames a thread (its tmux session); returns the new session name.
+/// Claude keeps running and attached clients stay attached.
+pub fn rename_session(cfg: &Config, host: &str, session: &str, name: &str) -> Result<String> {
+    validate_name(name)?;
+    let r = Remote::new(cfg.host_or_err(host)?);
+    let tmux = r.tmux();
+    let new = renamed(session, name);
+    if new == session {
+        return Ok(new);
+    }
+    let s = quote(&new);
+    r.run(&format!(
+        "set -e\n{}\n{tmux} rename-session -t ={} {s}\n",
+        refuse_existing(&tmux, &s, &new),
+        quote(session),
+    ))?;
+    Ok(new)
 }
 
 /// Copies files into the host's upload dir; returns their remote paths.
@@ -175,5 +241,23 @@ mod tests {
         assert!(validate_name("").is_err());
         assert!(validate_name("a b").is_err());
         assert!(validate_name("x;rm").is_err());
+    }
+
+    #[test]
+    fn renaming_keeps_the_base_prefix() {
+        assert_eq!(renamed("api/calm-heron", "auth-ui"), "api/auth-ui");
+        assert_eq!(renamed("scratch", "notes"), "notes");
+    }
+
+    #[test]
+    fn random_names_are_valid_and_avoid_taken_ones() {
+        for _ in 0..200 {
+            let name = random_name(|n| n.starts_with('a'));
+            assert!(validate_name(&name).is_ok(), "{name}");
+            assert!(!name.starts_with('a'), "{name}");
+        }
+        let names: std::collections::HashSet<String> =
+            (0..50).map(|_| random_name(|_| false)).collect();
+        assert!(names.len() > 25, "names barely vary: {names:?}");
     }
 }

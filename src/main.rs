@@ -37,6 +37,12 @@ enum Cmd {
     },
     /// Attach this terminal to a session
     Attach { host: String, session: String },
+    /// Rename a thread; its base prefix stays
+    Rename {
+        host: String,
+        session: String,
+        name: String,
+    },
     /// Upload files and paste their remote paths into the active session
     Upload {
         #[arg(required = true)]
@@ -82,6 +88,15 @@ fn main() -> Result<()> {
         Cmd::Attach { host, session } => {
             let h = cfg.host_or_err(&host)?;
             attach::attach_here(h, &session)
+        }
+        Cmd::Rename {
+            host,
+            session,
+            name,
+        } => {
+            let new = actions::rename_session(&cfg, &host, &session, &name)?;
+            println!("renamed {session} to {new}");
+            Ok(())
         }
         Cmd::Upload {
             files,

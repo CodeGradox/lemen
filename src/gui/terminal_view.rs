@@ -2,7 +2,7 @@
 //! Dropped or pasted images go to the host first; the session gets the path.
 
 use super::keys::{self, Key};
-use super::terminal::{self, Pty, Size};
+use super::terminal::{Palette, Pty, Size};
 use crate::actions;
 use crate::attach::attach_argv;
 use crate::config::Host;
@@ -12,6 +12,7 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor, Rgb};
 use futures::StreamExt;
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::cell::Cell;
@@ -72,6 +73,11 @@ impl TerminalView {
         view
     }
 
+    #[cfg(test)]
+    pub fn pty_size(&self) -> Option<Size> {
+        self.pty.as_ref().map(|p| p.size())
+    }
+
     pub fn exited(&self) -> bool {
         self.pty.is_none()
     }
@@ -112,7 +118,8 @@ impl TerminalView {
                 cx.write_to_clipboard(ClipboardItem::new_string(text))
             }
             TermEvent::ColorRequest(index, format) => {
-                let color = terminal::indexed(index, pty.term.lock().colors());
+                let palette = Palette::for_appearance(cx.theme().is_dark());
+                let color = palette.indexed(index, pty.term.lock().colors());
                 pty.write(format(color).into_bytes());
             }
             TermEvent::TextAreaSizeRequest(format) => {
@@ -385,11 +392,11 @@ struct Frame {
 }
 
 /// Snapshots the grid under the lock so painting doesn't block the reader.
-fn snapshot(pty: &Pty) -> Frame {
+fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
     let term = pty.term.lock();
     let content = term.renderable_content();
     let colors = content.colors;
-    let default_bg = terminal::indexed(NamedColor::Background as usize, colors);
+    let default_bg = palette.indexed(NamedColor::Background as usize, colors);
     let offset = content.display_offset as i32;
     let mut rows: Vec<Row> = (0..term.screen_lines())
         .map(|_| Row {
@@ -407,14 +414,10 @@ fn snapshot(pty: &Pty) -> Frame {
             continue;
         };
         let flags = cell.flags;
-        let mut fg = terminal::resolve(cell.fg, colors);
-        let mut bg = terminal::resolve(cell.bg, colors);
+        let mut fg = palette.resolve(cell.fg, colors);
+        let mut bg = palette.resolve(cell.bg, colors);
         if flags.contains(Flags::DIM) {
-            fg = Rgb {
-                r: fg.r / 3 * 2,
-                g: fg.g / 3 * 2,
-                b: fg.b / 3 * 2,
-            };
+            fg = palette.dim(fg);
         }
         if flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
@@ -478,7 +481,7 @@ fn snapshot(pty: &Pty) -> Frame {
         && content.cursor.shape != CursorShape::Hidden)
         .then(|| {
             let line = usize::try_from(content.cursor.point.line.0 + offset).ok()?;
-            let color = hsla(terminal::indexed(NamedColor::Cursor as usize, colors));
+            let color = hsla(palette.indexed(NamedColor::Cursor as usize, colors));
             Some((
                 content.cursor.point.column.0,
                 line,
@@ -558,7 +561,8 @@ impl Render for TerminalView {
         let focused = self.focus.is_focused(window);
         let view = cx.entity().downgrade();
         let bounds_cell = self.bounds.clone();
-        let frame = self.pty.as_ref().map(snapshot);
+        let palette = Palette::for_appearance(cx.theme().is_dark());
+        let frame = self.pty.as_ref().map(|pty| snapshot(pty, palette));
         let grid = canvas(
             move |bounds, _, cx| {
                 bounds_cell.set(bounds);
@@ -590,7 +594,7 @@ impl Render for TerminalView {
             .track_focus(&self.focus)
             .relative()
             .size_full()
-            .bg(hsla(terminal::BACKGROUND))
+            .bg(hsla(palette.background))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -609,11 +613,82 @@ impl Render for TerminalView {
                         .px_2()
                         .py_1()
                         .rounded_md()
-                        .bg(hsla(terminal::FOREGROUND).opacity(0.15))
-                        .text_color(hsla(terminal::FOREGROUND))
+                        .bg(hsla(palette.foreground).opacity(0.15))
+                        .text_color(hsla(palette.foreground))
                         .text_sm()
                         .child(status),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
+    use super::TerminalView;
+    use crate::config::Host;
+    use gpui_kit::{px, size};
+    use std::process::Command;
+
+    fn tmux(socket: &str, args: &[&str]) -> String {
+        let out = Command::new("tmux")
+            .arg("-L")
+            .arg(socket)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A real `tmux attach` in a headless window: resizing the window must
+    /// resize the PTY, and tmux must see the new size.
+    #[gpui::test]
+    fn the_terminal_follows_the_window_size(cx: &mut gpui::TestAppContext) {
+        let socket = format!("muxbox-unit-{}", std::process::id());
+        tmux(&socket, &["new-session", "-d", "-s", "t", "sleep 600"]);
+        let host = Host {
+            name: "local".into(),
+            ssh: "local".into(),
+            upload_dir: "/tmp".into(),
+            tmux_socket: Some(socket.clone()),
+            claude: "claude".into(),
+        };
+        // The PTY reader is a real thread, so this test can't be deterministic.
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
+        let pty_size = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |v, _| v.pty.as_ref().map(|p| p.size()))
+        };
+
+        cx.simulate_resize(size(px(600.0), px(400.0)));
+        cx.run_until_parked();
+        let small = pty_size(cx).expect("attached");
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        let large = pty_size(cx).expect("attached");
+
+        // tmux runs in real time; give it a moment to see the new size.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut client = String::new();
+        while std::time::Instant::now() < deadline {
+            client = tmux(
+                &socket,
+                &["list-clients", "-F", "#{client_width}x#{client_height}"],
+            );
+            if client == format!("{}x{}", large.cols, large.lines) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // kill-server leaves the socket file behind.
+        let path = tmux(&socket, &["display-message", "-p", "#{socket_path}"]);
+        tmux(&socket, &["kill-server"]);
+        let _ = std::fs::remove_file(path);
+        assert!(
+            large.cols > small.cols && large.lines > small.lines,
+            "{small:?} -> {large:?}"
+        );
+        assert_eq!(client, format!("{}x{}", large.cols, large.lines));
     }
 }

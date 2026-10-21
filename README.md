@@ -15,6 +15,8 @@ Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `g
 `~/.config/muxbox/config.toml` (or `$MUXBOX_CONFIG`):
 
 ```toml
+# theme = "system"                # or "light" / "dark"; must come before the tables
+
 [[hosts]]
 name = "agent"
 ssh = "agent"                     # user@host or a ~/.ssh/config alias; "local" runs here
@@ -36,8 +38,9 @@ With the default `worktree_dir`, new worktree threads run `claude -w <name>` and
 Run `muxbox`. The sidebar lists each base's worktrees and their sessions; it refreshes every 3 s.
 
 - Click a session to show it. Each opened session keeps its own terminal, so switching is instant. muxbox reopens the last session on launch.
-- **New worktree** starts a thread in a new worktree; **+** on a worktree starts another thread in it. Name it in the field that appears in the header.
+- **New worktree** starts a thread in a new worktree; **+** on a worktree starts another thread in it. The field that appears in the header suggests a free random name like `calm-heron`: press Enter to take it, or type your own.
 - **×** on a session, clicked twice, kills it. The worktree stays.
+- Double-click a session, or right-click → **Rename…**, to rename it. Only the thread's tmux name changes; Claude keeps running and its worktree and branch keep their names.
 - `⌘B` or the header button collapses the sidebar. `⌘Q` quits; sessions keep running.
 - A terminal whose connection dropped (laptop slept) says so; click it to reconnect.
 
@@ -45,7 +48,7 @@ Run `muxbox`. The sidebar lists each base's worktrees and their sessions; it ref
 
 **Scrolling and selection** belong to tmux: `set -g mouse on` on the host lets you scroll with the wheel and select with the mouse. tmux sends copied text to the terminal (OSC 52), and muxbox puts it on your Mac clipboard.
 
-CLI: `muxbox ls`, `muxbox new <base> <name> [--worktree <path>]`, `muxbox attach <host> <session>`, `muxbox upload <files>...`, `muxbox paste` (clipboard image to the last session muxbox showed).
+CLI: `muxbox ls`, `muxbox new <base> <name> [--worktree <path>]`, `muxbox attach <host> <session>`, `muxbox rename <host> <session> <name>`, `muxbox upload <files>...`, `muxbox paste` (clipboard image to the last session muxbox showed).
 
 ### Status dots
 

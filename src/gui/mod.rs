@@ -9,10 +9,11 @@ mod terminal_view;
 
 use crate::actions;
 use crate::attach::Active;
-use crate::config::Config;
+use crate::config::{Config, ThemeChoice};
 use crate::snapshot::{self, Session, Snapshot};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
@@ -30,13 +31,24 @@ const REFRESH: Duration = Duration::from_secs(3);
 
 type Key = (String, String);
 
-enum NewThread {
-    Worktree { base: usize },
-    InWorktree { base: usize, worktree: String },
+/// What the name field in the header is asking for.
+enum Ask {
+    NewWorktree { base: usize },
+    NewThread { base: usize, worktree: String },
+    Rename { host: String, session: String },
+}
+
+enum Done {
+    Started(Key),
+    Renamed {
+        host: String,
+        old: String,
+        new: String,
+    },
 }
 
 struct Prompt {
-    what: NewThread,
+    what: Ask,
     input: Entity<InputState>,
     _events: Subscription,
 }
@@ -50,8 +62,11 @@ struct Muxbox {
     collapsed: bool,
     prompt: Option<Prompt>,
     confirm_kill: Option<Key>,
+    /// A session being renamed keeps its terminal while its old name disappears.
+    renaming: Option<Key>,
     status: Option<(String, bool)>,
     _refresh: Task<()>,
+    _appearance: Option<Subscription>,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -59,7 +74,11 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            Theme::change(ThemeMode::Dark, None, cx);
+            match cfg.theme {
+                ThemeChoice::System => Theme::sync_system_appearance(None, cx),
+                ThemeChoice::Light => Theme::change(ThemeMode::Light, None, cx),
+                ThemeChoice::Dark => Theme::change(ThemeMode::Dark, None, cx),
+            }
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
@@ -124,6 +143,12 @@ impl Muxbox {
                 cx.background_executor().timer(REFRESH).await;
             }
         });
+        // Follow macOS when it switches between light and dark.
+        let appearance = (cfg.theme == ThemeChoice::System).then(|| {
+            cx.observe_window_appearance(window, |_, window, cx| {
+                Theme::sync_system_appearance(Some(window), cx);
+            })
+        });
         Muxbox {
             cfg,
             snap: Snapshot::default(),
@@ -133,8 +158,10 @@ impl Muxbox {
             collapsed: false,
             prompt: None,
             confirm_kill: None,
+            renaming: None,
             status: None,
             _refresh: refresh,
+            _appearance: appearance,
         }
     }
 
@@ -143,8 +170,13 @@ impl Muxbox {
         let live: Vec<Key> = sessions(&snap)
             .map(|(h, s)| (h.to_string(), s.name.clone()))
             .collect();
-        self.terminals.retain(|k, _| live.contains(k));
-        if self.active.as_ref().is_some_and(|a| !live.contains(a)) {
+        self.terminals
+            .retain(|k, _| live.contains(k) || self.renaming.as_ref() == Some(k));
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|a| !live.contains(a) && self.renaming.as_ref() != Some(a))
+        {
             self.active = None;
         }
         self.snap = snap;
@@ -183,14 +215,31 @@ impl Muxbox {
         cx.notify();
     }
 
-    fn ask_name(&mut self, what: NewThread, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("name, e.g. auth-ui"));
+    /// Opens the name field, selected so typing replaces it. New threads get
+    /// a free random name; a rename starts from the current one.
+    fn ask_name(&mut self, what: Ask, window: &mut Window, cx: &mut Context<Self>) {
+        let name = match &what {
+            Ask::NewWorktree { base } | Ask::NewThread { base, .. } => {
+                actions::random_name(|n| self.name_taken(*base, n))
+            }
+            Ask::Rename { session, .. } => {
+                session.rsplit('/').next().unwrap_or(session).to_string()
+            }
+        };
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("name")
+                .default_value(name)
+        });
         let events = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = event {
-                this.start_thread(window, cx);
+                this.submit(window, cx);
             }
         });
-        input.update(cx, |i, cx| i.focus(window, cx));
+        input.update(cx, |i, cx| {
+            i.focus(window, cx);
+            i.select_all(window, cx);
+        });
         self.prompt = Some(Prompt {
             what,
             input,
@@ -199,7 +248,23 @@ impl Muxbox {
         cx.notify();
     }
 
-    fn start_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Whether a thread or worktree called `name` already exists in `base`.
+    fn name_taken(&self, base: usize, name: &str) -> bool {
+        let b = &self.cfg.bases[base];
+        let session = format!("{}/{name}", b.name());
+        let in_tmux = sessions(&self.snap).any(|(h, s)| h == b.host && s.name == session);
+        let as_worktree = self
+            .snap
+            .hosts
+            .iter()
+            .flat_map(|h| h.bases.iter())
+            .filter(|v| v.index == base)
+            .flat_map(|v| v.worktrees.iter())
+            .any(|w| w.path.rsplit('/').next() == Some(name));
+        in_tmux || as_worktree
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(prompt) = &self.prompt else { return };
         let name = prompt.input.read(cx).value().trim().to_string();
         if let Err(e) = actions::validate_name(&name) {
@@ -207,22 +272,38 @@ impl Muxbox {
             cx.notify();
             return;
         }
-        let Some(prompt) = self.prompt.take() else {
+        let Some(Prompt { what, .. }) = self.prompt.take() else {
             return;
         };
         let cfg = self.cfg.clone();
-        self.status = Some((format!("starting {name}…"), false));
+        let doing = match &what {
+            Ask::Rename { host, session } => {
+                self.renaming = Some((host.clone(), session.clone()));
+                "renaming"
+            }
+            _ => "starting",
+        };
+        self.status = Some((format!("{doing} {name}…"), false));
         cx.notify();
         let window_handle = window.window_handle();
         cx.spawn(async move |this, cx| {
-            let started = cx
+            let done = cx
                 .background_spawn(async move {
-                    match prompt.what {
-                        NewThread::Worktree { base } => {
-                            actions::new_worktree_thread(&cfg, base, &name)
+                    match what {
+                        Ask::NewWorktree { base } => {
+                            actions::new_worktree_thread(&cfg, base, &name).map(Done::Started)
                         }
-                        NewThread::InWorktree { base, worktree } => {
-                            actions::new_thread_in(&cfg, base, &worktree, &name)
+                        Ask::NewThread { base, worktree } => {
+                            actions::new_thread_in(&cfg, base, &worktree, &name).map(Done::Started)
+                        }
+                        Ask::Rename { host, session } => {
+                            actions::rename_session(&cfg, &host, &session, &name).map(|new| {
+                                Done::Renamed {
+                                    host,
+                                    old: session,
+                                    new,
+                                }
+                            })
                         }
                     }
                 })
@@ -230,10 +311,15 @@ impl Muxbox {
             window_handle
                 .update(cx, |_, window, cx| {
                     this.update(cx, |this, cx| {
-                        match started {
-                            Ok((host, session)) => {
+                        this.renaming = None;
+                        match done {
+                            Ok(Done::Started((host, session))) => {
                                 this.status = None;
                                 this.open(host, session, window, cx);
+                            }
+                            Ok(Done::Renamed { host, old, new }) => {
+                                this.status = None;
+                                this.follow_rename(host, old, new, cx);
                             }
                             Err(e) => this.status = Some((format!("{e:#}"), true)),
                         }
@@ -243,6 +329,22 @@ impl Muxbox {
                 .ok();
         })
         .detach();
+    }
+
+    /// Moves the open terminal and the selection to a renamed session.
+    fn follow_rename(&mut self, host: String, old: String, new: String, cx: &mut Context<Self>) {
+        let old_key = (host.clone(), old);
+        let new_key = (host.clone(), new.clone());
+        if let Some(view) = self.terminals.remove(&old_key) {
+            // Reconnects attach by name, so the view must learn the new one.
+            view.update(cx, |v, _| v.session = new.clone());
+            self.terminals.insert(new_key.clone(), view);
+        }
+        if self.active.as_ref() == Some(&old_key) {
+            self.active = Some(new_key);
+            let _ = Active { host, session: new }.save();
+        }
+        cx.notify();
     }
 
     /// First click arms, second click kills; the worktree stays.
@@ -297,7 +399,7 @@ impl Muxbox {
                             let this = this.clone();
                             move |_, window, cx| {
                                 this.update(cx, |this, cx| {
-                                    this.ask_name(NewThread::Worktree { base: index }, window, cx)
+                                    this.ask_name(Ask::NewWorktree { base: index }, window, cx)
                                 })
                                 .ok();
                             }
@@ -328,7 +430,7 @@ impl Muxbox {
                                 .xsmall()
                                 .tooltip("New thread here")
                                 .on_click(move |_, window, cx| {
-                                    let what = NewThread::InWorktree {
+                                    let what = Ask::NewThread {
                                         base: index,
                                         worktree: worktree.clone(),
                                     };
@@ -407,13 +509,37 @@ impl Muxbox {
         };
         let detail = age(s.idle_secs);
         let muted = cx.theme().muted_foreground;
+        // Click opens; a double click (its second click) starts a rename.
         let open = {
             let this = this.clone();
             let key = key.clone();
-            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            move |event: &ClickEvent, window: &mut Window, cx: &mut App| {
                 let (host, session) = key.clone();
-                this.update(cx, |this, cx| this.open(host, session, window, cx))
-                    .ok();
+                this.update(cx, |this, cx| {
+                    if event.click_count() >= 2 {
+                        this.ask_name(Ask::Rename { host, session }, window, cx);
+                    } else {
+                        this.open(host, session, window, cx);
+                    }
+                })
+                .ok();
+            }
+        };
+        let menu = {
+            let this = this.clone();
+            let key = key.clone();
+            move |menu: PopupMenu, _: &mut Window, _: &mut App| {
+                let this = this.clone();
+                let key = key.clone();
+                menu.item(
+                    PopupMenuItem::new("Rename…").on_click(move |_, window, cx| {
+                        let (host, session) = key.clone();
+                        this.update(cx, |this, cx| {
+                            this.ask_name(Ask::Rename { host, session }, window, cx)
+                        })
+                        .ok();
+                    }),
+                )
             }
         };
         let suffix = move |_: &mut Window, _: &mut App| {
@@ -423,6 +549,8 @@ impl Muxbox {
                 .ghost()
                 .xsmall()
                 .on_click(move |_, _, cx| {
+                    // Otherwise the row opens the session too, which disarms the kill.
+                    cx.stop_propagation();
                     this.update(cx, |this, cx| this.kill(key.clone(), cx)).ok();
                 });
             let kill = if arming {
@@ -441,6 +569,7 @@ impl Muxbox {
             .icon(IconName::SquareTerminal)
             .active(active)
             .on_click(open)
+            .context_menu(menu)
             .suffix(suffix)
     }
 
@@ -482,15 +611,16 @@ impl Muxbox {
             );
         if let Some(prompt) = &self.prompt {
             let what = match &prompt.what {
-                NewThread::Worktree { base } => {
+                Ask::NewWorktree { base } => {
                     format!("New worktree in {}", self.cfg.bases[*base].name())
                 }
-                NewThread::InWorktree { worktree, .. } => {
+                Ask::NewThread { worktree, .. } => {
                     format!(
                         "New thread in {}",
                         worktree.rsplit('/').next().unwrap_or(worktree)
                     )
                 }
+                Ask::Rename { session, .. } => format!("Rename {session}"),
             };
             bar = bar
                 .child(div().flex_1())
@@ -577,5 +707,72 @@ fn age(secs: u64) -> String {
         60..3600 => format!("{}m", secs / 60),
         3600..86400 => format!("{}h", secs / 3600),
         _ => format!("{}d", secs / 86400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
+    use super::{Muxbox, TerminalView};
+    use crate::config::Config;
+    use gpui_kit::{AppContext, px, size};
+    use std::process::Command;
+
+    fn tmux(socket: &str, args: &[&str]) -> String {
+        let out = Command::new("tmux")
+            .arg("-L")
+            .arg(socket)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The whole window: sidebar, header and the active terminal. Resizing
+    /// the window must resize the terminal inside it.
+    #[gpui::test]
+    fn the_active_terminal_follows_the_window_size(cx: &mut gpui::TestAppContext) {
+        let socket = format!("muxbox-unit-app-{}", std::process::id());
+        tmux(&socket, &["new-session", "-d", "-s", "t", "sleep 600"]);
+        let cfg: Config = toml::from_str(&format!(
+            "[[hosts]]\nname = \"local\"\nssh = \"local\"\ntmux_socket = \"{socket}\"\n"
+        ))
+        .unwrap();
+        let host = cfg.hosts[0].clone();
+        // The PTY reader is a real thread, so this test can't be deterministic.
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        // Wrapped in Root exactly as gpui_kit::open_window does.
+        let mut app = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| Muxbox::new(cfg, window, cx));
+            app = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        // Show the session without `open`, which would remember it in ~/.muxbox.
+        let view = app.update(cx, |app, cx| {
+            let view = cx.new(|cx| TerminalView::new(host, "t".into(), cx));
+            let key = ("local".to_string(), "t".to_string());
+            app.terminals.insert(key.clone(), view.clone());
+            app.active = Some(key);
+            cx.notify();
+            view
+        });
+
+        cx.simulate_resize(size(px(900.0), px(600.0)));
+        cx.run_until_parked();
+        let small = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        cx.simulate_resize(size(px(1400.0), px(900.0)));
+        cx.run_until_parked();
+        let large = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        // kill-server leaves the socket file behind.
+        let path = tmux(&socket, &["display-message", "-p", "#{socket_path}"]);
+        tmux(&socket, &["kill-server"]);
+        let _ = std::fs::remove_file(path);
+        assert!(
+            large.cols > small.cols && large.lines > small.lines,
+            "{small:?} -> {large:?}"
+        );
     }
 }

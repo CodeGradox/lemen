@@ -9,9 +9,21 @@ pub const CLAUDE_WORKTREES: &str = ".claude/worktrees";
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub theme: ThemeChoice,
+    #[serde(default)]
     pub hosts: Vec<Host>,
     #[serde(default)]
     pub bases: Vec<Base>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    /// Follow macOS light/dark.
+    #[default]
+    System,
+    Light,
+    Dark,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,4 +126,18 @@ pub fn home() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_defaults_to_system() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.theme, ThemeChoice::System);
+        let cfg: Config = toml::from_str("theme = \"light\"").unwrap();
+        assert_eq!(cfg.theme, ThemeChoice::Light);
+        assert!(toml::from_str::<Config>("theme = \"blue\"").is_err());
+    }
 }

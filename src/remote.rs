@@ -108,8 +108,13 @@ impl<'a> Remote<'a> {
         if self.is_local() {
             return vec!["sh".into(), "-c".into(), script.into()];
         }
-        let mut argv: Vec<String> = vec!["ssh".into()];
-        argv.extend(SSH_OPTS.iter().map(|s| s.to_string()));
+        // Its own connection rather than the shared one: window resizes have
+        // to reach the remote tmux, and through the shared connection they
+        // didn't.
+        let mut argv: Vec<String> = ["ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         argv.push("-t".into());
         argv.push(self.host.ssh.clone());
         argv.push(format!("sh -c {}", quote(script)));
@@ -147,5 +152,19 @@ mod tests {
         assert_eq!(sh_path("~/code/api"), "\"$HOME\"/'code/api'");
         assert_eq!(sh_path("/srv/api"), "'/srv/api'");
         assert_eq!(sh_path(".claude/worktrees"), "'.claude/worktrees'");
+    }
+
+    #[test]
+    fn terminals_get_their_own_connection() {
+        let host = Host {
+            name: "agent".into(),
+            ssh: "agent".into(),
+            upload_dir: "~/.muxbox/uploads".into(),
+            tmux_socket: None,
+            claude: "claude".into(),
+        };
+        let argv = Remote::new(&host).interactive("tmux attach");
+        assert!(argv.contains(&"ControlPath=none".to_string()), "{argv:?}");
+        assert!(argv.contains(&"-t".to_string()), "{argv:?}");
     }
 }
