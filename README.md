@@ -1,6 +1,6 @@
 # muxbox
 
-A sidebar for Claude Code sessions that live in tmux on a remote host. It runs in a WezTerm split; the other split shows the selected session (`ssh -t host tmux attach`). Sessions keep running when your laptop sleeps.
+A macOS app for Claude Code sessions that live in tmux on a remote host: a sidebar of sessions next to a built-in terminal (`ssh -t host tmux attach`). Sessions keep running when your laptop sleeps.
 
 ## Install
 
@@ -8,7 +8,7 @@ A sidebar for Claude Code sessions that live in tmux on a remote host. It runs i
 cargo install --path .   # puts muxbox in ~/.cargo/bin
 ```
 
-Needs `tmux` and `git` on the host, WezTerm locally.
+Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `git`.
 
 ## Config
 
@@ -33,37 +33,19 @@ With the default `worktree_dir`, new worktree threads run `claude -w <name>` and
 
 ## Use
 
-Run `muxbox` in a WezTerm pane.
+Run `muxbox`. The sidebar lists each base's worktrees and their sessions; it refreshes every 3 s.
 
-| Key | Does |
-| --- | --- |
-| `j` / `k` | Move |
-| `Enter` | Show the session in the Claude pane |
-| `n` | New thread in a new worktree of the selected base |
-| `t` | New thread in the selected worktree |
-| `x` | Kill the session (the worktree stays) |
-| `Tab` | Focus the Claude pane |
-| `r` | Refresh now (it also refreshes every 3 s) |
-| `q` | Quit (closes the Claude pane; sessions keep running) |
+- Click a session to show it. Each opened session keeps its own terminal, so switching is instant. muxbox reopens the last session on launch.
+- **New worktree** starts a thread in a new worktree; **+** on a worktree starts another thread in it. Name it in the field that appears in the header.
+- **×** on a session, clicked twice, kills it. The worktree stays.
+- `⌘B` or the header button collapses the sidebar. `⌘Q` quits; sessions keep running.
+- A terminal whose connection dropped (laptop slept) says so; click it to reconnect.
 
-Drop files on the sidebar to upload them and paste their remote paths into the session in the Claude pane. Outside WezTerm, `Enter` attaches in the same terminal until you detach.
+**Images:** drop files on the terminal, or `⌘V` with an image or copied files on the clipboard. muxbox uploads them to the host's `upload_dir` and pastes the remote paths. Text pastes as text.
 
-CLI: `muxbox ls`, `muxbox new <base> <name> [--worktree <path>]`, `muxbox attach <host> <session>`, `muxbox upload <files>...`, `muxbox paste`.
+**Scrolling and selection** belong to tmux: `set -g mouse on` on the host lets you scroll with the wheel and select with the mouse. tmux sends copied text to the terminal (OSC 52), and muxbox puts it on your Mac clipboard.
 
-### Paste images with a key
-
-`muxbox paste` uploads the clipboard image to the session muxbox is showing. Bind it in `~/.wezterm.lua`:
-
-```lua
-config.keys = {
-  { key = 'V', mods = 'CMD|SHIFT',
-    action = wezterm.action_callback(function(window, pane)
-      -- full path: WezTerm's PATH may not include ~/.cargo/bin
-      local ok, out, err = wezterm.run_child_process({ os.getenv('HOME') .. '/.cargo/bin/muxbox', 'paste' })
-      window:toast_notification('muxbox', ok and out or err, nil, 3000)
-    end) },
-}
-```
+CLI: `muxbox ls`, `muxbox new <base> <name> [--worktree <path>]`, `muxbox attach <host> <session>`, `muxbox upload <files>...`, `muxbox paste` (clipboard image to the last session muxbox showed).
 
 ### Status dots
 

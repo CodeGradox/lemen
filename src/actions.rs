@@ -1,6 +1,6 @@
+use crate::attach::Active;
 use crate::config::{CLAUDE_WORKTREES, Config, Host};
 use crate::remote::{Remote, quote, sh_path};
-use crate::viewer::Active;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -147,8 +147,8 @@ pub fn upload_and_type(
     Ok(paths)
 }
 
-/// The session to send uploads to: explicit flags, else what the muxbox
-/// Claude pane shows right now, else the last session it showed.
+/// The session to send uploads to: explicit flags, else the session muxbox
+/// showed last.
 pub fn resolve_target(
     cfg: &Config,
     host: Option<String>,
@@ -161,23 +161,8 @@ pub fn resolve_target(
     let active = Active::load()
         .context("no active session: open one in muxbox, or pass --host and --session")?;
     let host = host.unwrap_or(active.host);
-    if let Some(s) = session {
-        return Ok((host, s));
-    }
-    let h = cfg.host_or_err(&host)?;
-    if let Some(v) = &active.viewer {
-        let r = Remote::new(h);
-        let script = format!(
-            "t=$(cat \"$HOME/.muxbox/viewers/{v}\" 2>/dev/null) && {} display-message -c \"$t\" -p '#{{client_session}}' 2>/dev/null || true",
-            r.tmux()
-        );
-        if let Ok(out) = r.run(&script)
-            && !out.trim().is_empty()
-        {
-            return Ok((host, out.trim().to_string()));
-        }
-    }
-    Ok((host, active.session))
+    cfg.host_or_err(&host)?;
+    Ok((host, session.unwrap_or(active.session)))
 }
 
 #[cfg(test)]

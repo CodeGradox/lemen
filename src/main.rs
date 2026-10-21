@@ -1,10 +1,10 @@
 mod actions;
+mod attach;
 mod clip;
 mod config;
+mod gui;
 mod remote;
 mod snapshot;
-mod ui;
-mod viewer;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -21,8 +21,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Open the sidebar (the default)
-    Ui,
+    /// Open the window (the default)
+    Gui,
     /// Print hosts, bases, worktrees and sessions
     Ls,
     /// Start a thread in a new worktree, or in an existing one with --worktree
@@ -58,8 +58,8 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load()?;
-    match cli.cmd.unwrap_or(Cmd::Ui) {
-        Cmd::Ui => ui::run(cfg),
+    match cli.cmd.unwrap_or(Cmd::Gui) {
+        Cmd::Gui => gui::run(cfg),
         Cmd::Ls => {
             print_tree(&cfg, &snapshot::fetch(&cfg));
             Ok(())
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
         }
         Cmd::Attach { host, session } => {
             let h = cfg.host_or_err(&host)?;
-            viewer::attach_here(h, &session)
+            attach::attach_here(h, &session)
         }
         Cmd::Upload {
             files,

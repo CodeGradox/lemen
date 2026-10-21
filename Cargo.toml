@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+alacritty_terminal = "0.26.0"
 anyhow = "1.0.104"
 arboard = "3.7.0"
 clap = { version = "4.6.7", features = ["derive"] }
+futures = "0.3"
+gpui-kit = "0.8.0"
 png = "0.18.1"
-ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
