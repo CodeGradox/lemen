@@ -5,6 +5,8 @@ mod config;
 mod gui;
 mod remote;
 mod snapshot;
+#[cfg(test)]
+mod test_support;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -29,11 +31,15 @@ enum Cmd {
     New {
         /// Base name (last path component unless set in the config)
         base: String,
-        /// Thread name; also the worktree name for new worktrees
+        /// Label for the thread (shown in the sidebar; several threads can
+        /// share one); also the worktree name for new worktrees
         name: String,
         /// Path of an existing worktree to start in
         #[arg(long)]
         worktree: Option<String>,
+        /// Start just a shell instead of Claude (in an existing worktree)
+        #[arg(long, requires = "worktree")]
+        shell: bool,
     },
     /// Attach this terminal to a session
     Attach { host: String, session: String },
@@ -74,13 +80,16 @@ fn main() -> Result<()> {
             base,
             name,
             worktree,
+            shell,
         } => {
             let b = cfg
                 .base_by_name(&base)
                 .with_context(|| format!("unknown base {base}"))?;
+            actions::validate_name(&name)?;
+            let thread = actions::unique_thread(&name, |_| false);
             let (host, session) = match worktree {
-                Some(w) => actions::new_thread_in(&cfg, b, &w, &name)?,
-                None => actions::new_worktree_thread(&cfg, b, &name)?,
+                Some(w) => actions::new_thread_in(&cfg, b, &w, &thread, shell)?,
+                None => actions::new_worktree_thread(&cfg, b, &name, &thread)?,
             };
             println!("started {session} on {host}");
             Ok(())

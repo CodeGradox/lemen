@@ -244,8 +244,26 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::wait_until;
     use alacritty_terminal::vte::ansi::NamedColor;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+
+    const SIZE: Size = Size {
+        cols: 40,
+        lines: 5,
+        cell_width: 8,
+        cell_height: 16,
+    };
+
+    /// Starts `sh -c script` in a PTY.
+    fn spawn(script: &str) -> Pty {
+        let argv: Vec<String> = ["sh", "-c", script].iter().map(|s| s.to_string()).collect();
+        Pty::spawn(&argv, SIZE).unwrap().0
+    }
+
+    fn shows(pty: &Pty, needle: &str) -> bool {
+        wait_until(Duration::from_secs(5), || screen_text(pty).contains(needle))
+    }
 
     #[test]
     fn palette_covers_the_xterm_ranges() {
@@ -305,70 +323,22 @@ mod tests {
 
     #[test]
     fn spawned_output_reaches_the_grid_and_input_reaches_the_program() {
-        let size = Size {
-            cols: 40,
-            lines: 5,
-            cell_width: 8,
-            cell_height: 16,
-        };
-        let argv: Vec<String> = [
-            "sh",
-            "-c",
-            "printf 'hello\\n'; read x; printf 'got %s' \"$x\"; sleep 5",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let (pty, _events) = Pty::spawn(&argv, size).unwrap();
-        let wait_for = |needle: &str| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if screen_text(&pty).contains(needle) {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            false
-        };
-        assert!(wait_for("hello"), "output: {:?}", screen_text(&pty));
+        let pty = spawn("printf 'hello\\n'; read x; printf 'got %s' \"$x\"; sleep 5");
+        assert!(shows(&pty, "hello"), "output: {:?}", screen_text(&pty));
         pty.write(b"abc\r".as_slice());
-        assert!(wait_for("got abc"), "output: {:?}", screen_text(&pty));
+        assert!(shows(&pty, "got abc"), "output: {:?}", screen_text(&pty));
     }
 
     #[test]
     fn a_running_program_sees_resizes() {
-        let size = Size {
-            cols: 40,
-            lines: 5,
-            cell_width: 8,
-            cell_height: 16,
-        };
         // Prints its size at start and on every SIGWINCH.
-        let argv: Vec<String> = [
-            "sh",
-            "-c",
-            "trap 'stty size' WINCH; stty size; while :; do sleep 0.05; done",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let (mut pty, _events) = Pty::spawn(&argv, size).unwrap();
-        let wait_for = |pty: &Pty, needle: &str| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if screen_text(pty).contains(needle) {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            false
-        };
-        assert!(wait_for(&pty, "5 40"), "output: {:?}", screen_text(&pty));
+        let mut pty = spawn("trap 'stty size' WINCH; stty size; while :; do sleep 0.05; done");
+        assert!(shows(&pty, "5 40"), "output: {:?}", screen_text(&pty));
         pty.resize(Size {
             cols: 60,
             lines: 8,
-            ..size
+            ..SIZE
         });
-        assert!(wait_for(&pty, "8 60"), "output: {:?}", screen_text(&pty));
+        assert!(shows(&pty, "8 60"), "output: {:?}", screen_text(&pty));
     }
 }

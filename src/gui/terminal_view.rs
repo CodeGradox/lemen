@@ -15,18 +15,12 @@ use futures::StreamExt;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use std::cell::Cell;
 use std::path::PathBuf;
-use std::rc::Rc;
 
 /// Key context for terminal-only key bindings.
 pub const CONTEXT: &str = "Terminal";
 const FONT_FAMILY: &str = "Menlo";
 const FONT_SIZE: f32 = 13.0;
-
-pub enum TerminalEvent {
-    Exited,
-}
 
 pub struct TerminalView {
     pub host: Host,
@@ -34,15 +28,15 @@ pub struct TerminalView {
     pty: Option<Pty>,
     focus: FocusHandle,
     /// Where the grid was last painted, for mapping mouse positions to cells.
-    bounds: Rc<Cell<Bounds<Pixels>>>,
+    bounds: Bounds<Pixels>,
     cell: Size,
+    /// Cell width and line height of the terminal font, measured once.
+    metrics: Option<(Pixels, Pixels)>,
     mouse_cell: Option<(usize, usize)>,
     scroll_lines: f32,
     status: Option<String>,
     _reader: Option<Task<()>>,
 }
-
-impl EventEmitter<TerminalEvent> for TerminalView {}
 
 impl Focusable for TerminalView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -57,13 +51,14 @@ impl TerminalView {
             session,
             pty: None,
             focus: cx.focus_handle(),
-            bounds: Rc::new(Cell::new(Bounds::default())),
+            bounds: Bounds::default(),
             cell: Size {
                 cols: 80,
                 lines: 24,
                 cell_width: 8,
                 cell_height: 16,
             },
+            metrics: None,
             mouse_cell: None,
             scroll_lines: 0.0,
             status: None,
@@ -129,7 +124,6 @@ impl TerminalView {
                 self.pty = None;
                 self._reader = None;
                 self.status = Some("disconnected · click to reconnect".into());
-                cx.emit(TerminalEvent::Exited);
                 cx.notify();
             }
             _ => {}
@@ -172,12 +166,16 @@ impl TerminalView {
             ctrl: m.control,
             alt: m.alt,
             shift: m.shift,
-            cmd: m.platform,
         };
-        if let Some(bytes) = keys::encode(&key, self.mode().contains(TermMode::APP_CURSOR)) {
-            if let Some(pty) = &self.pty {
-                pty.term.lock().scroll_display(Scroll::Bottom);
+        let mut term = self.pty.as_ref().map(|p| p.term.lock());
+        let app_cursor = term
+            .as_ref()
+            .is_some_and(|t| t.mode().contains(TermMode::APP_CURSOR));
+        if let Some(bytes) = keys::encode(&key, app_cursor) {
+            if let Some(term) = term.as_mut() {
+                term.scroll_display(Scroll::Bottom);
             }
+            drop(term);
             self.write(bytes);
             cx.stop_propagation();
         }
@@ -192,43 +190,48 @@ impl TerminalView {
         let mut paths = vec![];
         let mut image = None;
         let mut text = None;
-        for entry in item.entries() {
+        for entry in item.into_entries() {
             match entry {
-                ClipboardEntry::ExternalPaths(p) => paths.extend(p.paths().iter().cloned()),
-                ClipboardEntry::Image(i) => image = Some(i.clone()),
-                ClipboardEntry::String(s) => text = Some(s.text.clone()),
+                ClipboardEntry::ExternalPaths(p) => paths.extend(p.0),
+                ClipboardEntry::Image(i) => image = Some(i),
+                ClipboardEntry::String(s) => text = Some(s.text),
             }
         }
         // Finder puts a file's icon next to its path; the path wins.
         if !paths.is_empty() {
-            self.upload(paths, vec![], cx);
-        } else if let Some(image) = image {
-            match save_image(&image) {
-                Ok(path) => self.upload(vec![path.clone()], vec![path], cx),
-                Err(e) => self.status = Some(format!("paste failed: {e:#}")),
-            }
+            self.upload(paths, None, cx);
+        } else if image.is_some() {
+            self.upload(vec![], image, cx);
         } else if let Some(text) = text {
             self.paste_text(&text);
         }
     }
 
-    /// Copies files to the host, then pastes their remote paths.
-    fn upload(&mut self, files: Vec<PathBuf>, temporary: Vec<PathBuf>, cx: &mut Context<Self>) {
+    /// Copies files (and a pasted image) to the host, then pastes their
+    /// remote paths.
+    fn upload(&mut self, mut files: Vec<PathBuf>, image: Option<Image>, cx: &mut Context<Self>) {
         let host = self.host.clone();
-        self.status = Some(format!("uploading {} file(s)…", files.len()));
+        let count = files.len() + usize::from(image.is_some());
+        self.status = Some(format!("uploading {count} file(s)…"));
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { actions::upload(&host, &files) })
+                .background_spawn(async move {
+                    // An image goes up as a temporary file.
+                    let temporary = image.map(|i| save_image(&i)).transpose()?;
+                    files.extend(temporary.clone());
+                    let uploaded = actions::upload(&host, &files);
+                    if let Some(t) = temporary {
+                        let _ = std::fs::remove_file(t);
+                    }
+                    uploaded
+                })
                 .await;
-            for t in temporary {
-                let _ = std::fs::remove_file(t);
-            }
             this.update(cx, |this, cx| {
                 match result {
                     Ok(paths) => {
                         this.status = None;
-                        this.paste_text(&format!("{} ", paths.join(" ")));
+                        this.paste_text(&actions::paste_line(&paths));
                     }
                     Err(e) => this.status = Some(format!("upload failed: {e:#}")),
                 }
@@ -240,7 +243,7 @@ impl TerminalView {
     }
 
     fn cell_at(&self, position: Point<Pixels>) -> (usize, usize) {
-        let b = self.bounds.get();
+        let b = self.bounds;
         let col = ((position.x - b.origin.x) / px(self.cell.cell_width as f32)).max(0.0) as usize;
         let line = ((position.y - b.origin.y) / px(self.cell.cell_height as f32)).max(0.0) as usize;
         (
@@ -250,8 +253,7 @@ impl TerminalView {
     }
 
     /// tmux in mouse mode wants SGR reports; otherwise clicks only focus.
-    fn reports_mouse(&self) -> bool {
-        let mode = self.mode();
+    fn reports_mouse(mode: TermMode) -> bool {
         mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE)
     }
 
@@ -261,7 +263,7 @@ impl TerminalView {
             self.connect(cx);
             return;
         }
-        if self.reports_mouse() {
+        if Self::reports_mouse(self.mode()) {
             let (col, line) = self.cell_at(event.position);
             self.mouse_cell = Some((col, line));
             self.write(keys::sgr_mouse(
@@ -275,7 +277,7 @@ impl TerminalView {
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        if self.mouse_cell.take().is_some() && self.reports_mouse() {
+        if self.mouse_cell.take().is_some() && Self::reports_mouse(self.mode()) {
             let (col, line) = self.cell_at(event.position);
             self.write(keys::sgr_mouse(
                 keys::MouseButton::Left,
@@ -290,7 +292,7 @@ impl TerminalView {
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, _: &mut Context<Self>) {
         if event.pressed_button != Some(MouseButton::Left)
             || self.mouse_cell.is_none()
-            || !self.reports_mouse()
+            || !Self::reports_mouse(self.mode())
         {
             return;
         }
@@ -318,19 +320,18 @@ impl TerminalView {
         }
         self.scroll_lines -= lines as f32;
         let mode = self.mode();
-        if self.reports_mouse() {
+        let notches = lines.unsigned_abs() as usize;
+        if Self::reports_mouse(mode) {
             let (col, line) = self.cell_at(event.position);
             let button = if lines > 0 {
                 keys::MouseButton::WheelUp
             } else {
                 keys::MouseButton::WheelDown
             };
-            for _ in 0..lines.abs() {
-                self.write(keys::sgr_mouse(button, false, col, line, true));
-            }
+            self.write(keys::sgr_mouse(button, false, col, line, true).repeat(notches));
         } else if mode.contains(TermMode::ALT_SCREEN) {
             let arrow: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
-            self.write(arrow.repeat(lines.unsigned_abs() as usize));
+            self.write(arrow.repeat(notches));
         } else if let Some(pty) = &self.pty {
             pty.term.lock().scroll_display(Scroll::Delta(lines));
             cx.notify();
@@ -378,11 +379,59 @@ fn hsla(c: Rgb) -> Hsla {
     .into()
 }
 
-/// One screen row: its text, styled runs, and background spans.
+/// What a run of text looks like; runs merge while it stays the same.
+#[derive(Clone, Copy, PartialEq)]
+struct Style {
+    fg: Rgb,
+    /// Only the flags that change how text is drawn.
+    flags: Flags,
+}
+
+impl Style {
+    const DRAWN: Flags = Flags::BOLD
+        .union(Flags::ITALIC)
+        .union(Flags::ALL_UNDERLINES)
+        .union(Flags::STRIKEOUT);
+
+    fn text_run(self, len: usize) -> TextRun {
+        let mut font = font(FONT_FAMILY);
+        if self.flags.contains(Flags::BOLD) {
+            font.weight = FontWeight::BOLD;
+        }
+        if self.flags.contains(Flags::ITALIC) {
+            font.style = FontStyle::Italic;
+        }
+        let color = hsla(self.fg);
+        TextRun {
+            len,
+            font,
+            color,
+            background_color: None,
+            underline: self
+                .flags
+                .intersects(Flags::ALL_UNDERLINES)
+                .then(|| UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(color),
+                    wavy: self.flags.contains(Flags::UNDERCURL),
+                }),
+            strikethrough: self
+                .flags
+                .contains(Flags::STRIKEOUT)
+                .then(|| StrikethroughStyle {
+                    thickness: px(1.0),
+                    color: Some(color),
+                }),
+        }
+    }
+}
+
+/// One screen row: its text, styled runs (style, byte length), and
+/// background spans (first column, end column, color).
 struct Row {
     text: String,
-    runs: Vec<TextRun>,
-    backgrounds: Vec<(usize, usize, Hsla)>,
+    runs: Vec<(Style, usize)>,
+    backgrounds: Vec<(usize, usize, Rgb)>,
 }
 
 struct Frame {
@@ -398,14 +447,14 @@ fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
     let colors = content.colors;
     let default_bg = palette.indexed(NamedColor::Background as usize, colors);
     let offset = content.display_offset as i32;
+    let cols = term.columns();
     let mut rows: Vec<Row> = (0..term.screen_lines())
         .map(|_| Row {
-            text: String::new(),
+            text: String::with_capacity(cols),
             runs: vec![],
             backgrounds: vec![],
         })
         .collect();
-    let base = font(FONT_FAMILY);
     for cell in content.display_iter {
         let Some(row) = usize::try_from(cell.point.line.0 + offset)
             .ok()
@@ -425,8 +474,8 @@ fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
         let col = cell.point.column.0;
         if bg != default_bg {
             match row.backgrounds.last_mut() {
-                Some((_, end, color)) if *end == col && *color == hsla(bg) => *end = col + 1,
-                _ => row.backgrounds.push((col, col + 1, hsla(bg))),
+                Some((_, end, color)) if *end == col && *color == bg => *end = col + 1,
+                _ => row.backgrounds.push((col, col + 1, bg)),
             }
         }
         // A wide character's spacer stays a space so later cells keep their column.
@@ -435,46 +484,15 @@ fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
         } else {
             cell.c
         };
-        let mut run_font = base.clone();
-        if flags.contains(Flags::BOLD) {
-            run_font.weight = FontWeight::BOLD;
-        }
-        if flags.contains(Flags::ITALIC) {
-            run_font.style = FontStyle::Italic;
-        }
-        let color = hsla(fg);
-        let underline = flags
-            .intersects(Flags::ALL_UNDERLINES)
-            .then(|| UnderlineStyle {
-                thickness: px(1.0),
-                color: Some(color),
-                wavy: flags.contains(Flags::UNDERCURL),
-            });
-        let strikethrough = flags
-            .contains(Flags::STRIKEOUT)
-            .then(|| StrikethroughStyle {
-                thickness: px(1.0),
-                color: Some(color),
-            });
+        let style = Style {
+            fg,
+            flags: flags.intersection(Style::DRAWN),
+        };
         let len = c.len_utf8();
         row.text.push(c);
         match row.runs.last_mut() {
-            Some(r)
-                if r.font == run_font
-                    && r.color == color
-                    && r.underline == underline
-                    && r.strikethrough == strikethrough =>
-            {
-                r.len += len
-            }
-            _ => row.runs.push(TextRun {
-                len,
-                font: run_font,
-                color,
-                background_color: None,
-                underline,
-                strikethrough,
-            }),
+            Some((last, run_len)) if *last == style => *run_len += len,
+            _ => row.runs.push((style, len)),
         }
     }
     let cursor = (content.mode.contains(TermMode::SHOW_CURSOR)
@@ -513,7 +531,7 @@ fn paint(
             let origin = point(bounds.origin.x + w * start as f32, y);
             window.paint_quad(fill(
                 Bounds::new(origin, size(w * (end - start) as f32, h)),
-                color,
+                hsla(color),
             ));
         }
     }
@@ -540,10 +558,14 @@ fn paint(
             continue;
         }
         let y = bounds.origin.y + h * i as f32;
-        let line =
-            window
-                .text_system()
-                .shape_line(row.text.into(), px(FONT_SIZE), &row.runs, Some(w));
+        let runs: Vec<TextRun> = row
+            .runs
+            .iter()
+            .map(|&(style, len)| style.text_run(len))
+            .collect();
+        let line = window
+            .text_system()
+            .shape_line(row.text.into(), px(FONT_SIZE), &runs, Some(w));
         let _ = line.paint(
             point(bounds.origin.x, y),
             h,
@@ -557,15 +579,13 @@ fn paint(
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (w, h) = Self::measure(window);
+        let (w, h) = *self.metrics.get_or_insert_with(|| Self::measure(window));
         let focused = self.focus.is_focused(window);
         let view = cx.entity().downgrade();
-        let bounds_cell = self.bounds.clone();
         let palette = Palette::for_appearance(cx.theme().is_dark());
         let frame = self.pty.as_ref().map(|pty| snapshot(pty, palette));
         let grid = canvas(
             move |bounds, _, cx| {
-                bounds_cell.set(bounds);
                 let size = Size {
                     cols: (bounds.size.width / w).floor().max(1.0) as u16,
                     lines: (bounds.size.height / h).floor().max(1.0) as u16,
@@ -573,6 +593,7 @@ impl Render for TerminalView {
                     cell_height: f32::from(h) as u16,
                 };
                 view.update(cx, |view, _| {
+                    view.bounds = bounds;
                     view.cell = size;
                     if let Some(pty) = &mut view.pty {
                         pty.resize(size);
@@ -601,7 +622,7 @@ impl Render for TerminalView {
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_scroll_wheel(cx.listener(Self::scroll))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                this.upload(paths.paths().to_vec(), vec![], cx)
+                this.upload(paths.paths().to_vec(), None, cx)
             }))
             .child(grid)
             .when_some(self.status.clone(), |this, status| {
@@ -626,69 +647,40 @@ impl Render for TerminalView {
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::TerminalView;
-    use crate::config::Host;
+    use crate::test_support::{TmuxServer, wait_until};
     use gpui_kit::{px, size};
-    use std::process::Command;
-
-    fn tmux(socket: &str, args: &[&str]) -> String {
-        let out = Command::new("tmux")
-            .arg("-L")
-            .arg(socket)
-            .args(args)
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
+    use std::time::Duration;
 
     /// A real `tmux attach` in a headless window: resizing the window must
     /// resize the PTY, and tmux must see the new size.
     #[gpui::test]
     fn the_terminal_follows_the_window_size(cx: &mut gpui::TestAppContext) {
-        let socket = format!("muxbox-unit-{}", std::process::id());
-        tmux(&socket, &["new-session", "-d", "-s", "t", "sleep 600"]);
-        let host = Host {
-            name: "local".into(),
-            ssh: "local".into(),
-            upload_dir: "/tmp".into(),
-            tmux_socket: Some(socket.clone()),
-            claude: "claude".into(),
-        };
+        let server = TmuxServer::new("resize");
+        server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
+        let host = server.config().hosts.remove(0);
         // The PTY reader is a real thread, so this test can't be deterministic.
         cx.executor().allow_parking();
         cx.update(gpui_kit::init);
         let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
-        let pty_size = |cx: &mut gpui::VisualTestContext| {
-            view.read_with(cx, |v, _| v.pty.as_ref().map(|p| p.size()))
-        };
 
         cx.simulate_resize(size(px(600.0), px(400.0)));
         cx.run_until_parked();
-        let small = pty_size(cx).expect("attached");
+        let small = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
         cx.simulate_resize(size(px(1000.0), px(700.0)));
         cx.run_until_parked();
-        let large = pty_size(cx).expect("attached");
-
-        // tmux runs in real time; give it a moment to see the new size.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut client = String::new();
-        while std::time::Instant::now() < deadline {
-            client = tmux(
-                &socket,
-                &["list-clients", "-F", "#{client_width}x#{client_height}"],
-            );
-            if client == format!("{}x{}", large.cols, large.lines) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        // kill-server leaves the socket file behind.
-        let path = tmux(&socket, &["display-message", "-p", "#{socket_path}"]);
-        tmux(&socket, &["kill-server"]);
-        let _ = std::fs::remove_file(path);
+        let large = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
         assert!(
             large.cols > small.cols && large.lines > small.lines,
             "{small:?} -> {large:?}"
         );
-        assert_eq!(client, format!("{}x{}", large.cols, large.lines));
+
+        // tmux runs in real time; give it a moment to see the new size.
+        let want = format!("{}x{}", large.cols, large.lines);
+        let client = || server.tmux(&["list-clients", "-F", "#{client_width}x#{client_height}"]);
+        assert!(
+            wait_until(Duration::from_secs(5), || client() == want),
+            "tmux sees {}",
+            client()
+        );
     }
 }

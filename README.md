@@ -38,9 +38,9 @@ With the default `worktree_dir`, new worktree threads run `claude -w <name>` and
 Run `muxbox`. The sidebar lists each base's worktrees and their sessions; it refreshes every 3 s.
 
 - Click a session to show it. Each opened session keeps its own terminal, so switching is instant. muxbox reopens the last session on launch.
-- **New worktree** starts a thread in a new worktree; **+** on a worktree starts another thread in it. The field that appears in the header suggests a free random name like `calm-heron`: press Enter to take it, or type your own.
+- **New worktree** starts a thread in a new worktree; **+** on a worktree starts another session in it: **Claude**, or a plain **Shell**. The field that appears in the header asks for a label (`claude` or `shell` to start with; a free random name for a new worktree): press Enter to take it, or type your own. Several sessions can share a label: muxbox names the tmux session `<label>--<random words>`, like `claude--calm-heron`, and shows only the label. Claude sessions get Claude's spark as their icon, shells a terminal.
 - **×** on a session, clicked twice, kills it. The worktree stays.
-- Double-click a session, or right-click → **Rename…**, to rename it. Only the thread's tmux name changes; Claude keeps running and its worktree and branch keep their names.
+- Double-click a session, or right-click → **Rename…**, to change its label. Only the thread's tmux name changes (its random words stay); Claude keeps running and its worktree and branch keep their names.
 - `⌘B` or the header button collapses the sidebar. `⌘Q` quits; sessions keep running.
 - A terminal whose connection dropped (laptop slept) says so; click it to reconnect.
 
@@ -48,7 +48,7 @@ Run `muxbox`. The sidebar lists each base's worktrees and their sessions; it ref
 
 **Scrolling and selection** belong to tmux: `set -g mouse on` on the host lets you scroll with the wheel and select with the mouse. tmux sends copied text to the terminal (OSC 52), and muxbox puts it on your Mac clipboard.
 
-CLI: `muxbox ls`, `muxbox new <base> <name> [--worktree <path>]`, `muxbox attach <host> <session>`, `muxbox rename <host> <session> <name>`, `muxbox upload <files>...`, `muxbox paste` (clipboard image to the last session muxbox showed).
+CLI: `muxbox ls`, `muxbox new <base> <name> [--worktree <path> [--shell]]`, `muxbox attach <host> <session>`, `muxbox rename <host> <session> <name>`, `muxbox upload <files>...`, `muxbox paste` (clipboard image to the last session muxbox showed).
 
 ### Status dots
 
@@ -58,6 +58,10 @@ Each session's dot comes from Claude Code itself: every refresh runs `claude age
 - **Yellow:** Claude needs input (a question or permission prompt); hover the dot for what it's asking.
 - **Blue:** it finished while you were looking at another session; opening it clears that.
 - **Grey:** idle, or no Claude running.
+
+### Notifications
+
+When a session finishes or starts needing input, a popup appears at the top-right of the main screen, like Zed's, unless it's the session you're looking at in the active window. **Show** brings muxbox forward and opens that session; **Dismiss** closes the popup. Opening the session from the sidebar closes its popup too.
 
 The refresh runs every 3 seconds, so a turn shorter than that can go unnoticed.
 

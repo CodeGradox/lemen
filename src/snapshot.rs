@@ -43,12 +43,19 @@ pub struct Session {
     pub path: String,
     pub attached: bool,
     pub idle_secs: u64,
-    /// Set by Claude Code hooks through the `@muxbox_state` tmux option.
-    pub state: Option<String>,
     /// What Claude in this session is doing.
     pub activity: Activity,
     /// What Claude is waiting on, when it needs input.
     pub waiting_for: Option<String>,
+    /// muxbox started it for Claude rather than as a plain shell.
+    pub started_claude: bool,
+}
+
+impl Session {
+    /// Started for Claude, or Claude found running in it.
+    pub fn runs_claude(&self) -> bool {
+        self.started_claude || self.activity != Activity::Unknown
+    }
 }
 
 /// Ordered by urgency, so a session with several Claudes shows the most
@@ -65,13 +72,23 @@ pub enum Activity {
 /// tmux prints control characters such as tabs as `_`, and session names
 /// can't contain `:`, so fields are split on a printable marker instead.
 const SEP: &str = "|::|";
-const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{@muxbox_state}|::|#{@muxbox_worktree}";
+const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{@muxbox_state}|::|#{@muxbox_worktree}|::|#{@muxbox_kind}";
 const PANES: &str = "#{session_name}|::|#{pane_pid}";
 
 pub fn fetch(cfg: &Config) -> Snapshot {
-    Snapshot {
-        hosts: cfg.hosts.iter().map(|h| fetch_host(cfg, h)).collect(),
-    }
+    // In parallel: an unreachable host takes the whole SSH connect timeout.
+    let hosts = std::thread::scope(|scope| {
+        let fetches: Vec<_> = cfg
+            .hosts
+            .iter()
+            .map(|h| scope.spawn(|| fetch_host(cfg, h)))
+            .collect();
+        fetches
+            .into_iter()
+            .map(|f| f.join().expect("fetch thread"))
+            .collect()
+    });
+    Snapshot { hosts }
 }
 
 fn fetch_host(cfg: &Config, host: &Host) -> HostView {
@@ -107,9 +124,8 @@ fn script(cfg: &Config, host: &Host, remote: &Remote) -> String {
         tmux = remote.tmux(),
     );
     // Claude Code lists every running session with its pid and status; the
-    // process tree ties each one to the tmux pane it runs in. A
-    // non-interactive shell may not have ~/.local/bin on PATH.
-    s += "echo '@@ps'\nps -A -o pid= -o ppid=\necho '@@agents'\nfor c in claude \"$HOME/.local/bin/claude\"; do if command -v \"$c\" >/dev/null 2>&1; then \"$c\" agents --json 2>/dev/null; break; fi; done\n";
+    // process tree ties each one to the tmux pane it runs in.
+    s += "echo '@@ps'\nps -A -o pid= -o ppid=\necho '@@agents'\nclaude agents --json 2>/dev/null || true\n";
     s
 }
 
@@ -174,14 +190,6 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
         if let Some((activity, waiting_for)) = claude.get(&s.name) {
             s.activity = *activity;
             s.waiting_for = waiting_for.clone();
-        } else {
-            // Without `claude agents`, fall back to what hooks reported.
-            s.activity = match s.state.as_deref() {
-                Some("needs_input") => Activity::NeedsInput,
-                Some("working") => Activity::Working,
-                Some("idle") => Activity::Idle,
-                _ => Activity::Unknown,
-            };
         }
     }
 
@@ -222,7 +230,7 @@ fn parse_worktree_line(base: &mut BaseView, line: &str) {
 
 fn parse_session(line: &str, now: u64) -> Option<Session> {
     let f: Vec<&str> = line.split(SEP).collect();
-    if f.len() != 6 {
+    if f.len() != 7 {
         return None;
     }
     let activity: u64 = f[3].parse().unwrap_or(now);
@@ -231,9 +239,15 @@ fn parse_session(line: &str, now: u64) -> Option<Session> {
         path: if f[5].is_empty() { f[1] } else { f[5] }.to_string(),
         attached: f[2] != "0",
         idle_secs: now.saturating_sub(activity),
-        state: (!f[4].is_empty()).then(|| f[4].to_string()),
-        activity: Activity::Unknown,
+        // What hooks reported; `claude agents`, when available, overrides it.
+        activity: match f[4] {
+            "needs_input" => Activity::NeedsInput,
+            "working" => Activity::Working,
+            "idle" => Activity::Idle,
+            _ => Activity::Unknown,
+        },
         waiting_for: None,
+        started_claude: f[6] == "claude",
     })
 }
 
@@ -330,9 +344,9 @@ mod tests {
             worktree /home/agent/projects/api\nHEAD abc\nbranch refs/heads/main\n\n\
             worktree /home/agent/projects/api/.claude/worktrees/auth\nHEAD def\nbranch refs/heads/worktree-auth\n\n\
             @@now\n1000\n@@tmux\n\
-            api/auth|::|/home/agent/projects/api|::|1|::|990|::|needs_input|::|/home/agent/projects/api/.claude/worktrees/auth\n\
-            api/tests|::|/home/agent/projects/api|::|0|::|400|::||::|\n\
-            scratch|::|/tmp|::|0|::|1000|::||::|\n\
+            api/auth|::|/home/agent/projects/api|::|1|::|990|::|needs_input|::|/home/agent/projects/api/.claude/worktrees/auth|::|claude\n\
+            api/tests|::|/home/agent/projects/api|::|0|::|400|::||::||::|\n\
+            scratch|::|/tmp|::|0|::|1000|::||::||::|shell\n\
             @@panes\napi/auth|::|90\napi/tests|::|100\nscratch|::|110\n\
             @@ps\n  90     1\n 100     1\n 110     1\n 200   100\n 250   100\n 300   250\n 400     1\n\
             @@agents\n[\n\
@@ -354,7 +368,6 @@ mod tests {
             ["api/tests"]
         );
         assert_eq!(wts[1].sessions[0].name, "api/auth");
-        assert_eq!(wts[1].sessions[0].state.as_deref(), Some("needs_input"));
         assert_eq!(wts[1].sessions[0].idle_secs, 10);
         assert!(wts[1].sessions[0].attached);
         assert_eq!(h.other[0].name, "scratch");
@@ -369,6 +382,10 @@ mod tests {
         // No Claude found: hooks state, else unknown. pid 400 is in no pane.
         assert_eq!(wts[1].sessions[0].activity, Activity::NeedsInput);
         assert_eq!(h.other[0].activity, Activity::Unknown);
+        // Claude's icon: started for Claude, or Claude found running.
+        assert!(wts[1].sessions[0].runs_claude());
+        assert!(tests.runs_claude());
+        assert!(!h.other[0].runs_claude());
     }
 
     #[test]

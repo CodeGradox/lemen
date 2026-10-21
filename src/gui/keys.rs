@@ -8,15 +8,11 @@ pub struct Key<'a> {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
-    pub cmd: bool,
 }
 
-/// Bytes for a keystroke, or None if the terminal shouldn't get it
-/// (Cmd shortcuts belong to the app).
+/// Bytes for a keystroke, or None if it types nothing the terminal knows.
+/// Cmd shortcuts never get here: they belong to the app.
 pub fn encode(k: &Key, app_cursor: bool) -> Option<Vec<u8>> {
-    if k.cmd {
-        return None;
-    }
     // xterm modifier parameter: 1 + shift + 2*alt + 4*ctrl.
     let m = 1 + k.shift as u8 + 2 * k.alt as u8 + 4 * k.ctrl as u8;
     let cursor = |end: char| {
@@ -162,7 +158,6 @@ mod tests {
             ctrl: false,
             alt: false,
             shift: false,
-            cmd: false,
         }
     }
 
@@ -247,20 +242,6 @@ mod tests {
         );
         assert_eq!(encode(&key("pagedown", None), false).unwrap(), b"\x1b[6~");
         assert_eq!(encode(&key("f5", None), false).unwrap(), b"\x1b[15~");
-    }
-
-    #[test]
-    fn cmd_shortcuts_stay_in_the_app() {
-        assert!(
-            encode(
-                &Key {
-                    cmd: true,
-                    ..key("v", Some("v"))
-                },
-                false
-            )
-            .is_none()
-        );
     }
 
     #[test]

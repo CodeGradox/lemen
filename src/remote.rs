@@ -2,7 +2,7 @@ use crate::config::Host;
 use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 /// One shared SSH connection per host, so each command costs milliseconds.
 const SSH_OPTS: &[&str] = &[
@@ -45,7 +45,8 @@ impl<'a> Remote<'a> {
     /// Runs a POSIX sh script on the host and returns its stdout.
     ///
     /// The script goes over stdin to `sh -s`, so the remote login shell
-    /// (bash, zsh, fish...) never has to parse it.
+    /// (bash, zsh, fish...) never has to parse it. A non-interactive shell
+    /// often lacks `~/.local/bin` (where Claude Code installs) on PATH.
     pub fn run(&self, script: &str) -> Result<String> {
         let mut cmd = if self.is_local() {
             let mut c = Command::new("sh");
@@ -70,15 +71,9 @@ impl<'a> Remote<'a> {
             .stdin
             .take()
             .expect("piped stdin")
-            .write_all(script.as_bytes())?;
+            .write_all(format!("PATH=\"$HOME/.local/bin:$PATH\"\n{script}").as_bytes())?;
         let out = child.wait_with_output()?;
-        if !out.status.success() {
-            bail!(
-                "{}: {}",
-                self.host.name,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+        check(&out, &self.host.name)?;
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
@@ -97,14 +92,7 @@ impl<'a> Remote<'a> {
             .arg(format!("{}:{}", self.host.ssh, remote_path))
             .output()
             .context("starting scp")?;
-        if !out.status.success() {
-            bail!(
-                "scp to {}: {}",
-                self.host.name,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(())
+        check(&out, &format!("scp to {}", self.host.name))
     }
 
     /// argv for an interactive terminal that runs `script` on the host.
@@ -124,6 +112,20 @@ impl<'a> Remote<'a> {
         argv.push(format!("sh -c {}", quote(script)));
         argv
     }
+}
+
+/// Turns a failed command into an error carrying its stderr.
+fn check(out: &Output, what: &str) -> Result<()> {
+    if !out.status.success() {
+        bail!("{what}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// A tmux target for exactly the session `name` (without `=`, tmux also
+/// matches prefixes), quoted for sh. Append `:` to target its window.
+pub fn target(name: &str) -> String {
+    format!("={}", quote(name))
 }
 
 /// Quotes a string as a single POSIX shell word.
@@ -160,13 +162,7 @@ mod tests {
 
     #[test]
     fn terminals_get_their_own_connection() {
-        let host = Host {
-            name: "agent".into(),
-            ssh: "agent".into(),
-            upload_dir: "~/.muxbox/uploads".into(),
-            tmux_socket: None,
-            claude: "claude".into(),
-        };
+        let host: Host = toml::from_str("name = 'agent'\nssh = 'agent'").unwrap();
         let argv = Remote::new(&host).interactive("tmux attach");
         assert!(argv.contains(&"ControlPath=none".to_string()), "{argv:?}");
         assert!(argv.contains(&"-t".to_string()), "{argv:?}");

@@ -4,25 +4,28 @@
 //! so switching is instant and scrollback survives.
 
 mod keys;
+mod notification;
 mod terminal;
 mod terminal_view;
 
 use crate::actions;
 use crate::attach::Active;
-use crate::config::{Config, ThemeChoice};
-use crate::snapshot::{self, Activity, Session, Snapshot};
+use crate::config::{Config, ThemeChoice, leaf};
+use crate::snapshot::{self, Activity, Session, Snapshot, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme, IconName, Sizable, StyledExt, Theme, ThemeMode, h_flex, v_flex,
+    ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, ThemeMode, h_flex, v_flex,
 };
 use gpui_kit::*;
+use notification::{Notification, NotificationEvent};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Duration;
 use terminal_view::TerminalView;
 
@@ -30,13 +33,27 @@ actions!(muxbox, [Quit, ToggleSidebar]);
 
 const REFRESH: Duration = Duration::from_secs(3);
 
+/// The sidebar icon for Claude sessions, drawn in Claude's orange.
+const CLAUDE_ICON: &[u8] = include_bytes!("claude.svg");
+const CLAUDE_ORANGE: u32 = 0xd97757;
+
 type Key = (String, String);
 
 /// What the name field in the header is asking for.
 enum Ask {
-    NewWorktree { base: usize },
-    NewThread { base: usize, worktree: String },
-    Rename { host: String, session: String },
+    NewWorktree {
+        base: usize,
+    },
+    /// Claude, or with `shell` just a shell, in an existing worktree.
+    NewThread {
+        base: usize,
+        worktree: String,
+        shell: bool,
+    },
+    Rename {
+        host: String,
+        session: String,
+    },
 }
 
 enum Done {
@@ -56,6 +73,8 @@ struct Prompt {
 
 struct Muxbox {
     cfg: Config,
+    /// Where to remember the session you last opened; tests have none.
+    state_file: Option<PathBuf>,
     snap: Snapshot,
     loaded: bool,
     terminals: HashMap<Key, Entity<TerminalView>>,
@@ -65,11 +84,15 @@ struct Muxbox {
     confirm_kill: Option<Key>,
     /// A session being renamed keeps its terminal while its old name disappears.
     renaming: Option<Key>,
-    /// Sessions whose Claude was working at the last refresh.
-    working: HashSet<Key>,
     /// Sessions that finished while you were looking at another one.
     done: HashSet<Key>,
     status: Option<(String, bool)>,
+    /// The session from last time, opened once the first refresh is in.
+    restore: Option<Key>,
+    /// The main window, for background work that ends in UI changes.
+    window: AnyWindowHandle,
+    /// Notification popups that are showing, one per session.
+    popups: HashMap<Key, (WindowHandle<Notification>, Subscription)>,
     _refresh: Task<()>,
     _appearance: Option<Subscription>,
 }
@@ -92,7 +115,6 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 KeyBinding::new("shift-tab", NoAction, Some(terminal_view::CONTEXT)),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.on_window_closed(|cx, _| cx.quit()).detach();
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some("muxbox".into()),
@@ -105,46 +127,37 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 ))),
                 ..Default::default()
             };
-            gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Muxbox::new(cfg, window, cx))
+            let (main, _) = gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| Muxbox::new(cfg, Active::path().ok(), window, cx))
             })
             .expect("failed to open window");
+            // Closing the main window quits; notification popups come and go.
+            let main = main.window_id();
+            cx.on_window_closed(move |cx, closed| {
+                if closed == main {
+                    cx.quit();
+                }
+            })
+            .detach();
             cx.activate(true);
         });
     Ok(())
 }
 
 impl Muxbox {
-    fn new(cfg: Config, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let refresh_cfg = cfg.clone();
-        // Reopen the session from last time once we know it still exists.
-        let mut restore = Active::load().ok().map(|a| (a.host, a.session));
-        let window_handle = window.window_handle();
+    fn new(
+        cfg: Config,
+        state_file: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let restore = state_file
+            .as_deref()
+            .and_then(|p| Active::load_from(p).ok())
+            .map(|a| (a.host, a.session));
         let refresh = cx.spawn(async move |this, cx| {
-            loop {
-                let cfg = refresh_cfg.clone();
-                let snap = cx
-                    .background_spawn(async move { snapshot::fetch(&cfg) })
-                    .await;
-                if this
-                    .update(cx, |this, cx| this.set_snapshot(snap, cx))
-                    .is_err()
-                {
-                    break;
-                }
-                if let Some((host, session)) = restore.take() {
-                    window_handle
-                        .update(cx, |_, window, cx| {
-                            this.update(cx, |this, cx| {
-                                let exists = sessions(&this.snap)
-                                    .any(|(h, s)| h == host && s.name == session);
-                                if exists && this.active.is_none() {
-                                    this.open(host, session, window, cx);
-                                }
-                            })
-                        })
-                        .ok();
-                }
+            while let Ok(refreshed) = this.update(cx, |this, cx| this.refresh(cx)) {
+                refreshed.await;
                 cx.background_executor().timer(REFRESH).await;
             }
         });
@@ -156,6 +169,7 @@ impl Muxbox {
         });
         Muxbox {
             cfg,
+            state_file,
             snap: Snapshot::default(),
             loaded: false,
             terminals: HashMap::new(),
@@ -164,60 +178,147 @@ impl Muxbox {
             prompt: None,
             confirm_kill: None,
             renaming: None,
-            working: HashSet::new(),
             done: HashSet::new(),
             status: None,
+            restore,
+            window: window.window_handle(),
+            popups: HashMap::new(),
             _refresh: refresh,
             _appearance: appearance,
         }
     }
 
-    fn set_snapshot(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
-        // Forget terminals whose session is gone (killed, or ended elsewhere).
-        let live: Vec<Key> = sessions(&snap)
-            .map(|(h, s)| (h.to_string(), s.name.clone()))
-            .collect();
-        self.terminals
-            .retain(|k, _| live.contains(k) || self.renaming.as_ref() == Some(k));
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|a| !live.contains(a) && self.renaming.as_ref() != Some(a))
-        {
-            self.active = None;
-        }
-        // Working -> idle while you're elsewhere means "done, unseen".
-        let activity: HashMap<Key, Activity> = sessions(&snap)
-            .map(|(h, s)| ((h.to_string(), s.name.clone()), s.activity))
-            .collect();
-        let working: HashSet<Key> = activity
-            .iter()
-            .filter(|(_, a)| **a == Activity::Working)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in self.working.difference(&working) {
-            let finished = matches!(activity.get(k), Some(Activity::Idle | Activity::Unknown));
-            if finished && self.active.as_ref() != Some(k) {
-                self.done.insert(k.clone());
-            }
-        }
-        self.done
-            .retain(|k| live.contains(k) && !working.contains(k));
-        self.working = working;
-        self.snap = snap;
-        self.loaded = true;
-        cx.notify();
-    }
-
-    fn refresh_now(&mut self, cx: &mut Context<Self>) {
+    /// Fetches a snapshot in the background and applies it.
+    fn refresh(&self, cx: &mut Context<Self>) -> Task<()> {
         let cfg = self.cfg.clone();
+        let window = self.window;
         cx.spawn(async move |this, cx| {
             let snap = cx
                 .background_spawn(async move { snapshot::fetch(&cfg) })
                 .await;
-            this.update(cx, |this, cx| this.set_snapshot(snap, cx)).ok();
+            window
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| this.set_snapshot(snap, window, cx))
+                        .ok();
+                })
+                .ok();
         })
-        .detach();
+    }
+
+    fn set_snapshot(&mut self, snap: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
+        let before: HashMap<Key, Activity> = sessions(&self.snap)
+            .map(|(h, s)| (key(h, s), s.activity))
+            .collect();
+        let now: HashMap<Key, &Session> = sessions(&snap).map(|(h, s)| (key(h, s), s)).collect();
+        // Forget terminals whose session is gone (killed, or ended elsewhere).
+        let renaming = self.renaming.clone();
+        let live = |k: &Key| now.contains_key(k) || renaming.as_ref() == Some(k);
+        self.terminals.retain(|k, _| live(k));
+        if self.active.as_ref().is_some_and(|a| !live(a)) {
+            self.active = None;
+        }
+        // Working -> idle is "finished"; anything -> waiting is "needs input".
+        let mut news = vec![];
+        for (k, s) in &now {
+            let was = before.get(k).copied().unwrap_or(Activity::Unknown);
+            let finished = was == Activity::Working
+                && matches!(s.activity, Activity::Idle | Activity::Unknown);
+            if finished && self.active.as_ref() != Some(k) {
+                self.done.insert(k.clone());
+            }
+            if finished || (s.activity == Activity::NeedsInput && was != Activity::NeedsInput) {
+                news.push((k.clone(), s.activity, s.waiting_for.clone()));
+            }
+        }
+        self.done
+            .retain(|k| now.get(k).is_some_and(|s| s.activity != Activity::Working));
+        let gone: Vec<Key> = self
+            .popups
+            .keys()
+            .filter(|k| !now.contains_key(*k))
+            .cloned()
+            .collect();
+        let restore = self
+            .restore
+            .take()
+            .filter(|k| now.contains_key(k) && self.active.is_none());
+        drop(now);
+        for k in gone {
+            self.close_popup(&k, cx);
+        }
+        self.snap = snap;
+        self.loaded = true;
+        self.notify_news(news, window, cx);
+        if let Some((host, session)) = restore {
+            self.open(host, session, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Pops up a notification for each session that finished or needs input,
+    /// except the one you're looking at in the active window.
+    fn notify_news(
+        &mut self,
+        news: Vec<(Key, Activity, Option<String>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Decided once: opening a popup mustn't change the answer.
+        let looking = window.is_window_active();
+        for (key, activity, waiting_for) in news {
+            if looking && self.active.as_ref() == Some(&key) {
+                continue;
+            }
+            let Some(screen) = cx.primary_display() else {
+                return;
+            };
+            let host = &key.0;
+            let session = actions::label(&key.1);
+            let (title, caption, icon) = match activity {
+                Activity::NeedsInput => (
+                    format!("{session} needs input"),
+                    waiting_for.unwrap_or_else(|| host.clone()),
+                    IconName::CircleAlert,
+                ),
+                _ => (
+                    format!("{session} finished"),
+                    host.clone(),
+                    IconName::CircleCheck,
+                ),
+            };
+            // A newer event for the same session replaces its popup.
+            self.close_popup(&key, cx);
+            let slot = self.popups.len();
+            let Ok(popup) = cx.open_window(Notification::window_options(screen, slot), |_, cx| {
+                cx.new(|_| Notification::new(title, caption, icon))
+            }) else {
+                continue;
+            };
+            let Ok(entity) = popup.entity(cx) else {
+                continue;
+            };
+            let target = key.clone();
+            let events = cx.subscribe_in(
+                &entity,
+                window,
+                move |this, _, event: &NotificationEvent, window, cx| {
+                    if let NotificationEvent::Show = event {
+                        cx.activate(true);
+                        window.activate_window();
+                        this.open(target.0.clone(), target.1.clone(), window, cx);
+                    }
+                    this.close_popup(&target, cx);
+                },
+            );
+            self.popups.insert(key, (popup, events));
+            window.request_attention();
+        }
+    }
+
+    fn close_popup(&mut self, key: &Key, cx: &mut App) {
+        if let Some((popup, _events)) = self.popups.remove(key) {
+            popup.update(cx, |_, window, _| window.remove_window()).ok();
+        }
     }
 
     fn open(&mut self, host: String, session: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -234,32 +335,38 @@ impl Muxbox {
             view.update(cx, |v, cx| v.connect(cx));
         }
         self.done.remove(&key);
+        self.close_popup(&key, cx);
         self.active = Some(key);
         self.confirm_kill = None;
-        let _ = Active { host, session }.save();
+        self.remember(host, session);
         view.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
-    /// Opens the name field, selected so typing replaces it. New threads get
-    /// a free random name; a rename starts from the current one.
+    fn remember(&self, host: String, session: String) {
+        if let Some(path) = &self.state_file {
+            let _ = Active { host, session }.save_to(path);
+        }
+    }
+
+    /// Opens the name field, selected so typing replaces it. It asks for a
+    /// label, which several threads can share: it starts as `claude` or
+    /// `shell`, a free random name for a worktree, or the current label.
     fn ask_name(&mut self, what: Ask, window: &mut Window, cx: &mut Context<Self>) {
         let name = match &what {
-            Ask::NewWorktree { base } | Ask::NewThread { base, .. } => {
-                actions::random_name(|n| self.name_taken(*base, n))
-            }
-            Ask::Rename { session, .. } => {
-                session.rsplit('/').next().unwrap_or(session).to_string()
-            }
+            Ask::NewWorktree { base } => actions::random_name(|n| self.worktree_taken(*base, n)),
+            Ask::NewThread { shell: true, .. } => "shell".to_string(),
+            Ask::NewThread { shell: false, .. } => "claude".to_string(),
+            Ask::Rename { session, .. } => actions::label(leaf(session)).to_string(),
         };
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("name")
                 .default_value(name)
         });
-        let events = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+        let events = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
             if let InputEvent::PressEnter { .. } = event {
-                this.submit(window, cx);
+                this.submit(cx);
             }
         });
         input.update(cx, |i, cx| {
@@ -274,23 +381,27 @@ impl Muxbox {
         cx.notify();
     }
 
-    /// Whether a thread or worktree called `name` already exists in `base`.
-    fn name_taken(&self, base: usize, name: &str) -> bool {
-        let b = &self.cfg.bases[base];
-        let session = format!("{}/{name}", b.name());
-        let in_tmux = sessions(&self.snap).any(|(h, s)| h == b.host && s.name == session);
-        let as_worktree = self
-            .snap
+    /// Whether `base` already has a worktree called `name`.
+    fn worktree_taken(&self, base: usize, name: &str) -> bool {
+        self.snap
             .hosts
             .iter()
             .flat_map(|h| h.bases.iter())
             .filter(|v| v.index == base)
             .flat_map(|v| v.worktrees.iter())
-            .any(|w| w.path.rsplit('/').next() == Some(name));
-        in_tmux || as_worktree
+            .any(|w| leaf(&w.path) == name)
     }
 
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// A thread name for `label` in `base` that no session uses yet.
+    fn unique_thread(&self, base: usize, label: &str) -> String {
+        let b = &self.cfg.bases[base];
+        actions::unique_thread(label, |thread| {
+            let session = b.session_name(thread);
+            sessions(&self.snap).any(|(h, s)| h == b.host && s.name == session)
+        })
+    }
+
+    fn submit(&mut self, cx: &mut Context<Self>) {
         let Some(prompt) = &self.prompt else { return };
         let name = prompt.input.read(cx).value().trim().to_string();
         if let Err(e) = actions::validate_name(&name) {
@@ -300,6 +411,12 @@ impl Muxbox {
         }
         let Some(Prompt { what, .. }) = self.prompt.take() else {
             return;
+        };
+        let thread = match &what {
+            Ask::NewWorktree { base } | Ask::NewThread { base, .. } => {
+                self.unique_thread(*base, &name)
+            }
+            Ask::Rename { .. } => String::new(),
         };
         let cfg = self.cfg.clone();
         let doing = match &what {
@@ -311,17 +428,21 @@ impl Muxbox {
         };
         self.status = Some((format!("{doing} {name}…"), false));
         cx.notify();
-        let window_handle = window.window_handle();
+        let window_handle = self.window;
         cx.spawn(async move |this, cx| {
             let done = cx
                 .background_spawn(async move {
                     match what {
                         Ask::NewWorktree { base } => {
-                            actions::new_worktree_thread(&cfg, base, &name).map(Done::Started)
+                            actions::new_worktree_thread(&cfg, base, &name, &thread)
+                                .map(Done::Started)
                         }
-                        Ask::NewThread { base, worktree } => {
-                            actions::new_thread_in(&cfg, base, &worktree, &name).map(Done::Started)
-                        }
+                        Ask::NewThread {
+                            base,
+                            worktree,
+                            shell,
+                        } => actions::new_thread_in(&cfg, base, &worktree, &thread, shell)
+                            .map(Done::Started),
                         Ask::Rename { host, session } => {
                             actions::rename_session(&cfg, &host, &session, &name).map(|new| {
                                 Done::Renamed {
@@ -349,7 +470,7 @@ impl Muxbox {
                             }
                             Err(e) => this.status = Some((format!("{e:#}"), true)),
                         }
-                        this.refresh_now(cx);
+                        this.refresh(cx).detach();
                     })
                 })
                 .ok();
@@ -368,7 +489,7 @@ impl Muxbox {
         }
         if self.active.as_ref() == Some(&old_key) {
             self.active = Some(new_key);
-            let _ = Active { host, session: new }.save();
+            self.remember(host, new);
         }
         cx.notify();
     }
@@ -391,7 +512,7 @@ impl Muxbox {
                 if let Err(e) = killed {
                     this.status = Some((format!("{e:#}"), true));
                 }
-                this.refresh_now(cx);
+                this.refresh(cx).detach();
             })
             .ok();
         })
@@ -416,20 +537,13 @@ impl Muxbox {
             }
             for b in &h.bases {
                 let base = &self.cfg.bases[b.index];
-                let mut menu = SidebarMenu::new();
                 let index = b.index;
-                menu = menu.child(
+                let mut menu = SidebarMenu::new().child(
                     SidebarMenuItem::new("New worktree")
                         .icon(IconName::Plus)
-                        .on_click({
-                            let this = this.clone();
-                            move |_, window, cx| {
-                                this.update(cx, |this, cx| {
-                                    this.ask_name(Ask::NewWorktree { base: index }, window, cx)
-                                })
-                                .ok();
-                            }
-                        }),
+                        .on_click(ask_on_click(&this, move || Ask::NewWorktree {
+                            base: index,
+                        })),
                 );
                 if let Some(e) = &b.error {
                     menu = menu.child(
@@ -440,42 +554,7 @@ impl Muxbox {
                 }
                 let prefix = format!("{}/", base.name());
                 for (wi, w) in b.worktrees.iter().enumerate() {
-                    let label = match (&w.branch, wi) {
-                        (Some(branch), 0) => branch.clone(),
-                        _ => w.path.rsplit('/').next().unwrap_or(&w.path).to_string(),
-                    };
-                    let worktree = w.path.clone();
-                    let add = {
-                        let this = this.clone();
-                        move |_: &mut Window, _: &mut App| {
-                            let this = this.clone();
-                            let worktree = worktree.clone();
-                            Button::new("add")
-                                .icon(IconName::Plus)
-                                .ghost()
-                                .xsmall()
-                                .tooltip("New thread here")
-                                .on_click(move |_, window, cx| {
-                                    let what = Ask::NewThread {
-                                        base: index,
-                                        worktree: worktree.clone(),
-                                    };
-                                    this.update(cx, |this, cx| this.ask_name(what, window, cx))
-                                        .ok();
-                                })
-                        }
-                    };
-                    let threads = w
-                        .sessions
-                        .iter()
-                        .map(|s| self.session_item(&h.name, s, &prefix, cx));
-                    menu = menu.child(
-                        SidebarMenuItem::new(label)
-                            .icon(IconName::Folder)
-                            .default_open(true)
-                            .suffix(add)
-                            .children(threads),
-                    );
+                    menu = menu.child(self.worktree_item(&h.name, index, wi, w, &prefix, cx));
                 }
                 groups.push(SidebarGroup::new(format!("{} · {}", base.name(), h.name)).child(menu));
             }
@@ -498,7 +577,7 @@ impl Muxbox {
                 .xsmall()
                 .tooltip("Refresh")
                 .on_click(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.refresh_now(cx)).ok();
+                    this.update(cx, |this, cx| this.refresh(cx).detach()).ok();
                 })
         };
         Sidebar::new("sessions")
@@ -516,6 +595,55 @@ impl Muxbox {
             .children(groups)
     }
 
+    /// A worktree with its sessions; + offers a Claude thread or a shell.
+    fn worktree_item(
+        &self,
+        host: &str,
+        base: usize,
+        position: usize,
+        w: &Worktree,
+        prefix: &str,
+        cx: &mut Context<Self>,
+    ) -> SidebarMenuItem {
+        // The main checkout reads best as its branch; linked ones by directory.
+        let label = match (&w.branch, position) {
+            (Some(branch), 0) => branch.clone(),
+            _ => leaf(&w.path).to_string(),
+        };
+        let this = cx.entity().downgrade();
+        let worktree = w.path.clone();
+        let add = move |_: &mut Window, _: &mut App| {
+            let (this, worktree) = (this.clone(), worktree.clone());
+            Button::new("add")
+                .icon(IconName::Plus)
+                .ghost()
+                .xsmall()
+                .tooltip("New session here")
+                .dropdown_menu(move |menu, _, _| {
+                    let item = |label: &'static str, shell: bool| {
+                        let worktree = worktree.clone();
+                        PopupMenuItem::new(label).on_click(ask_on_click(&this, move || {
+                            Ask::NewThread {
+                                base,
+                                worktree: worktree.clone(),
+                                shell,
+                            }
+                        }))
+                    };
+                    menu.item(item("Claude", false)).item(item("Shell", true))
+                })
+        };
+        let threads = w
+            .sessions
+            .iter()
+            .map(|s| self.session_item(host, s, prefix, cx));
+        SidebarMenuItem::new(label)
+            .icon(IconName::Folder)
+            .default_open(true)
+            .suffix(add)
+            .children(threads)
+    }
+
     fn session_item(
         &self,
         host: &str,
@@ -524,10 +652,10 @@ impl Muxbox {
         cx: &mut Context<Self>,
     ) -> SidebarMenuItem {
         let this = cx.entity().downgrade();
-        let key: Key = (host.to_string(), s.name.clone());
+        let key = key(host, s);
         let active = self.active.as_ref() == Some(&key);
         let arming = self.confirm_kill.as_ref() == Some(&key);
-        let label = s.name.strip_prefix(prefix).unwrap_or(&s.name).to_string();
+        let label = actions::label(s.name.strip_prefix(prefix).unwrap_or(&s.name)).to_string();
         let working = s.activity == Activity::Working;
         let (dot, tip): (Hsla, SharedString) = match s.activity {
             Activity::NeedsInput => (
@@ -567,16 +695,12 @@ impl Muxbox {
             let this = this.clone();
             let key = key.clone();
             move |menu: PopupMenu, _: &mut Window, _: &mut App| {
-                let this = this.clone();
                 let key = key.clone();
                 menu.item(
-                    PopupMenuItem::new("Rename…").on_click(move |_, window, cx| {
+                    PopupMenuItem::new("Rename…").on_click(ask_on_click(&this, move || {
                         let (host, session) = key.clone();
-                        this.update(cx, |this, cx| {
-                            this.ask_name(Ask::Rename { host, session }, window, cx)
-                        })
-                        .ok();
-                    }),
+                        Ask::Rename { host, session }
+                    })),
                 )
             }
         };
@@ -604,12 +728,24 @@ impl Muxbox {
                 .child(status)
                 .child(kill)
         };
+        let icon = if s.runs_claude() {
+            Icon::empty()
+                .data(CLAUDE_ICON)
+                .text_color(rgb(CLAUDE_ORANGE))
+        } else {
+            Icon::new(IconName::SquareTerminal)
+        };
         SidebarMenuItem::new(label)
-            .icon(IconName::SquareTerminal)
+            .icon(icon)
             .active(active)
             .on_click(open)
             .context_menu(menu)
             .suffix(suffix)
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.collapsed = !self.collapsed;
+        cx.notify();
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -624,14 +760,10 @@ impl Muxbox {
             .small()
             .tooltip("Toggle sidebar (⌘B)")
             .on_click(move |_, _, cx| {
-                this.update(cx, |this, cx| {
-                    this.collapsed = !this.collapsed;
-                    cx.notify();
-                })
-                .ok();
+                this.update(cx, |this, cx| this.toggle_sidebar(cx)).ok();
             });
         let title = match &self.active {
-            Some((host, session)) => format!("{session}  ·  {host}"),
+            Some((host, session)) => format!("{}  ·  {host}", actions::label(session)),
             None => String::new(),
         };
         let mut bar = h_flex()
@@ -653,13 +785,13 @@ impl Muxbox {
                 Ask::NewWorktree { base } => {
                     format!("New worktree in {}", self.cfg.bases[*base].name())
                 }
-                Ask::NewThread { worktree, .. } => {
-                    format!(
-                        "New thread in {}",
-                        worktree.rsplit('/').next().unwrap_or(worktree)
-                    )
+                Ask::NewThread {
+                    worktree, shell, ..
+                } => {
+                    let what = if *shell { "shell" } else { "Claude thread" };
+                    format!("New {what} in {}", leaf(worktree))
                 }
-                Ask::Rename { session, .. } => format!("Rename {session}"),
+                Ask::Rename { session, .. } => format!("Rename {}", actions::label(session)),
             };
             bar = bar
                 .child(div().flex_1())
@@ -688,7 +820,11 @@ impl Muxbox {
 impl Render for Muxbox {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.active.as_ref().and_then(|k| self.terminals.get(k)) {
-            Some(view) => div().size_full().child(view.clone()),
+            // Cached: sidebar redraws (the breathing dot) don't re-render the
+            // terminal; it re-renders on its own output, size or focus change.
+            Some(view) => div()
+                .size_full()
+                .child(view.clone().cached(StyleRefinement::default().size_full())),
             None => div()
                 .size_full()
                 .flex()
@@ -705,10 +841,7 @@ impl Render for Muxbox {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.collapsed = !this.collapsed;
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
                 if e.keystroke.key == "escape" && this.prompt.take().is_some() {
                     cx.stop_propagation();
@@ -740,6 +873,22 @@ fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
     })
 }
 
+fn key(host: &str, s: &Session) -> Key {
+    (host.to_string(), s.name.clone())
+}
+
+/// A click handler that opens the name field for `ask()`.
+fn ask_on_click(
+    this: &WeakEntity<Muxbox>,
+    ask: impl Fn() -> Ask + 'static,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    let this = this.clone();
+    move |_, window, cx| {
+        this.update(cx, |this, cx| this.ask_name(ask(), window, cx))
+            .ok();
+    }
+}
+
 /// A session's status dot; it breathes while Claude works.
 fn status_dot(key: &Key, color: Hsla, working: bool, tip: SharedString) -> AnyElement {
     let id = SharedString::from(format!("status-{}-{}", key.0, key.1));
@@ -752,8 +901,10 @@ fn status_dot(key: &Key, color: Hsla, working: bool, tip: SharedString) -> AnyEl
     if working {
         dot.with_animation(
             id,
+            // Every animation frame redraws the window; 15 fps is smooth enough.
             Animation::new(Duration::from_millis(1600))
                 .repeat()
+                .with_max_fps(15.0)
                 .with_easing(pulsating_between(0.35, 1.0)),
             |dot, delta| dot.opacity(delta),
         )
@@ -775,76 +926,17 @@ fn age(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Muxbox, TerminalView};
-    use crate::config::Config;
-    use gpui_kit::{AppContext, px, size};
-    use std::process::Command;
-
-    fn tmux(socket: &str, args: &[&str]) -> String {
-        let out = Command::new("tmux")
-            .arg("-L")
-            .arg(socket)
-            .args(args)
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    /// The whole window: sidebar, header and the active terminal. Resizing
-    /// the window must resize the terminal inside it.
-    #[gpui::test]
-    fn the_active_terminal_follows_the_window_size(cx: &mut gpui::TestAppContext) {
-        let socket = format!("muxbox-unit-app-{}", std::process::id());
-        tmux(&socket, &["new-session", "-d", "-s", "t", "sleep 600"]);
-        let cfg: Config = toml::from_str(&format!(
-            "[[hosts]]\nname = \"local\"\nssh = \"local\"\ntmux_socket = \"{socket}\"\n"
-        ))
-        .unwrap();
-        let host = cfg.hosts[0].clone();
-        // The PTY reader is a real thread, so this test can't be deterministic.
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        // Wrapped in Root exactly as gpui_kit::open_window does.
-        let mut app = None;
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|cx| Muxbox::new(cfg, window, cx));
-            app = Some(view.clone());
-            gpui_kit::base::Root::new(view, window, cx)
-        });
-        let app = app.unwrap();
-        // Show the session without `open`, which would remember it in ~/.muxbox.
-        let view = app.update(cx, |app, cx| {
-            let view = cx.new(|cx| TerminalView::new(host, "t".into(), cx));
-            let key = ("local".to_string(), "t".to_string());
-            app.terminals.insert(key.clone(), view.clone());
-            app.active = Some(key);
-            cx.notify();
-            view
-        });
-
-        cx.simulate_resize(size(px(900.0), px(600.0)));
-        cx.run_until_parked();
-        let small = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
-        cx.simulate_resize(size(px(1400.0), px(900.0)));
-        cx.run_until_parked();
-        let large = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
-        // kill-server leaves the socket file behind.
-        let path = tmux(&socket, &["display-message", "-p", "#{socket_path}"]);
-        tmux(&socket, &["kill-server"]);
-        let _ = std::fs::remove_file(path);
-        assert!(
-            large.cols > small.cols && large.lines > small.lines,
-            "{small:?} -> {large:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod status_tests {
-    // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Key, Muxbox};
+    use super::{Key, Muxbox, NotificationEvent};
     use crate::config::Config;
     use crate::snapshot::{Activity, HostView, Session, Snapshot};
+    use crate::test_support::{TmuxServer, wait_until};
+    use gpui::VisualTestContext;
+    use gpui_kit::{AppContext, Entity, px, size};
+    use std::time::Duration;
+
+    fn key(s: &str) -> Key {
+        ("local".into(), s.into())
+    }
 
     fn snapshot(sessions: &[(&str, Activity)]) -> Snapshot {
         let other = sessions
@@ -854,9 +946,9 @@ mod status_tests {
                 path: "/tmp".into(),
                 attached: false,
                 idle_secs: 0,
-                state: None,
                 activity: *activity,
                 waiting_for: None,
+                started_claude: false,
             })
             .collect();
         Snapshot {
@@ -869,33 +961,76 @@ mod status_tests {
         }
     }
 
+    /// Applies a snapshot the way a refresh does.
+    fn apply(app: &Entity<Muxbox>, sessions: &[(&str, Activity)], cx: &mut VisualTestContext) {
+        let snap = snapshot(sessions);
+        cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
+    }
+
+    fn open(app: &Entity<Muxbox>, session: &str, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open("local".into(), session.into(), window, cx)
+            })
+        });
+    }
+
+    /// The whole window: sidebar, header and the active terminal. Resizing
+    /// the window must resize the terminal inside it.
+    #[gpui::test]
+    fn the_active_terminal_follows_the_window_size(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("app");
+        server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
+        // The PTY reader is a real thread, so this test can't be deterministic.
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        // Wrapped in Root exactly as gpui_kit::open_window does.
+        let mut app = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| Muxbox::new(server.config(), None, window, cx));
+            app = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        open(&app, "t", cx);
+        let view = app.read_with(cx, |app, _| app.terminals[&key("t")].clone());
+
+        cx.simulate_resize(size(px(900.0), px(600.0)));
+        cx.run_until_parked();
+        let small = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        cx.simulate_resize(size(px(1400.0), px(900.0)));
+        cx.run_until_parked();
+        let large = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        assert!(
+            large.cols > small.cols && large.lines > small.lines,
+            "{small:?} -> {large:?}"
+        );
+    }
+
     #[gpui::test]
     fn a_session_that_finishes_elsewhere_is_marked_done(cx: &mut gpui::TestAppContext) {
         // No hosts, so the background refresh has nothing to fetch.
         let cfg: Config = toml::from_str("").unwrap();
         cx.update(gpui_kit::init);
-        let (app, cx) = cx.add_window_view(|window, cx| Muxbox::new(cfg, window, cx));
-        let key = |s: &str| -> Key { ("local".into(), s.into()) };
-        app.update(cx, |app, cx| {
-            app.active = Some(key("shown"));
-            app.set_snapshot(
-                snapshot(&[
-                    ("shown", Activity::Working),
-                    ("elsewhere", Activity::Working),
-                    ("asking", Activity::Working),
-                ]),
-                cx,
-            );
-            assert!(app.done.is_empty());
-            app.set_snapshot(
-                snapshot(&[
-                    ("shown", Activity::Idle),
-                    ("elsewhere", Activity::Idle),
-                    ("asking", Activity::NeedsInput),
-                ]),
-                cx,
-            );
-            assert!(app.working.is_empty(), "{:?}", app.working);
+        let (app, cx) = cx.add_window_view(|window, cx| Muxbox::new(cfg, None, window, cx));
+        app.update(cx, |app, _| app.active = Some(key("shown")));
+        let working = [
+            ("shown", Activity::Working),
+            ("elsewhere", Activity::Working),
+            ("asking", Activity::Working),
+        ];
+        apply(&app, &working, cx);
+        app.read_with(cx, |app, _| assert!(app.done.is_empty()));
+        apply(
+            &app,
+            &[
+                ("shown", Activity::Idle),
+                ("elsewhere", Activity::Idle),
+                ("asking", Activity::NeedsInput),
+            ],
+            cx,
+        );
+        app.read_with(cx, |app, _| {
             assert!(app.done.contains(&key("elsewhere")), "{:?}", app.done);
             assert!(
                 !app.done.contains(&key("shown")),
@@ -905,9 +1040,93 @@ mod status_tests {
                 !app.done.contains(&key("asking")),
                 "waiting on you isn't done"
             );
-            // Working again clears it.
-            app.set_snapshot(snapshot(&[("elsewhere", Activity::Working)]), cx);
-            assert!(app.done.is_empty(), "{:?}", app.done);
+        });
+        // Working again clears it.
+        apply(&app, &[("elsewhere", Activity::Working)], cx);
+        app.read_with(cx, |app, _| assert!(app.done.is_empty(), "{:?}", app.done));
+    }
+
+    #[gpui::test]
+    fn finishing_out_of_sight_pops_up_a_notification(cx: &mut gpui::TestAppContext) {
+        // No tmux runs here: Show still opens a short-lived terminal that
+        // tries to attach, a real process.
+        let server = TmuxServer::new("popup");
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (app, cx) =
+            cx.add_window_view(|window, cx| Muxbox::new(server.config(), None, window, cx));
+        let windows = |cx: &mut VisualTestContext| cx.update(|_, cx| cx.windows().len());
+
+        // In the active window: the session you're looking at doesn't pop up,
+        // one you aren't does. The test platform activates windows
+        // asynchronously.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        app.update(cx, |app, _| app.active = Some(key("shown")));
+        apply(
+            &app,
+            &[("shown", Activity::Working), ("a", Activity::Working)],
+            cx,
+        );
+        apply(
+            &app,
+            &[("shown", Activity::Idle), ("a", Activity::Idle)],
+            cx,
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.popups.contains_key(&key("shown")),
+                "you're looking at it"
+            );
+            assert!(app.popups.contains_key(&key("a")));
+        });
+        assert_eq!(windows(cx), 2);
+
+        // Away from the window, even the shown session pops up; needing input
+        // does too.
+        cx.deactivate_window();
+        apply(
+            &app,
+            &[
+                ("shown", Activity::Working),
+                ("a", Activity::Idle),
+                ("b", Activity::Working),
+            ],
+            cx,
+        );
+        apply(
+            &app,
+            &[
+                ("shown", Activity::Idle),
+                ("a", Activity::Idle),
+                ("b", Activity::NeedsInput),
+            ],
+            cx,
+        );
+        assert_eq!(windows(cx), 4);
+        let popup = app.read_with(cx, |app, cx| app.popups[&key("a")].0.entity(cx).unwrap());
+
+        // Show opens that session and closes only its popup.
+        popup.update(cx, |_, cx| cx.emit(NotificationEvent::Show));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.active, Some(key("a")));
+            assert!(!app.popups.contains_key(&key("a")));
+            assert!(app.popups.contains_key(&key("b")) && app.popups.contains_key(&key("shown")));
+        });
+        assert_eq!(windows(cx), 3);
+
+        // Opening a session from the sidebar answers its popup too.
+        open(&app, "b", cx);
+        app.read_with(cx, |app, _| assert!(!app.popups.contains_key(&key("b"))));
+        assert_eq!(windows(cx), 2);
+
+        // Let the terminals' attach attempts end before the server cleans up.
+        wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, cx| {
+                app.terminals.values().all(|t| t.read(cx).exited())
+            })
         });
     }
 }

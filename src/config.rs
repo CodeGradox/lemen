@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::path::PathBuf;
+use serde::de::DeserializeOwned;
+use std::path::{Path, PathBuf};
 
 /// Where `claude -w` puts worktrees; bases using it let Claude create them.
 pub const CLAUDE_WORKTREES: &str = ".claude/worktrees";
@@ -67,18 +68,14 @@ fn default_worktree_dir() -> String {
 
 impl Base {
     pub fn name(&self) -> String {
-        let name = match &self.name {
-            Some(n) => n.clone(),
-            None => self
-                .path
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or_default()
-                .to_string(),
-        };
+        let name = self.name.as_deref().unwrap_or_else(|| leaf(&self.path));
         // tmux reserves `.` and `:` in target names.
         name.replace(['.', ':'], "-")
+    }
+
+    /// The tmux session for thread `thread` of this base: `<base>/<thread>`.
+    pub fn session_name(&self, thread: &str) -> String {
+        format!("{}/{thread}", self.name())
     }
 
     pub fn uses_claude_worktrees(&self) -> bool {
@@ -95,11 +92,7 @@ impl Config {
     }
 
     pub fn load() -> Result<Config> {
-        let path = Self::path()?;
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Config =
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let cfg: Config = read_toml(&Self::path()?)?;
         for b in &cfg.bases {
             if cfg.host(&b.host).is_none() {
                 bail!("base {} refers to unknown host {}", b.path, b.host);
@@ -120,6 +113,20 @@ impl Config {
     pub fn base_by_name(&self, name: &str) -> Option<usize> {
         self.bases.iter().position(|b| b.name() == name)
     }
+}
+
+/// The last component of a path: `api` for `~/code/api/`.
+pub fn leaf(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+}
+
+pub fn read_toml<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
 pub fn home() -> Result<PathBuf> {
