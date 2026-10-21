@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use terminal_view::TerminalView;
 
-actions!(muxbox, [Quit, ToggleSidebar]);
+actions!(lemen, [Quit, ToggleSidebar]);
 
 const REFRESH: Duration = Duration::from_secs(3);
 
@@ -71,7 +71,7 @@ struct Prompt {
     _events: Subscription,
 }
 
-struct Muxbox {
+struct Lemen {
     cfg: Config,
     /// Where to remember the session you last opened; tests have none.
     state_file: Option<PathBuf>,
@@ -117,7 +117,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             cx.on_action(|_: &Quit, cx| cx.quit());
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
-                    title: Some("muxbox".into()),
+                    title: Some("lemen".into()),
                     ..Default::default()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -128,7 +128,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 ..Default::default()
             };
             let (main, _) = gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Muxbox::new(cfg, Active::path().ok(), window, cx))
+                cx.new(|cx| Lemen::new(cfg, Active::path().ok(), window, cx))
             })
             .expect("failed to open window");
             // Closing the main window quits; notification popups come and go.
@@ -144,7 +144,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-impl Muxbox {
+impl Lemen {
     fn new(
         cfg: Config,
         state_file: Option<PathBuf>,
@@ -167,7 +167,7 @@ impl Muxbox {
                 Theme::sync_system_appearance(Some(window), cx);
             })
         });
-        Muxbox {
+        Lemen {
             cfg,
             state_file,
             snap: Snapshot::default(),
@@ -588,7 +588,7 @@ impl Muxbox {
                     h_flex()
                         .w_full()
                         .justify_between()
-                        .child(div().font_semibold().child("muxbox"))
+                        .child(div().font_semibold().child("lemen"))
                         .child(refresh),
                 ),
             )
@@ -817,7 +817,7 @@ impl Muxbox {
     }
 }
 
-impl Render for Muxbox {
+impl Render for Lemen {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.active.as_ref().and_then(|k| self.terminals.get(k)) {
             // Cached: sidebar redraws (the breathing dot) don't re-render the
@@ -879,7 +879,7 @@ fn key(host: &str, s: &Session) -> Key {
 
 /// A click handler that opens the name field for `ask()`.
 fn ask_on_click(
-    this: &WeakEntity<Muxbox>,
+    this: &WeakEntity<Lemen>,
     ask: impl Fn() -> Ask + 'static,
 ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     let this = this.clone();
@@ -926,7 +926,7 @@ fn age(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Key, Muxbox, NotificationEvent};
+    use super::{Key, Lemen, NotificationEvent};
     use crate::config::Config;
     use crate::snapshot::{Activity, HostView, Session, Snapshot};
     use crate::test_support::{TmuxServer, wait_until};
@@ -962,12 +962,12 @@ mod tests {
     }
 
     /// Applies a snapshot the way a refresh does.
-    fn apply(app: &Entity<Muxbox>, sessions: &[(&str, Activity)], cx: &mut VisualTestContext) {
+    fn apply(app: &Entity<Lemen>, sessions: &[(&str, Activity)], cx: &mut VisualTestContext) {
         let snap = snapshot(sessions);
         cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
     }
 
-    fn open(app: &Entity<Muxbox>, session: &str, cx: &mut VisualTestContext) {
+    fn open(app: &Entity<Lemen>, session: &str, cx: &mut VisualTestContext) {
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.open("local".into(), session.into(), window, cx)
@@ -987,7 +987,7 @@ mod tests {
         // Wrapped in Root exactly as gpui_kit::open_window does.
         let mut app = None;
         let (_, cx) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|cx| Muxbox::new(server.config(), None, window, cx));
+            let view = cx.new(|cx| Lemen::new(server.config(), None, window, cx));
             app = Some(view.clone());
             gpui_kit::base::Root::new(view, window, cx)
         });
@@ -1012,7 +1012,7 @@ mod tests {
         // No hosts, so the background refresh has nothing to fetch.
         let cfg: Config = toml::from_str("").unwrap();
         cx.update(gpui_kit::init);
-        let (app, cx) = cx.add_window_view(|window, cx| Muxbox::new(cfg, None, window, cx));
+        let (app, cx) = cx.add_window_view(|window, cx| Lemen::new(cfg, None, window, cx));
         app.update(cx, |app, _| app.active = Some(key("shown")));
         let working = [
             ("shown", Activity::Working),
@@ -1054,7 +1054,7 @@ mod tests {
         cx.executor().allow_parking();
         cx.update(gpui_kit::init);
         let (app, cx) =
-            cx.add_window_view(|window, cx| Muxbox::new(server.config(), None, window, cx));
+            cx.add_window_view(|window, cx| Lemen::new(server.config(), None, window, cx));
         let windows = |cx: &mut VisualTestContext| cx.update(|_, cx| cx.windows().len());
 
         // In the active window: the session you're looking at doesn't pop up,

@@ -361,7 +361,7 @@ fn save_image(image: &Image) -> anyhow::Result<PathBuf> {
         _ => "tiff",
     };
     let path = std::env::temp_dir().join(format!(
-        "muxbox-paste-{}-{}.{ext}",
+        "lemen-paste-{}-{}.{ext}",
         std::process::id(),
         image.id
     ));

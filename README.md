@@ -1,18 +1,18 @@
-# muxbox
+# lemen
 
 A macOS app for Claude Code sessions that live in tmux on a remote host: a sidebar of sessions next to a built-in terminal (`ssh -t host tmux attach`). Sessions keep running when your laptop sleeps.
 
 ## Install
 
 ```sh
-cargo install --path .   # puts muxbox in ~/.cargo/bin
+cargo install --path .   # puts lemen in ~/.cargo/bin
 ```
 
 Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `git`.
 
 ## Config
 
-`~/.config/muxbox/config.toml` (or `$MUXBOX_CONFIG`):
+`~/.config/lemen/config.toml` (or `$LEMEN_CONFIG`):
 
 ```toml
 # theme = "system"                # or "light" / "dark"; must come before the tables
@@ -20,7 +20,7 @@ Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `g
 [[hosts]]
 name = "agent"
 ssh = "agent"                     # user@host or a ~/.ssh/config alias; "local" runs here
-# upload_dir = "~/.muxbox/uploads"
+# upload_dir = "~/.lemen/uploads"
 # tmux_socket = "work"            # tmux -L; default server if unset
 # claude = "claude"               # command typed into new sessions
 
@@ -31,28 +31,28 @@ path = "~/projects/api"
 # worktree_dir = ".claude/worktrees"
 ```
 
-With the default `worktree_dir`, new worktree threads run `claude -w <name>` and Claude creates the worktree. Any other `worktree_dir` (relative to the repo, absolute, or `~/...`) makes muxbox run `git worktree add -b worktree-<name>` there first.
+With the default `worktree_dir`, new worktree threads run `claude -w <name>` and Claude creates the worktree. Any other `worktree_dir` (relative to the repo, absolute, or `~/...`) makes lemen run `git worktree add -b worktree-<name>` there first.
 
 ## Use
 
-Run `muxbox`. The sidebar lists each base's worktrees and their sessions; it refreshes every 3 s.
+Run `lemen`. The sidebar lists each base's worktrees and their sessions; it refreshes every 3 s.
 
-- Click a session to show it. Each opened session keeps its own terminal, so switching is instant. muxbox reopens the last session on launch.
-- **New worktree** starts a thread in a new worktree; **+** on a worktree starts another session in it: **Claude**, or a plain **Shell**. The field that appears in the header asks for a label (`claude` or `shell` to start with; a free random name for a new worktree): press Enter to take it, or type your own. Several sessions can share a label: muxbox names the tmux session `<label>--<random words>`, like `claude--calm-heron`, and shows only the label. Claude sessions get Claude's spark as their icon, shells a terminal.
+- Click a session to show it. Each opened session keeps its own terminal, so switching is instant. lemen reopens the last session on launch.
+- **New worktree** starts a thread in a new worktree; **+** on a worktree starts another session in it: **Claude**, or a plain **Shell**. The field that appears in the header asks for a label (`claude` or `shell` to start with; a free random name for a new worktree): press Enter to take it, or type your own. Several sessions can share a label: lemen names the tmux session `<label>--<random words>`, like `claude--calm-heron`, and shows only the label. Claude sessions get Claude's spark as their icon, shells a terminal.
 - **×** on a session, clicked twice, kills it. The worktree stays.
 - Double-click a session, or right-click → **Rename…**, to change its label. Only the thread's tmux name changes (its random words stay); Claude keeps running and its worktree and branch keep their names.
 - `⌘B` or the header button collapses the sidebar. `⌘Q` quits; sessions keep running.
 - A terminal whose connection dropped (laptop slept) says so; click it to reconnect.
 
-**Images:** drop files on the terminal, or `⌘V` with an image or copied files on the clipboard. muxbox uploads them to the host's `upload_dir` and pastes the remote paths. Text pastes as text.
+**Images:** drop files on the terminal, or `⌘V` with an image or copied files on the clipboard. lemen uploads them to the host's `upload_dir` and pastes the remote paths. Text pastes as text.
 
-**Scrolling and selection** belong to tmux: `set -g mouse on` on the host lets you scroll with the wheel and select with the mouse. tmux sends copied text to the terminal (OSC 52), and muxbox puts it on your Mac clipboard.
+**Scrolling and selection** belong to tmux: `set -g mouse on` on the host lets you scroll with the wheel and select with the mouse. tmux sends copied text to the terminal (OSC 52), and lemen puts it on your Mac clipboard.
 
-CLI: `muxbox ls`, `muxbox new <base> <name> [--worktree <path> [--shell]]`, `muxbox attach <host> <session>`, `muxbox rename <host> <session> <name>`, `muxbox upload <files>...`, `muxbox paste` (clipboard image to the last session muxbox showed).
+CLI: `lemen ls`, `lemen new <base> <name> [--worktree <path> [--shell]]`, `lemen attach <host> <session>`, `lemen rename <host> <session> <name>`, `lemen upload <files>...`, `lemen paste` (clipboard image to the last session lemen showed).
 
 ### Status dots
 
-Each session's dot comes from Claude Code itself: every refresh runs `claude agents --json` on the host, which lists each running Claude with its process and status, and muxbox matches the process to its tmux session. No setup needed; it needs Claude Code 2.1.139 or later (when `claude agents` arrived), on `PATH` or in `~/.local/bin`.
+Each session's dot comes from Claude Code itself: every refresh runs `claude agents --json` on the host, which lists each running Claude with its process and status, and lemen matches the process to its tmux session. No setup needed; it needs Claude Code 2.1.139 or later (when `claude agents` arrived), on `PATH` or in `~/.local/bin`.
 
 - **Green, breathing:** Claude is working.
 - **Yellow:** Claude needs input (a question or permission prompt); hover the dot for what it's asking.
@@ -61,19 +61,19 @@ Each session's dot comes from Claude Code itself: every refresh runs `claude age
 
 ### Notifications
 
-When a session finishes or starts needing input, a popup appears at the top-right of the main screen, like Zed's, unless it's the session you're looking at in the active window. **Show** brings muxbox forward and opens that session; **Dismiss** closes the popup. Opening the session from the sidebar closes its popup too.
+When a session finishes or starts needing input, a popup appears at the top-right of the main screen, like Zed's, unless it's the session you're looking at in the active window. **Show** brings lemen forward and opens that session; **Dismiss** closes the popup. Opening the session from the sidebar closes its popup too.
 
 The refresh runs every 3 seconds, so a turn shorter than that can go unnoticed.
 
-For older Claude Code without `claude agents`, hooks can report the same states through a `@muxbox_state` tmux option. Put this in `~/.claude/settings.json` on the host:
+For older Claude Code without `claude agents`, hooks can report the same states through a `@lemen_state` tmux option. Put this in `~/.claude/settings.json` on the host:
 
 ```json
 {
   "hooks": {
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set-option -t \"$TMUX_PANE\" @muxbox_state working || true" }] }],
-    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set-option -t \"$TMUX_PANE\" @muxbox_state working || true" }] }],
-    "Notification": [{ "hooks": [{ "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set-option -t \"$TMUX_PANE\" @muxbox_state needs_input || true" }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set-option -t \"$TMUX_PANE\" @muxbox_state idle || true" }] }]
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set-option -t \"$TMUX_PANE\" @lemen_state working || true" }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set-option -t \"$TMUX_PANE\" @lemen_state working || true" }] }],
+    "Notification": [{ "hooks": [{ "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set-option -t \"$TMUX_PANE\" @lemen_state needs_input || true" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set-option -t \"$TMUX_PANE\" @lemen_state idle || true" }] }]
   }
 }
 ```

@@ -55,7 +55,7 @@ pub struct Base {
 }
 
 fn default_upload_dir() -> String {
-    "~/.muxbox/uploads".into()
+    "~/.lemen/uploads".into()
 }
 
 fn default_claude() -> String {
@@ -85,10 +85,10 @@ impl Base {
 
 impl Config {
     pub fn path() -> Result<PathBuf> {
-        if let Some(p) = std::env::var_os("MUXBOX_CONFIG") {
+        if let Some(p) = std::env::var_os("LEMEN_CONFIG") {
             return Ok(p.into());
         }
-        Ok(home()?.join(".config/muxbox/config.toml"))
+        Ok(home()?.join(".config/lemen/config.toml"))
     }
 
     pub fn load() -> Result<Config> {

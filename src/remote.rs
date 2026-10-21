@@ -9,7 +9,7 @@ const SSH_OPTS: &[&str] = &[
     "-o",
     "ControlMaster=auto",
     "-o",
-    "ControlPath=~/.ssh/muxbox-%C",
+    "ControlPath=~/.ssh/lemen-%C",
     "-o",
     "ControlPersist=10m",
 ];

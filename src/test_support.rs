@@ -13,7 +13,7 @@ pub struct TmuxServer {
 impl TmuxServer {
     pub fn new(tag: &str) -> TmuxServer {
         TmuxServer {
-            socket: format!("muxbox-test-{tag}-{}", std::process::id()),
+            socket: format!("lemen-test-{tag}-{}", std::process::id()),
         }
     }
 

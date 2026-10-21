@@ -27,7 +27,7 @@ mod tests {
 
     #[test]
     fn writes_a_readable_png() {
-        let dir = std::env::temp_dir().join(format!("muxbox-clip-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lemen-clip-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("x.png");
         write_png(&path, 2, 1, &[255, 0, 0, 255, 0, 0, 255, 255]).unwrap();

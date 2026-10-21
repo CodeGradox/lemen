@@ -47,7 +47,7 @@ pub struct Session {
     pub activity: Activity,
     /// What Claude is waiting on, when it needs input.
     pub waiting_for: Option<String>,
-    /// muxbox started it for Claude rather than as a plain shell.
+    /// lemen started it for Claude rather than as a plain shell.
     pub started_claude: bool,
 }
 
@@ -72,7 +72,8 @@ pub enum Activity {
 /// tmux prints control characters such as tabs as `_`, and session names
 /// can't contain `:`, so fields are split on a printable marker instead.
 const SEP: &str = "|::|";
-const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{@muxbox_state}|::|#{@muxbox_worktree}|::|#{@muxbox_kind}";
+/// The `@muxbox_*` fallbacks read sessions tagged before the rename to lemen.
+const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{?@lemen_state,#{@lemen_state},#{@muxbox_state}}|::|#{?@lemen_worktree,#{@lemen_worktree},#{@muxbox_worktree}}|::|#{?@lemen_kind,#{@lemen_kind},#{@muxbox_kind}}";
 const PANES: &str = "#{session_name}|::|#{pane_pid}";
 
 pub fn fetch(cfg: &Config) -> Snapshot {
@@ -321,6 +322,7 @@ fn find_worktree(bases: &[BaseView], path: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TmuxServer;
 
     fn cfg() -> Config {
         toml::from_str(
@@ -397,5 +399,22 @@ mod tests {
             "@@base 0\n@@error no such directory\n@@now\n1\n@@tmux\n",
         );
         assert_eq!(h.bases[0].error.as_deref(), Some("no such directory"));
+    }
+
+    #[test]
+    fn reads_tags_from_before_the_rename() {
+        let server = TmuxServer::new("tags");
+        server.tmux(&["new-session", "-d", "-s", "old"]);
+        server.tmux(&["new-session", "-d", "-s", "new"]);
+        server.tmux(&["set-option", "-t", "=old:", "@muxbox_kind", "claude"]);
+        server.tmux(&["set-option", "-t", "=old:", "@muxbox_worktree", "/srv/a,b"]);
+        server.tmux(&["set-option", "-t", "=new:", "@lemen_kind", "shell"]);
+        server.tmux(&["set-option", "-t", "=new:", "@muxbox_kind", "claude"]);
+        let snap = fetch(&server.config());
+        let other = &snap.hosts[0].other;
+        let get = |name| other.iter().find(|s| s.name == name).expect(name);
+        assert!(get("old").started_claude);
+        assert_eq!(get("old").path, "/srv/a,b");
+        assert!(!get("new").started_claude);
     }
 }

@@ -3631,6 +3631,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
+name = "lemen"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "arboard",
+ "clap",
+ "futures",
+ "gpui-kit",
+ "gpui-pre",
+ "png 0.18.1",
+ "serde",
+ "serde_json",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4007,23 +4024,6 @@ name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
-
-[[package]]
-name = "muxbox"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "arboard",
- "clap",
- "futures",
- "gpui-kit",
- "gpui-pre",
- "png 0.18.1",
- "serde",
- "serde_json",
- "toml 1.1.8+spec-1.1.0",
-]
 
 [[package]]
 name = "naga"

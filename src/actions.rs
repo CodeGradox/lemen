@@ -65,7 +65,7 @@ pub fn unique_thread(label: &str, taken: impl Fn(&str) -> bool) -> String {
     format!("{label}{LABEL_END}{words}")
 }
 
-/// What muxbox shows for a session or thread: the name without its unique
+/// What lemen shows for a session or thread: the name without its unique
 /// words. `api/claude--calm-heron` shows as `api/claude`.
 pub fn label(name: &str) -> &str {
     match name.rsplit_once(LABEL_END) {
@@ -174,7 +174,7 @@ fn launch(tmux: &str, session: &str, command: &str) -> String {
 fn tag(tmux: &str, session: &str, kind: &str) -> String {
     let t = target(session);
     format!(
-        "{tmux} set-option -t {t}: @muxbox_worktree \"$dir\"\n{tmux} set-option -t {t}: @muxbox_kind {kind}"
+        "{tmux} set-option -t {t}: @lemen_worktree \"$dir\"\n{tmux} set-option -t {t}: @lemen_kind {kind}"
     )
 }
 
@@ -270,14 +270,14 @@ pub fn upload_and_type(
     let r = Remote::new(h);
     let tmux = r.tmux();
     r.run(&format!(
-        "set -e\n{tmux} set-buffer -b muxbox {}\n{tmux} paste-buffer -p -d -b muxbox -t {}:\n",
+        "set -e\n{tmux} set-buffer -b lemen {}\n{tmux} paste-buffer -p -d -b lemen -t {}:\n",
         quote(&paste_line(&paths)),
         target(session)
     ))?;
     Ok(paths)
 }
 
-/// The session to send uploads to: explicit flags, else the session muxbox
+/// The session to send uploads to: explicit flags, else the session lemen
 /// showed last.
 pub fn resolve_target(
     cfg: &Config,
@@ -289,7 +289,7 @@ pub fn resolve_target(
         return Ok((h.clone(), s.clone()));
     }
     let active = Active::load()
-        .context("no active session: open one in muxbox, or pass --host and --session")?;
+        .context("no active session: open one in lemen, or pass --host and --session")?;
     let host = host.unwrap_or(active.host);
     cfg.host_or_err(&host)?;
     Ok((host, session.unwrap_or(active.session)))
