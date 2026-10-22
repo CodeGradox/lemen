@@ -11,6 +11,16 @@ pub struct Snapshot {
     pub hosts: Vec<HostView>,
 }
 
+impl Snapshot {
+    /// The worktrees of every base on `host`.
+    pub fn worktrees<'a>(&'a self, host: &'a str) -> impl Iterator<Item = &'a Worktree> {
+        self.hosts
+            .iter()
+            .filter(move |h| h.name == host)
+            .flat_map(|h| h.bases.iter().flat_map(|b| b.worktrees.iter()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HostView {
     pub name: String,
@@ -84,7 +94,36 @@ pub enum Activity {
 const SEP: &str = "|::|";
 /// The `@muxbox_*` fallbacks read sessions tagged before the rename to lemen.
 const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{?@lemen_state,#{@lemen_state},#{@muxbox_state}}|::|#{?@lemen_worktree,#{@lemen_worktree},#{@muxbox_worktree}}|::|#{?@lemen_kind,#{@lemen_kind},#{@muxbox_kind}}|::|#{@lemen_order}";
+/// How many fields `FIELDS` asks tmux for.
+const FIELD_COUNT: usize = 8;
 const PANES: &str = "#{session_name}|::|#{pane_pid}";
+
+/// What Claude is doing. `claude agents` lists every running session with
+/// its pid and status; the process tree (`@@ps`) ties each one to the tmux
+/// pane it runs in. Starting `claude agents` takes a moment of CPU, so it
+/// runs only when a Claude does: a `claude` process, or a live pid in
+/// Claude's session registry. Without a registry (an older Claude Code,
+/// or none) it runs anyway; no answer leaves the hooks to report.
+const CLAUDE: &str = r#"echo '@@agents'
+claude_runs() {
+  dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions
+  [ -d "$dir" ] || return 0
+  pgrep -x claude >/dev/null 2>&1 && return 0
+  for f in "$dir"/*.json; do
+    pid=${f##*/}; pid=${pid%.json}
+    case $pid in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
+}
+if claude_runs; then
+  agents=$(claude agents --json 2>/dev/null) || agents=
+  printf '%s\n' "$agents"
+  case $agents in ''|'[]') ;; *) echo '@@ps'; ps -A -o pid= -o ppid= ;; esac
+else
+  echo '[]'
+fi
+"#;
 
 pub fn fetch(cfg: &Config) -> Snapshot {
     // In parallel: an unreachable host takes the whole SSH connect timeout.
@@ -124,7 +163,9 @@ fn script(cfg: &Config, host: &Host, remote: &Remote) -> String {
         .filter(|(_, b)| b.host == host.name)
     {
         s += &format!(
-            "echo '@@base {i}'\n( cd {} 2>/dev/null || {{ echo '@@error no such directory'; exit 0; }}; git worktree list --porcelain 2>/dev/null || echo \"@@plain $(pwd -P)\" )\n",
+            // Only a folder git says isn't a repository is plain; any other
+            // failure (no git, dubious ownership) is shown as git's error.
+            "echo '@@base {i}'\n( cd {} 2>/dev/null || {{ echo '@@error no such directory'; exit 0; }}\nif out=$(LC_ALL=C git worktree list --porcelain 2>&1); then printf '%s\\n' \"$out\"\nelse case $out in *'not a git repository'*) echo \"@@plain $(pwd -P)\" ;; *) echo \"@@error $out\" | head -n 1 ;; esac; fi )\n",
             sh_path(&b.path)
         );
     }
@@ -134,9 +175,7 @@ fn script(cfg: &Config, host: &Host, remote: &Remote) -> String {
         quote(PANES),
         tmux = remote.tmux(),
     );
-    // Claude Code lists every running session with its pid and status; the
-    // process tree ties each one to the tmux pane it runs in.
-    s += "echo '@@ps'\nps -A -o pid= -o ppid=\necho '@@agents'\nclaude agents --json 2>/dev/null || true\n";
+    s += CLAUDE;
     s
 }
 
@@ -208,11 +247,14 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
         });
     }
 
-    let claude = claude_activity(&agents, &panes, &parents);
-    for s in &mut sessions {
-        if let Some((activity, waiting_for)) = claude.get(&s.name) {
-            s.activity = *activity;
-            s.waiting_for = waiting_for.clone();
+    // When `claude agents` answers, it's the whole truth: a session it
+    // doesn't list has no Claude, whatever a hook last recorded.
+    if let Some(claude) = claude_activity(&agents, &panes, &parents) {
+        for s in &mut sessions {
+            (s.activity, s.waiting_for) = claude
+                .get(&s.name)
+                .cloned()
+                .unwrap_or((Activity::Unknown, None));
         }
     }
 
@@ -277,7 +319,7 @@ fn parse_worktree_line(base: &mut BaseView, line: &str) {
 
 fn parse_session(line: &str, now: u64) -> Option<Session> {
     let f: Vec<&str> = line.split(SEP).collect();
-    if f.len() != 8 {
+    if f.len() != FIELD_COUNT {
         return None;
     }
     let activity: u64 = f[3].parse().unwrap_or(now);
@@ -314,8 +356,9 @@ fn claude_activity(
     agents: &str,
     panes: &HashMap<u32, String>,
     parents: &HashMap<u32, u32>,
-) -> HashMap<String, (Activity, Option<String>)> {
-    let agents: Vec<Agent> = serde_json::from_str(agents.trim()).unwrap_or_default();
+) -> Option<HashMap<String, (Activity, Option<String>)>> {
+    // No answer means an older Claude Code, or none: hooks report instead.
+    let agents: Vec<Agent> = serde_json::from_str(agents.trim()).ok()?;
     let mut found: HashMap<String, (Activity, Option<String>)> = HashMap::new();
     for agent in agents {
         let (Some("interactive"), Some(pid)) = (agent.kind.as_deref(), agent.pid) else {
@@ -348,7 +391,7 @@ fn claude_activity(
             }
         }
     }
-    found
+    Some(found)
 }
 
 /// The worktree containing `path`, preferring the deepest match: linked
@@ -357,7 +400,9 @@ fn find_worktree(bases: &[BaseView], path: &str) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize, usize)> = None;
     for (bi, b) in bases.iter().enumerate() {
         for (wi, w) in b.worktrees.iter().enumerate() {
-            let inside = path == w.path || path.starts_with(&format!("{}/", w.path));
+            let inside = path
+                .strip_prefix(&w.path)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
             if inside && best.is_none_or(|(_, _, len)| w.path.len() > len) {
                 best = Some((bi, wi, w.path.len()));
             }
@@ -369,7 +414,37 @@ fn find_worktree(bases: &[BaseView], path: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TmuxServer;
+    use crate::test_support::{TempDir, TmuxServer};
+
+    /// `claude agents` is asked only when a Claude may run: without a
+    /// session registry, or with a live pid in it. Otherwise the answer is
+    /// known: none.
+    #[test]
+    fn claude_agents_runs_only_when_a_claude_does() {
+        let dir = TempDir::new("claude-registry");
+        let run = || {
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", CLAUDE])
+                .env("CLAUDE_CONFIG_DIR", &*dir)
+                // Neither pgrep nor claude: only the registry finds a
+                // Claude, and asking `claude agents` gets no answer.
+                .env("PATH", "/nonexistent")
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let (asked, none) = ("@@agents\n\n", "@@agents\n[]\n");
+        assert_eq!(run(), asked, "no registry");
+        let sessions = dir.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        assert_eq!(run(), none);
+        // Ended long ago: no process has that pid.
+        std::fs::write(sessions.join("999999999.json"), "{}").unwrap();
+        assert_eq!(run(), none);
+        let alive = format!("{}.json", std::process::id());
+        std::fs::write(sessions.join(alive), "{}").unwrap();
+        assert_eq!(run(), asked);
+    }
 
     fn cfg() -> Config {
         toml::from_str(
@@ -431,8 +506,9 @@ mod tests {
             tests.waiting_for.as_deref(),
             Some("Allow Bash(rm -rf build)?")
         );
-        // No Claude found: hooks state, else unknown. pid 400 is in no pane.
-        assert_eq!(wts[1].sessions[0].activity, Activity::NeedsInput);
+        // `claude agents` answered and doesn't list it: the hook's old state
+        // is stale. pid 400 is in no pane.
+        assert_eq!(wts[1].sessions[0].activity, Activity::Unknown);
         assert_eq!(h.other[0].activity, Activity::Unknown);
         // Claude's icon: started for Claude, or Claude found running.
         assert!(wts[1].sessions[0].runs_claude());
@@ -455,6 +531,22 @@ mod tests {
         // Moved or not, the main checkout is known.
         let main: Vec<bool> = h.bases[0].worktrees.iter().map(|w| w.main).collect();
         assert_eq!(main, [false, true, false, false]);
+    }
+
+    /// Without `claude agents` (an older Claude Code), hooks report.
+    #[test]
+    fn hooks_report_when_claude_agents_cant() {
+        let cfg = cfg();
+        let out = "@@now\n1000\n@@tmux\n\
+            api/auth|::|/srv|::|0|::|990|::|needs_input|::||::|claude|::|\n\
+            @@panes\napi/auth|::|90\n@@ps\n  90     1\n@@agents\n";
+        let h = parse(&cfg, &cfg.hosts[0], out);
+        assert_eq!(h.other[0].activity, Activity::NeedsInput);
+    }
+
+    #[test]
+    fn the_session_format_has_every_field() {
+        assert_eq!(FIELDS.split(SEP).count(), FIELD_COUNT);
     }
 
     #[test]

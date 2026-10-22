@@ -53,9 +53,10 @@ impl Active {
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        std::fs::create_dir_all(path.parent().expect("has parent"))?;
-        std::fs::write(path, toml::to_string(self)?)?;
-        Ok(())
+        let dir = path.parent().expect("has parent");
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::write(path, toml::to_string(self)?)
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn load() -> Result<Active> {

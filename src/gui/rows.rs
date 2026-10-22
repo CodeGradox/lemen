@@ -48,8 +48,8 @@ pub enum Entry {
     Worktree {
         label: SharedString,
         suffix: Suffix,
-        /// Its right-click menu, if it has one.
-        menu: Option<MenuBuilder>,
+        /// Its right-click menu.
+        menu: MenuBuilder,
         /// Its folder icon's color.
         color: Option<Hsla>,
         threads: Threads,
@@ -328,7 +328,7 @@ fn worktree(
     id: SharedString,
     label: SharedString,
     suffix: Suffix,
-    menu: Option<MenuBuilder>,
+    menu: MenuBuilder,
     threads: Threads,
     look: WorktreeLook,
     window: &mut Window,
@@ -370,12 +370,9 @@ fn worktree(
             .debug_selector(move || format!("worktree-{index}")),
         None => header,
     };
-    let header = match menu {
-        Some(menu) => header
-            .context_menu(move |m, window, cx| menu(m, window, cx))
-            .into_any_element(),
-        None => header.into_any_element(),
-    };
+    let header = header
+        .context_menu(move |m, window, cx| menu(m, window, cx))
+        .into_any_element();
     let border = cx.theme().sidebar_border;
     div()
         .id(id)

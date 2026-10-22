@@ -516,6 +516,26 @@ fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
             _ => row.runs.push((style, len)),
         }
     }
+    // Blanks at the end of a row draw nothing (backgrounds are painted on
+    // their own), yet would cost a glyph each to shape and paint.
+    for row in &mut rows {
+        while row.text.ends_with(' ') {
+            let Some((style, len)) = row.runs.last_mut() else {
+                break;
+            };
+            if style
+                .flags
+                .intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+            {
+                break;
+            }
+            row.text.pop();
+            *len -= 1;
+            if *len == 0 {
+                row.runs.pop();
+            }
+        }
+    }
     let cursor = (content.mode.contains(TermMode::SHOW_CURSOR)
         && content.cursor.shape != CursorShape::Hidden)
         .then(|| {
@@ -671,11 +691,40 @@ impl Render for TerminalView {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::TerminalView;
+    use super::{TerminalView, snapshot};
     use crate::gui::settings::Prefs;
+    use crate::gui::terminal::{DARK, Pty, Size};
     use crate::test_support::{TmuxServer, wait_until};
     use gpui_kit::{px, size};
     use std::time::Duration;
+
+    /// Rows reach the painter without the blanks after their text.
+    #[test]
+    fn trailing_blanks_are_not_drawn() {
+        let argv: Vec<String> = ["sh", "-c", "printf 'hi'; sleep 5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let size = Size {
+            cols: 40,
+            lines: 3,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let (pty, _events) = Pty::spawn(&argv, size).unwrap();
+        let shown = || snapshot(&pty, &DARK).rows[0].text.clone();
+        assert!(
+            wait_until(Duration::from_secs(5), || shown() == "hi"),
+            "{:?}",
+            shown()
+        );
+        let frame = snapshot(&pty, &DARK);
+        assert_eq!(
+            frame.rows[0].runs.iter().map(|(_, len)| len).sum::<usize>(),
+            2
+        );
+        assert_eq!(frame.rows[1].text, "");
+    }
 
     /// A real `tmux attach` in a headless window: resizing the window must
     /// resize the PTY, and tmux must see the new size.

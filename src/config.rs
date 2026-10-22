@@ -330,15 +330,7 @@ impl Config {
     /// `path`. Defaults are left out of the file.
     pub fn save_project_look(path: &Path, base: &Base) -> Result<()> {
         edit(path, |doc| {
-            let Some(table) = doc
-                .get_mut("bases")
-                .and_then(|b| b.as_array_of_tables_mut())
-                .and_then(|bases| {
-                    bases.iter_mut().find(|t| {
-                        t.get("host").and_then(|v| v.as_str()) == Some(&base.host)
-                            && t.get("path").and_then(|v| v.as_str()) == Some(&base.path)
-                    })
-                })
+            let Some(table) = bases_mut(doc)?.and_then(|b| b.iter_mut().find(|t| is_base(t, base)))
             else {
                 return Ok(());
             };
@@ -370,17 +362,8 @@ impl Config {
     /// stays.
     pub fn remove_folder(path: &Path, base: &Base) -> Result<()> {
         edit(path, |doc| {
-            if let Some(bases) = doc
-                .get_mut("bases")
-                .and_then(|b| b.as_array_of_tables_mut())
-            {
-                let field = |t: &toml_edit::Table, k: &str| {
-                    t.get(k).and_then(|v| v.as_str()).map(str::to_string)
-                };
-                bases.retain(|t| {
-                    field(t, "host").as_deref() != Some(&base.host)
-                        || field(t, "path").as_deref() != Some(&base.path)
-                });
+            if let Some(bases) = bases_mut(doc)? {
+                bases.retain(|t| !is_base(t, base));
             }
             Ok(())
         })
@@ -409,7 +392,41 @@ fn edit(path: &Path, change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
     change(&mut doc)?;
-    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+    write_whole(path, &doc.to_string())
+}
+
+/// The `[[bases]]` tables, if the file has any.
+fn bases_mut(doc: &mut toml_edit::DocumentMut) -> Result<Option<&mut toml_edit::ArrayOfTables>> {
+    match doc.get_mut("bases") {
+        None => Ok(None),
+        Some(bases) => bases
+            .as_array_of_tables_mut()
+            .map(Some)
+            .context("bases in the config is not a list of [[bases]] tables"),
+    }
+}
+
+/// Whether a `[[bases]]` table is `base`'s.
+fn is_base(table: &toml_edit::Table, base: &Base) -> bool {
+    let field = |key| table.get(key).and_then(|v| v.as_str());
+    field("host") == Some(base.host.as_str()) && field("path") == Some(base.path.as_str())
+}
+
+/// Writes `contents` to `path` whole or not at all: it goes to a file
+/// beside it first, then takes its place, so a crash midway leaves the old
+/// file. A symlinked file (dotfiles) stays a link, to the new contents.
+pub fn write_whole(path: &Path, contents: &str) -> Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = target
+        .file_name()
+        .with_context(|| format!("{} has no file name", target.display()))?;
+    let temporary = target.with_file_name(format!(".{}.lemen-new", name.to_string_lossy()));
+    std::fs::write(&temporary, contents)
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    if let Ok(meta) = std::fs::metadata(&target) {
+        let _ = std::fs::set_permissions(&temporary, meta.permissions());
+    }
+    std::fs::rename(&temporary, &target).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Appends a `[[key]]` table with `fields`.
@@ -611,6 +628,25 @@ path = \"~/projects/api\"
             !saved.contains("color") && !saved.contains("collapsed") && !saved.contains("order"),
             "{saved}"
         );
+
+        // A symlinked config stays a link.
+        let real = path.with_extension("real.toml");
+        std::fs::rename(&path, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        Config::save_project_look(&path, &site).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::read_to_string(&real)
+                .unwrap()
+                .contains("# keep me")
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&real, &path).unwrap();
 
         // A file with no hosts or bases yet gets its first ones.
         std::fs::write(&path, "# empty\n").unwrap();

@@ -150,19 +150,11 @@ pub fn folder_to_add(host: &Host, path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lemen-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // macOS's /tmp is a link; git reports the real path.
-        dir.canonicalize().unwrap()
-    }
+    use crate::test_support::{TempDir, git_in};
 
     #[test]
     fn aliases_come_from_the_config_and_its_includes() {
-        let dir = temp("ssh-config");
+        let dir = TempDir::new("ssh-config");
         std::fs::create_dir(dir.join("conf.d")).unwrap();
         std::fs::write(
             dir.join("conf.d/work.conf"),
@@ -186,27 +178,16 @@ mod tests {
             ["lab", "build", "agent", "db", "database"]
         );
         assert!(ssh_aliases(&dir.join("missing")).is_empty());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn folders_are_listed_and_repos_found() {
-        let dir = temp("browse");
+        let dir = TempDir::new("browse");
         for d in ["web", "api/src", ".hidden", "Docs"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
         std::fs::write(dir.join("file.txt"), "").unwrap();
-        let git = |args: &[&str]| {
-            let ok = Command::new("git")
-                .args(args)
-                .current_dir(dir.join("api"))
-                .output()
-                .unwrap()
-                .status
-                .success();
-            assert!(ok, "git {args:?}");
-        };
-        git(&["init", "-q"]);
+        git_in(&dir.join("api"), &["init", "-q"]);
         let local = Host::new("local", "local");
         let base = dir.to_string_lossy().into_owned();
 
@@ -229,6 +210,5 @@ mod tests {
         let web = format!("{base}/web");
         assert_eq!(folder_to_add(&local, &web).unwrap(), web);
         assert!(folder_to_add(&local, &format!("{base}/nope")).is_err());
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

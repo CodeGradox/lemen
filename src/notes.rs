@@ -7,7 +7,12 @@ use std::path::{Path, PathBuf};
 /// Where a worktree's notes live under `root`: the host, then the
 /// worktree's own path, so the files are easy to find by hand.
 pub fn file(root: &Path, host: &str, worktree: &str) -> PathBuf {
-    let mut path = root.join(host.replace('/', "-"));
+    // A host named `.` or `..` mustn't step out of the notes folder.
+    let host = match host.replace('/', "-") {
+        dots if dots.chars().all(|c| c == '.') => format!("_{dots}"),
+        host => host,
+    };
+    let mut path = root.join(host);
     let parts: Vec<&str> = worktree
         .split('/')
         .filter(|p| !p.is_empty() && *p != "." && *p != "..")
@@ -40,7 +45,7 @@ pub fn save(path: &Path, text: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+    crate::config::write_whole(path, text)
 }
 
 #[cfg(test)]
@@ -68,6 +73,7 @@ mod tests {
             file(root, "a/b", "/x/../../y"),
             Path::new("/notes/a-b/x/y.md")
         );
+        assert_eq!(file(root, "..", "/y"), Path::new("/notes/_../y.md"));
     }
 
     #[test]

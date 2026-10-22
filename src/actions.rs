@@ -30,7 +30,9 @@ const NOUNS: &[&str] = &[
     "robin", "salmon", "spruce", "summit", "thistle", "tiger", "walrus", "willow", "wren", "yak",
 ];
 
-/// A random `adjective-noun` name, like `calm-heron`, that `taken` accepts.
+/// A random `adjective-noun` name, like `calm-heron`, that `taken` says
+/// is free. After 50 tries it adds a number; after 100 it gives up and
+/// returns a taken one.
 pub fn random_name(taken: impl Fn(&str) -> bool) -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut name = String::new();
@@ -74,17 +76,16 @@ pub fn label(name: &str) -> &str {
     }
 }
 
-/// Starts Claude in a new worktree `worktree` of `base`, in a session for
+/// Starts Claude in a new worktree `name` of `base`, in a session for
 /// thread `thread`. Returns (host, session).
 pub fn new_worktree_thread(
     cfg: &Config,
     base: usize,
-    worktree: &str,
+    name: &str,
     thread: &str,
 ) -> Result<(String, String)> {
-    validate_name(worktree)?;
+    validate_name(name)?;
     let b = &cfg.bases[base];
-    let name = worktree;
     start_session(cfg, base, thread, |host, tmux, session| {
         let (repo, s) = (sh_path(&b.path), quote(session));
         if b.uses_claude_worktrees() {
@@ -187,7 +188,7 @@ pub fn set_order(cfg: &Config, host: &str, sessions: &[String]) -> Result<()> {
         .enumerate()
         .map(|(i, s)| format!("{tmux} set-option -t {}: @lemen_order {i}\n", target(s)))
         .collect();
-    r.run(&script)?;
+    r.run(&format!("set -e\n{script}"))?;
     Ok(())
 }
 
@@ -210,10 +211,13 @@ pub fn remove_worktree(
         .map(|s| format!("{tmux} kill-session -t {} 2>/dev/null || true\n", target(s)))
         .collect();
     let wt = quote(worktree);
+    // In English, as `why_kept` reads git's refusals.
     let remove = if force {
-        format!("git worktree unlock {wt} 2>/dev/null || true\ngit worktree remove --force {wt}")
+        format!(
+            "LC_ALL=C git worktree unlock {wt} 2>/dev/null || true\nLC_ALL=C git worktree remove --force {wt}"
+        )
     } else {
-        format!("git worktree remove {wt}")
+        format!("LC_ALL=C git worktree remove {wt}")
     };
     r.run(&format!(
         "set -e\ncd {}\n{remove}\n{close}",
@@ -359,6 +363,13 @@ pub fn resolve_target(
     }
     let active = Active::load()
         .context("no active session: open one in lemen, or pass --host and --session")?;
+    // The last session lemen showed is only the right one on its own host.
+    if session.is_none() && host.as_ref().is_some_and(|h| *h != active.host) {
+        bail!(
+            "pass --session too: lemen last showed a session on {}",
+            active.host
+        );
+    }
     let host = host.unwrap_or(active.host);
     cfg.host_or_err(&host)?;
     Ok((host, session.unwrap_or(active.session)))
@@ -367,26 +378,17 @@ pub fn resolve_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TempDir, TmuxServer, git_in};
 
     /// Removing a worktree deletes it and then closes its threads; one with
     /// changes needs force, and nothing is closed until it's gone.
     #[test]
     fn removing_a_worktree_closes_its_threads() {
-        let server = crate::test_support::TmuxServer::new("rm-wt");
-        let dir = std::env::temp_dir().join(format!("lemen-rm-wt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let repo = dir.canonicalize().unwrap().join("repo");
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}: {out:?}");
-        };
+        let server = TmuxServer::new("rm-wt");
+        let dir = TempDir::new("rm-wt");
+        let repo = dir.join("repo");
         std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
         git(&["init", "-q"]);
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
@@ -445,7 +447,6 @@ mod tests {
         remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], true).unwrap();
         assert!(!b.exists());
         assert!(!alive("repo/b1"));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

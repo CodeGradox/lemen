@@ -7,33 +7,31 @@ mod folder_picker;
 mod keys;
 mod notes;
 mod notification;
+mod projects;
+mod prompt;
 mod rows;
 mod settings;
+mod sidebar;
 mod spotlight;
 mod terminal;
 mod terminal_view;
 
 use crate::actions;
 use crate::attach::Active;
-use crate::browse;
-use crate::config::{Base, COLORS, Config, Host, ThemeChoice, home, leaf};
+use crate::config::{Config, ThemeChoice, leaf};
 use crate::snapshot::{self, Activity, Session, Snapshot, Worktree};
-use folder_picker::{FolderPicker, HostChoice, PickerEvent};
-use gpui_kit::component::WindowExt;
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
-use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenuItem};
-use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, h_flex, v_flex};
+use folder_picker::FolderPicker;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::InputState;
+use gpui_kit::component::{ActiveTheme, IconName, Sizable, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use notes::NotesPanel;
 use notification::{Notification, NotificationEvent};
 use settings::Prefs;
+use sidebar::{SIDEBAR_WIDTH, SidebarView};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::time::Duration;
 use terminal_view::TerminalView;
 
@@ -71,10 +69,8 @@ fn bind_keys(cx: &mut App) {
 }
 
 const REFRESH: Duration = Duration::from_secs(3);
-
-/// The sidebar icon for Claude sessions, drawn in Claude's orange.
-const CLAUDE_ICON: &[u8] = include_bytes!("claude.svg");
-const CLAUDE_ORANGE: u32 = 0xd97757;
+/// Out of sight, the sidebar refreshes every this many REFRESH ticks.
+const AWAY: u32 = 5;
 
 type Key = (String, String);
 /// A list of threads: a host's worktree, by path, or with `None` the host's
@@ -95,15 +91,6 @@ enum Ask {
     Rename {
         host: String,
         session: String,
-    },
-}
-
-enum Done {
-    Started(Key),
-    Renamed {
-        host: String,
-        old: String,
-        new: String,
     },
 }
 
@@ -146,11 +133,15 @@ struct Lemen {
     notes_open: bool,
     /// Adding a folder, over the window.
     picker: Option<(Entity<FolderPicker>, Subscription)>,
+    /// The sidebar, drawn by `sidebar()` but as a view of its own, so a
+    /// terminal's output doesn't redraw it.
+    sidebar: Entity<SidebarView>,
     _refresh: Task<()>,
     /// Focused when no terminal is, so keys and menu actions reach the
     /// window.
     focus: FocusHandle,
     _appearance: Subscription,
+    _sidebar_follows: Subscription,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -235,14 +226,32 @@ impl Lemen {
         let notes = cx.new(|cx| NotesPanel::new(notes_dir, window, cx));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let lemen = cx.weak_entity();
+        let sidebar = cx.new(|_| SidebarView::new(lemen));
+        let sidebar_follows =
+            cx.observe_self(|this, cx| this.sidebar.update(cx, |_, cx| cx.notify()));
         let restore = state_file
             .as_deref()
             .and_then(|p| Active::load_from(p).ok())
             .map(|a| (a.host, a.session));
+        // Every tick while you look at lemen; out of sight, where a refresh
+        // still costs each host a `claude agents`, every AWAY ticks.
+        let handle = window.window_handle();
         let refresh = cx.spawn(async move |this, cx| {
-            while let Ok(refreshed) = this.update(cx, |this, cx| this.refresh(cx)) {
-                refreshed.await;
+            let mut since = AWAY;
+            loop {
+                let looking = handle
+                    .update(cx, |_, window, _| window.is_window_active())
+                    .unwrap_or(false);
+                if looking || since >= AWAY {
+                    let Ok(refreshed) = this.update(cx, |this, cx| this.refresh(cx)) else {
+                        break;
+                    };
+                    refreshed.await;
+                    since = 0;
+                }
                 cx.background_executor().timer(REFRESH).await;
+                since += 1;
             }
         });
         // Follow macOS when it switches between light and dark.
@@ -271,32 +280,53 @@ impl Lemen {
             notes,
             notes_open: false,
             picker: None,
+            sidebar,
             _refresh: refresh,
             focus,
             _appearance: appearance,
+            _sidebar_follows: sidebar_follows,
         }
+    }
+
+    /// Runs `work` off the main thread, then `then` with its result on the
+    /// main window; that's skipped if the window has closed.
+    fn in_background<R: Send + 'static>(
+        &self,
+        cx: &mut Context<Self>,
+        work: impl FnOnce() -> R + Send + 'static,
+        then: impl FnOnce(&mut Self, R, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Task<()> {
+        let window = self.window;
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { work() }).await;
+            window
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| then(this, result, window, cx))
+                        .ok();
+                })
+                .ok();
+        })
+    }
+
+    /// Shows what went wrong in the header.
+    fn fail(&mut self, e: anyhow::Error, cx: &mut Context<Self>) {
+        self.status = Some((format!("{e:#}"), true));
+        cx.notify();
     }
 
     /// Fetches a snapshot in the background and applies it.
     fn refresh(&self, cx: &mut Context<Self>) -> Task<()> {
         let cfg = self.cfg.clone();
-        let window = self.window;
         let changes = self.changes;
-        cx.spawn(async move |this, cx| {
-            let snap = cx
-                .background_spawn(async move { snapshot::fetch(&cfg) })
-                .await;
-            window
-                .update(cx, |_, window, cx| {
-                    this.update(cx, |this, cx| {
-                        if this.changes == changes {
-                            this.set_snapshot(snap, window, cx)
-                        }
-                    })
-                    .ok();
-                })
-                .ok();
-        })
+        self.in_background(
+            cx,
+            move || snapshot::fetch(&cfg),
+            move |this, snap, window, cx| {
+                if this.changes == changes {
+                    this.set_snapshot(snap, window, cx)
+                }
+            },
+        )
     }
 
     fn set_snapshot(&mut self, snap: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
@@ -443,10 +473,8 @@ impl Lemen {
 
     /// The worktree a session runs in, and its label.
     fn worktree_of(&self, host: &str, session: &str) -> Option<(String, String)> {
-        let h = self.snap.hosts.iter().find(|h| h.name == host)?;
-        h.bases
-            .iter()
-            .flat_map(|b| b.worktrees.iter())
+        self.snap
+            .worktrees(host)
             .find(|w| w.sessions.iter().any(|s| s.name == session))
             .map(|w| (w.path.clone(), worktree_label(w)))
     }
@@ -466,29 +494,6 @@ impl Lemen {
         cx.notify();
     }
 
-    fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let hosts = host_choices(&self.cfg);
-        let picker = cx.new(|cx| FolderPicker::new(hosts, window, cx));
-        let events = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {
-            if let PickerEvent::Add { host, path } = event {
-                this.add_folder(host.clone(), path.clone(), cx);
-            }
-            this.close_picker(window, cx);
-        });
-        self.picker = Some((picker, events));
-        cx.notify();
-    }
-
-    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.picker = None;
-        self.focus_terminal(window, cx);
-    }
-
-    fn close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.prompt = None;
-        self.focus_terminal(window, cx);
-    }
-
     /// Gives the keyboard back to the session on show, after a spotlight.
     fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.active.as_ref().and_then(|k| self.terminals.get(k)) {
@@ -498,259 +503,10 @@ impl Lemen {
         cx.notify();
     }
 
-    /// The name field, in the spotlight: what it's for, the name, and a
-    /// hint or why the name can't be used.
-    fn prompt_card(&self, prompt: &Prompt, cx: &App) -> Div {
-        let (icon, what, verb) = match &prompt.what {
-            Ask::NewWorktree { base } => (
-                IconName::Folder,
-                format!("New worktree in {}", self.cfg.bases[*base].name()),
-                "start",
-            ),
-            Ask::NewThread {
-                worktree, shell, ..
-            } => (
-                if *shell {
-                    IconName::SquareTerminal
-                } else {
-                    IconName::Plus
-                },
-                format!(
-                    "New {} in {}",
-                    if *shell { "shell" } else { "Claude thread" },
-                    self.worktree_name(worktree)
-                ),
-                "start",
-            ),
-            Ask::Rename { session, .. } => (
-                IconName::CaseSensitive,
-                format!("Rename {}", actions::label(leaf(session))),
-                "rename",
-            ),
-        };
-        let footer = match &prompt.error {
-            Some((error, _)) => spotlight::footer(error.clone(), true, cx),
-            None => spotlight::footer(format!("⏎ {verb} · esc cancel"), false, cx),
-        };
-        spotlight::card(cx)
-            .child(spotlight::title(icon, what, cx))
-            .child(
-                div()
-                    .p_1()
-                    .child(Input::new(&prompt.input).appearance(false)),
-            )
-            .child(footer)
-    }
-
-    /// A worktree's name as the sidebar shows it.
-    fn worktree_name(&self, path: &str) -> String {
-        self.snap
-            .hosts
-            .iter()
-            .flat_map(|h| h.bases.iter().flat_map(|b| b.worktrees.iter()))
-            .find(|w| w.path == path)
-            .map(worktree_label)
-            .unwrap_or_else(|| leaf(path).to_string())
-    }
-
-    /// Adds a repository to the sidebar, and to the config file so it stays.
-    fn add_folder(&mut self, choice: HostChoice, path: String, cx: &mut Context<Self>) {
-        let host = choice.host;
-        if self
-            .cfg
-            .bases
-            .iter()
-            .any(|b| b.host == host.name && b.path == path)
-        {
-            self.status = Some((format!("{path} is in the sidebar already"), false));
-            cx.notify();
-            return;
-        }
-        let new_host = self.cfg.host(&host.name).is_none();
-        let base = Base::new(&host.name, &path);
-        if let Some(file) = Prefs::get(cx).config_file() {
-            let saved = Config::save_folder(file, new_host.then_some(&host), &base);
-            if let Err(e) = saved {
-                self.status = Some((format!("{e:#}"), true));
-                cx.notify();
-                return;
-            }
-        }
-        if new_host {
-            self.cfg.hosts.push(host);
-        }
-        self.cfg.bases.push(base);
-        self.refresh(cx).detach();
-        cx.notify();
-    }
-
     fn remember(&self, host: String, session: String) {
         if let Some(path) = &self.state_file {
             let _ = Active { host, session }.save_to(path);
         }
-    }
-
-    /// Opens the name field, selected so typing replaces it. It asks for a
-    /// label, which several threads can share: it starts as `claude` or
-    /// `shell`, a free random name for a worktree, or the current label.
-    fn ask_name(&mut self, what: Ask, window: &mut Window, cx: &mut Context<Self>) {
-        let name = match &what {
-            Ask::NewWorktree { base } => actions::random_name(|n| self.worktree_taken(*base, n)),
-            Ask::NewThread { shell: true, .. } => "shell".to_string(),
-            Ask::NewThread { shell: false, .. } => "claude".to_string(),
-            Ask::Rename { session, .. } => actions::label(leaf(session)).to_string(),
-        };
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("name")
-                .default_value(name)
-        });
-        let events =
-            cx.subscribe_in(
-                &input,
-                window,
-                |this, _, event: &InputEvent, _, cx| match event {
-                    InputEvent::PressEnter { .. } => this.submit(cx),
-                    // Enter also reports a change; only new text answers the error.
-                    InputEvent::Change => {
-                        if let Some(prompt) = &mut this.prompt {
-                            let text = prompt.input.read(cx).value();
-                            if prompt.error.as_ref().is_some_and(|(_, name)| *name != text) {
-                                prompt.error = None;
-                            }
-                        }
-                        cx.notify();
-                    }
-                    _ => {}
-                },
-            );
-        input.update(cx, |i, cx| {
-            i.focus(window, cx);
-            i.select_all(window, cx);
-        });
-        self.prompt = Some(Prompt {
-            what,
-            input,
-            error: None,
-            _events: events,
-        });
-        cx.notify();
-    }
-
-    /// Whether `base` already has a worktree called `name`.
-    fn worktree_taken(&self, base: usize, name: &str) -> bool {
-        self.snap
-            .hosts
-            .iter()
-            .flat_map(|h| h.bases.iter())
-            .filter(|v| v.index == base)
-            .flat_map(|v| v.worktrees.iter())
-            .any(|w| leaf(&w.path) == name)
-    }
-
-    /// A thread name for `label` in `base` that no session uses yet.
-    fn unique_thread(&self, base: usize, label: &str) -> String {
-        let b = &self.cfg.bases[base];
-        actions::unique_thread(label, |thread| {
-            let session = b.session_name(thread);
-            sessions(&self.snap).any(|(h, s)| h == b.host && s.name == session)
-        })
-    }
-
-    fn submit(&mut self, cx: &mut Context<Self>) {
-        let Some(prompt) = &mut self.prompt else {
-            return;
-        };
-        let text = prompt.input.read(cx).value().to_string();
-        let name = text.trim().to_string();
-        if let Err(e) = actions::validate_name(&name) {
-            prompt.error = Some((format!("{e:#}"), text));
-            cx.notify();
-            return;
-        }
-        let Some(Prompt { what, .. }) = self.prompt.take() else {
-            return;
-        };
-        let thread = match &what {
-            Ask::NewWorktree { base } | Ask::NewThread { base, .. } => {
-                self.unique_thread(*base, &name)
-            }
-            Ask::Rename { .. } => String::new(),
-        };
-        let cfg = self.cfg.clone();
-        let doing = match &what {
-            Ask::Rename { host, session } => {
-                self.renaming = Some((host.clone(), session.clone()));
-                "renaming"
-            }
-            _ => "starting",
-        };
-        self.status = Some((format!("{doing} {name}…"), false));
-        cx.notify();
-        let window_handle = self.window;
-        cx.spawn(async move |this, cx| {
-            let done = cx
-                .background_spawn(async move {
-                    match what {
-                        Ask::NewWorktree { base } => {
-                            actions::new_worktree_thread(&cfg, base, &name, &thread)
-                                .map(Done::Started)
-                        }
-                        Ask::NewThread {
-                            base,
-                            worktree,
-                            shell,
-                        } => actions::new_thread_in(&cfg, base, &worktree, &thread, shell)
-                            .map(Done::Started),
-                        Ask::Rename { host, session } => {
-                            actions::rename_session(&cfg, &host, &session, &name).map(|new| {
-                                Done::Renamed {
-                                    host,
-                                    old: session,
-                                    new,
-                                }
-                            })
-                        }
-                    }
-                })
-                .await;
-            window_handle
-                .update(cx, |_, window, cx| {
-                    this.update(cx, |this, cx| {
-                        this.renaming = None;
-                        match done {
-                            Ok(Done::Started((host, session))) => {
-                                this.status = None;
-                                this.open(host, session, window, cx);
-                            }
-                            Ok(Done::Renamed { host, old, new }) => {
-                                this.status = None;
-                                this.follow_rename(host, old, new, cx);
-                            }
-                            Err(e) => this.status = Some((format!("{e:#}"), true)),
-                        }
-                        this.refresh(cx).detach();
-                    })
-                })
-                .ok();
-        })
-        .detach();
-    }
-
-    /// Moves the open terminal and the selection to a renamed session.
-    fn follow_rename(&mut self, host: String, old: String, new: String, cx: &mut Context<Self>) {
-        let old_key = (host.clone(), old);
-        let new_key = (host.clone(), new.clone());
-        if let Some(view) = self.terminals.remove(&old_key) {
-            // Reconnects attach by name, so the view must learn the new one.
-            view.update(cx, |v, _| v.session = new.clone());
-            self.terminals.insert(new_key.clone(), view);
-        }
-        if self.active.as_ref() == Some(&old_key) {
-            self.active = Some(new_key);
-            self.remember(host, new);
-        }
-        cx.notify();
     }
 
     /// Moves a thread within its list: the sidebar shows the new order at
@@ -759,30 +515,26 @@ impl Lemen {
         let Some(sessions) = self.list_mut(&list) else {
             return;
         };
-        if from == to || from >= sessions.len() || to >= sessions.len() {
+        if !move_item(sessions, from, to) {
             return;
         }
-        let moved = sessions.remove(from);
-        sessions.insert(to, moved);
         let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
         self.changes += 1;
         cx.notify();
         let cfg = self.cfg.clone();
-        cx.spawn(async move |this, cx| {
-            let host = list.0;
-            let saved = cx
-                .background_spawn(async move { actions::set_order(&cfg, &host, &names) })
-                .await;
-            this.update(cx, |this, cx| {
+        let host = list.0;
+        self.in_background(
+            cx,
+            move || actions::set_order(&cfg, &host, &names),
+            |this, saved, _, cx| {
                 // Refreshes that started before tmux had the order are stale too.
                 this.changes += 1;
                 if let Err(e) = saved {
-                    this.status = Some((format!("{e:#}"), true));
+                    this.fail(e, cx);
                 }
                 this.refresh(cx).detach();
-            })
-            .ok();
-        })
+            },
+        )
         .detach();
     }
 
@@ -799,364 +551,6 @@ impl Lemen {
         }
     }
 
-    /// Asks before removing a worktree: that deletes its folder on the host
-    /// and closes the threads in it.
-    fn confirm_remove_worktree(
-        &mut self,
-        base: usize,
-        worktree: String,
-        label: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let host = self.cfg.bases[base].host.clone();
-        let sessions = self.sessions_in(&host, &worktree);
-        let threads = match sessions.len() {
-            0 => String::new(),
-            1 => " Its thread will be closed.".into(),
-            n => format!(" Its {n} threads will be closed."),
-        };
-        let description = format!("This deletes {worktree} on {host}. Its branch stays.{threads}");
-        let this = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (this, worktree, label, sessions) = (
-                this.clone(),
-                worktree.clone(),
-                label.clone(),
-                sessions.clone(),
-            );
-            alert
-                .icon(Icon::new(IconName::TriangleAlert).text_color(cx.theme().warning))
-                .title(format!("Remove worktree {label}?"))
-                .description(description.clone())
-                .show_cancel(true)
-                .ok_text("Remove")
-                .ok_variant(ButtonVariant::Danger)
-                .on_ok(move |_, window, cx| {
-                    let (worktree, label, sessions) =
-                        (worktree.clone(), label.clone(), sessions.clone());
-                    this.update(cx, |this, cx| {
-                        this.remove_worktree(base, worktree, label, sessions, false, window, cx)
-                    })
-                    .ok();
-                    true
-                })
-        });
-    }
-
-    /// The sessions running in a worktree, by name.
-    fn sessions_in(&self, host: &str, worktree: &str) -> Vec<String> {
-        self.snap
-            .hosts
-            .iter()
-            .filter(|h| h.name == host)
-            .flat_map(|h| h.bases.iter().flat_map(|b| b.worktrees.iter()))
-            .filter(|w| w.path == worktree)
-            .flat_map(|w| w.sessions.iter().map(|s| s.name.clone()))
-            .collect()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn remove_worktree(
-        &mut self,
-        base: usize,
-        worktree: String,
-        label: String,
-        sessions: Vec<String>,
-        force: bool,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let cfg = self.cfg.clone();
-        self.status = Some((format!("removing {label}…"), false));
-        cx.notify();
-        let window_handle = self.window;
-        cx.spawn(async move |this, cx| {
-            let (w, s) = (worktree.clone(), sessions.clone());
-            let removed = cx
-                .background_spawn(
-                    async move { actions::remove_worktree(&cfg, base, &w, &s, force) },
-                )
-                .await;
-            window_handle
-                .update(cx, |_, window, cx| {
-                    this.update(cx, |this, cx| {
-                        this.status = None;
-                        match removed {
-                            Ok(()) => this.forget_worktree(base, &worktree, cx),
-                            // Git keeps a locked or changed worktree unless forced.
-                            Err(e) => match (force, actions::why_kept(&e)) {
-                                (false, Some(kept)) => this.confirm_force_remove(
-                                    base, worktree, label, sessions, kept, window, cx,
-                                ),
-                                _ => this.status = Some((format!("{e:#}"), true)),
-                            },
-                        }
-                        this.refresh(cx).detach();
-                        cx.notify();
-                    })
-                    .ok();
-                })
-                .ok();
-        })
-        .detach();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn confirm_force_remove(
-        &mut self,
-        base: usize,
-        worktree: String,
-        label: String,
-        sessions: Vec<String>,
-        kept: actions::Kept,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (title, description) = match kept {
-            actions::Kept::Changes => (
-                format!("{label} has uncommitted changes"),
-                format!("Removing it anyway deletes them for good, with {worktree}."),
-            ),
-            actions::Kept::Locked(reason) => {
-                let why = if reason.is_empty() {
-                    String::new()
-                } else {
-                    format!(" by {reason}")
-                };
-                (
-                    format!("{label} is locked"),
-                    format!(
-                        "Git keeps it{why}. Removing it anyway unlocks and deletes {worktree}, with any uncommitted changes in it."
-                    ),
-                )
-            }
-        };
-        let this = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (this, worktree, label, sessions) = (
-                this.clone(),
-                worktree.clone(),
-                label.clone(),
-                sessions.clone(),
-            );
-            alert
-                .icon(Icon::new(IconName::TriangleAlert).text_color(cx.theme().warning))
-                .title(title.clone())
-                .description(description.clone())
-                .show_cancel(true)
-                .ok_text("Remove anyway")
-                .ok_variant(ButtonVariant::Danger)
-                .on_ok(move |_, window, cx| {
-                    let (worktree, label, sessions) =
-                        (worktree.clone(), label.clone(), sessions.clone());
-                    this.update(cx, |this, cx| {
-                        this.remove_worktree(base, worktree, label, sessions, true, window, cx)
-                    })
-                    .ok();
-                    true
-                })
-        });
-    }
-
-    /// A project's menu: removing it.
-    fn project_menu(&self, index: usize, cx: &mut Context<Self>) -> rows::MenuBuilder {
-        let this = cx.entity().downgrade();
-        let project = self.cfg.bases[index].clone();
-        Rc::new(move |menu, _, _| {
-            let (this, project) = (this.clone(), project.clone());
-            menu.item(
-                PopupMenuItem::new("Remove project…").on_click(move |_, window, cx| {
-                    this.update(cx, |this, cx| {
-                        this.confirm_remove_project(project.clone(), window, cx)
-                    })
-                    .ok();
-                }),
-            )
-        })
-    }
-
-    /// The colors a worktree's folder can take, as a submenu: each with its
-    /// swatch, the current one checked, and none.
-    fn color_menu(
-        &self,
-        index: usize,
-        worktree: &str,
-        cx: &mut Context<Self>,
-    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
-        let this = cx.entity().downgrade();
-        let current = self.cfg.bases[index].worktree_colors.get(worktree).cloned();
-        let worktree = worktree.to_string();
-        move |menu, _, _| {
-            let set = |color: Option<&'static str>| {
-                let (this, worktree) = (this.clone(), worktree.clone());
-                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    this.update(cx, |this, cx| {
-                        this.set_worktree_color(index, &worktree, color, cx)
-                    })
-                    .ok();
-                }
-            };
-            let menu = COLORS.iter().fold(menu, |menu, &(name, hex)| {
-                menu.item(
-                    PopupMenuItem::element(move |_, _| {
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(div().size_3().rounded_full().bg(rgb(hex)))
-                            .child(title_case(name))
-                    })
-                    .checked(current.as_deref() == Some(name))
-                    .on_click(set(Some(name))),
-                )
-            });
-            menu.separator().item(
-                PopupMenuItem::new("No color")
-                    .checked(current.is_none())
-                    .on_click(set(None)),
-            )
-        }
-    }
-
-    /// Folds a project away in the sidebar, or opens it again.
-    fn toggle_project(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(base) = self.cfg.bases.get_mut(index) else {
-            return;
-        };
-        base.collapsed = !base.collapsed;
-        self.save_look(index, cx);
-    }
-
-    /// Colors a worktree's folder icon, or with `None` takes its color off.
-    fn set_worktree_color(
-        &mut self,
-        index: usize,
-        worktree: &str,
-        color: Option<&str>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(base) = self.cfg.bases.get_mut(index) else {
-            return;
-        };
-        match color {
-            Some(color) => base
-                .worktree_colors
-                .insert(worktree.to_string(), color.to_string()),
-            None => base.worktree_colors.remove(worktree),
-        };
-        self.save_look(index, cx);
-    }
-
-    /// Forgets a removed worktree's color and place in the order.
-    fn forget_worktree(&mut self, index: usize, worktree: &str, cx: &mut Context<Self>) {
-        let Some(base) = self.cfg.bases.get_mut(index) else {
-            return;
-        };
-        let had_color = base.worktree_colors.remove(worktree).is_some();
-        let placed = base.worktree_order.len();
-        base.worktree_order.retain(|p| p != worktree);
-        if had_color || base.worktree_order.len() != placed {
-            self.save_look(index, cx);
-        }
-    }
-
-    /// Moves a worktree within its project: the sidebar shows the new order
-    /// at once, and the config keeps it.
-    fn reorder_worktrees(&mut self, index: usize, from: usize, to: usize, cx: &mut Context<Self>) {
-        let Some(view) = self
-            .snap
-            .hosts
-            .iter_mut()
-            .flat_map(|h| h.bases.iter_mut())
-            .find(|b| b.index == index)
-        else {
-            return;
-        };
-        if from == to || from >= view.worktrees.len() || to >= view.worktrees.len() {
-            return;
-        }
-        let moved = view.worktrees.remove(from);
-        view.worktrees.insert(to, moved);
-        self.cfg.bases[index].worktree_order =
-            view.worktrees.iter().map(|w| w.path.clone()).collect();
-        // A refresh already under way sorts by the old order.
-        self.changes += 1;
-        self.save_look(index, cx);
-    }
-
-    /// Keeps a project's color, fold and worktree order in the config file.
-    fn save_look(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(file) = Prefs::get(cx).config_file()
-            && let Err(e) = Config::save_project_look(file, &self.cfg.bases[index])
-        {
-            self.status = Some((format!("{e:#}"), true));
-        }
-        cx.notify();
-    }
-
-    /// Asks before taking a project out of lemen; nothing on the host changes.
-    fn confirm_remove_project(
-        &mut self,
-        project: Base,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let this = cx.entity().downgrade();
-        let description = format!(
-            "Only lemen forgets it. {} on {}, its worktrees and running threads stay as they are.",
-            project.path, project.host
-        );
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let (this, project) = (this.clone(), project.clone());
-            alert
-                .title(format!("Remove {} from lemen?", project.name()))
-                .description(description.clone())
-                .show_cancel(true)
-                .ok_text("Remove")
-                .on_ok(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.remove_project(&project, cx))
-                        .ok();
-                    true
-                })
-        });
-    }
-
-    /// Takes a project out of the sidebar and the config file.
-    fn remove_project(&mut self, project: &Base, cx: &mut Context<Self>) {
-        let Some(index) = self
-            .cfg
-            .bases
-            .iter()
-            .position(|b| b.host == project.host && b.path == project.path)
-        else {
-            return;
-        };
-        if let Some(file) = Prefs::get(cx).config_file()
-            && let Err(e) = Config::remove_folder(file, project)
-        {
-            self.status = Some((format!("{e:#}"), true));
-            cx.notify();
-            return;
-        }
-        self.cfg.bases.remove(index);
-        // The snapshot points into the config's bases by index: drop the
-        // project's view, shift the later ones, and drop snapshots on their
-        // way that still use the old numbers.
-        for h in &mut self.snap.hosts {
-            h.bases.retain(|b| b.index != index);
-            for b in &mut h.bases {
-                if b.index > index {
-                    b.index -= 1;
-                }
-            }
-        }
-        self.changes += 1;
-        // A name field may be asking about it.
-        self.prompt = None;
-        self.refresh(cx).detach();
-        cx.notify();
-    }
-
     /// First click arms, second click kills; the worktree stays.
     fn kill(&mut self, key: Key, cx: &mut Context<Self>) {
         if self.confirm_kill.as_ref() != Some(&key) {
@@ -1166,351 +560,18 @@ impl Lemen {
         }
         self.confirm_kill = None;
         let cfg = self.cfg.clone();
-        cx.spawn(async move |this, cx| {
-            let (host, session) = key;
-            let killed = cx
-                .background_spawn(async move { actions::kill_session(&cfg, &host, &session) })
-                .await;
-            this.update(cx, |this, cx| {
+        let (host, session) = key;
+        self.in_background(
+            cx,
+            move || actions::kill_session(&cfg, &host, &session),
+            |this, killed, _, cx| {
                 if let Err(e) = killed {
-                    this.status = Some((format!("{e:#}"), true));
+                    this.fail(e, cx);
                 }
                 this.refresh(cx).detach();
-            })
-            .ok();
-        })
+            },
+        )
         .detach();
-    }
-
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let this = cx.entity().downgrade();
-        let mut groups: Vec<rows::Group> = vec![];
-        for h in &self.snap.hosts {
-            if let Some(e) = &h.error {
-                groups.push(rows::Group::new(
-                    h.name.clone(),
-                    rows::Menu::default().child(rows::Entry::Item(Box::new(
-                        SidebarMenuItem::new(e.clone())
-                            .icon(IconName::TriangleAlert)
-                            .disable(true),
-                    ))),
-                ));
-                continue;
-            }
-            for b in &h.bases {
-                let base = &self.cfg.bases[b.index];
-                let index = b.index;
-                let reorder: rows::Reorder = {
-                    let this = this.clone();
-                    Rc::new(move |from, to, _, cx| {
-                        this.update(cx, |this, cx| this.reorder_worktrees(index, from, to, cx))
-                            .ok();
-                    })
-                };
-                let mut menu = rows::Menu::default()
-                    .reorder_worktrees(format!("project {}\n{}", base.host, base.path), reorder);
-                // A folder without git has no worktrees to add.
-                if !b.plain {
-                    menu = menu.child(rows::Entry::Item(Box::new(
-                        SidebarMenuItem::new("New worktree")
-                            .icon(IconName::Plus)
-                            .on_click(ask_on_click(&this, move || Ask::NewWorktree {
-                                base: index,
-                            })),
-                    )));
-                }
-                if let Some(e) = &b.error {
-                    menu = menu.child(rows::Entry::Item(Box::new(
-                        SidebarMenuItem::new(e.clone())
-                            .icon(IconName::TriangleAlert)
-                            .disable(true),
-                    )));
-                }
-                let prefix = format!("{}/", base.name());
-                for w in &b.worktrees {
-                    // The main checkout and a plain folder are the project itself.
-                    let removable = !w.main;
-                    menu =
-                        menu.child(self.worktree_item(&h.name, index, w, removable, &prefix, cx));
-                }
-                let toggle: rows::Toggle = {
-                    let this = this.clone();
-                    Rc::new(move |_, cx| {
-                        this.update(cx, |this, cx| this.toggle_project(index, cx))
-                            .ok();
-                    })
-                };
-                groups.push(
-                    rows::Group::new(format!("{} · {}", base.name(), h.name), menu)
-                        .foldable(base.collapsed, toggle)
-                        .menu(self.project_menu(index, cx)),
-                );
-            }
-            if !h.other.is_empty() {
-                let threads = self.threads(&h.name, None, &h.other, "", cx);
-                groups.push(rows::Group::new(
-                    format!("other · {}", h.name),
-                    rows::Menu::default().child(rows::Entry::Threads(threads)),
-                ));
-            }
-        }
-        let add = {
-            let this = this.clone();
-            Button::new("add-folder")
-                .icon(IconName::Plus)
-                .ghost()
-                .xsmall()
-                .tooltip("Add folder")
-                .on_click(move |_, window, cx| {
-                    this.update(cx, |this, cx| this.open_picker(window, cx))
-                        .ok();
-                })
-        };
-        let refresh = {
-            let this = this.clone();
-            Button::new("refresh")
-                .icon(IconName::RefreshCw)
-                .ghost()
-                .xsmall()
-                .tooltip("Refresh")
-                .on_click(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.refresh(cx).detach()).ok();
-                })
-        };
-        Sidebar::new("sessions")
-            .collapsible(SidebarCollapsible::Offcanvas)
-            .collapsed(self.collapsed)
-            .header(
-                SidebarHeader::new().child(
-                    h_flex()
-                        .w_full()
-                        .justify_between()
-                        .child(div().font_semibold().child("lemen"))
-                        .child(h_flex().gap_1().child(add).child(refresh)),
-                ),
-            )
-            .children(groups)
-    }
-
-    /// A worktree with its sessions; + offers a Claude thread or a shell.
-    fn worktree_item(
-        &self,
-        host: &str,
-        base: usize,
-        w: &Worktree,
-        removable: bool,
-        prefix: &str,
-        cx: &mut Context<Self>,
-    ) -> rows::Entry {
-        let label = worktree_label(w);
-        // Color for every worktree; removing only for linked ones.
-        let menu: rows::MenuBuilder = {
-            let this = cx.entity().downgrade();
-            let colors = Rc::new(self.color_menu(base, &w.path, cx));
-            let (worktree, label) = (w.path.clone(), label.clone());
-            Rc::new(
-                move |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
-                    let colors = colors.clone();
-                    let menu = menu.submenu("Color", window, cx, move |m, w, cx| colors(m, w, cx));
-                    if !removable {
-                        return menu;
-                    }
-                    let (this, worktree, label) = (this.clone(), worktree.clone(), label.clone());
-                    menu.separator()
-                        .item(PopupMenuItem::new("Remove worktree…").on_click(
-                            move |_, window, cx| {
-                                this.update(cx, |this, cx| {
-                                    this.confirm_remove_worktree(
-                                        base,
-                                        worktree.clone(),
-                                        label.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                })
-                                .ok();
-                            },
-                        ))
-                },
-            )
-        };
-        let color = worktree_color(&self.cfg.bases[base], &w.path);
-        let this = cx.entity().downgrade();
-        let worktree = w.path.clone();
-        let (host_name, notes_label) = (host.to_string(), label.clone());
-        let add = move |_: &mut Window, _: &mut App| {
-            let notes = {
-                let (this, host, worktree, label) = (
-                    this.clone(),
-                    host_name.clone(),
-                    worktree.clone(),
-                    notes_label.clone(),
-                );
-                Button::new("notes")
-                    .icon(IconName::FileText)
-                    .ghost()
-                    .xsmall()
-                    .tooltip("Notes")
-                    .on_click(move |_, window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.open_notes(&host, &worktree, &label, window, cx)
-                        })
-                        .ok();
-                    })
-            };
-            let (this, worktree) = (this.clone(), worktree.clone());
-            let add = Button::new("add")
-                .icon(IconName::Plus)
-                .ghost()
-                .xsmall()
-                .tooltip("New session here")
-                .dropdown_menu(move |menu, _, _| {
-                    let item = |label: &'static str, shell: bool| {
-                        let worktree = worktree.clone();
-                        PopupMenuItem::new(label).on_click(ask_on_click(&this, move || {
-                            Ask::NewThread {
-                                base,
-                                worktree: worktree.clone(),
-                                shell,
-                            }
-                        }))
-                    };
-                    menu.item(item("Claude", false)).item(item("Shell", true))
-                });
-            h_flex().gap_1().child(notes).child(add)
-        };
-        rows::Entry::Worktree {
-            label: label.into(),
-            suffix: Rc::new(move |window, cx| add(window, cx).into_any_element()),
-            menu: Some(menu),
-            color,
-            threads: self.threads(host, Some(&w.path), &w.sessions, prefix, cx),
-        }
-    }
-
-    /// Threads that can be dragged into a new order.
-    fn threads(
-        &self,
-        host: &str,
-        worktree: Option<&str>,
-        sessions: &[Session],
-        prefix: &str,
-        cx: &mut Context<Self>,
-    ) -> rows::Threads {
-        let this = cx.entity().downgrade();
-        let list: List = (host.to_string(), worktree.map(str::to_string));
-        rows::Threads {
-            key: format!("{host}\n{}", worktree.unwrap_or_default()).into(),
-            rows: sessions
-                .iter()
-                .map(|s| self.session_item(host, s, prefix, cx))
-                .collect(),
-            reorder: Rc::new(move |from, to, _, cx| {
-                this.update(cx, |this, cx| this.reorder(list.clone(), from, to, cx))
-                    .ok();
-            }),
-        }
-    }
-
-    fn session_item(
-        &self,
-        host: &str,
-        s: &Session,
-        prefix: &str,
-        cx: &mut Context<Self>,
-    ) -> rows::Thread {
-        let this = cx.entity().downgrade();
-        let key = key(host, s);
-        let active = self.active.as_ref() == Some(&key);
-        let arming = self.confirm_kill.as_ref() == Some(&key);
-        let label = actions::label(s.name.strip_prefix(prefix).unwrap_or(&s.name)).to_string();
-        let working = s.activity == Activity::Working;
-        let (dot, tip): (Hsla, SharedString) = match s.activity {
-            Activity::NeedsInput => (
-                cx.theme().warning,
-                match &s.waiting_for {
-                    Some(what) => format!("Needs input: {what}").into(),
-                    None => "Needs input".into(),
-                },
-            ),
-            Activity::Working => (cx.theme().success, "Working".into()),
-            _ if self.done.contains(&key) => (cx.theme().info, "Done".into()),
-            Activity::Idle => (cx.theme().muted_foreground.opacity(0.5), "Idle".into()),
-            Activity::Unknown => (
-                cx.theme().muted_foreground.opacity(0.5),
-                "No Claude found".into(),
-            ),
-        };
-        let detail = age(s.idle_secs);
-        let muted = cx.theme().muted_foreground;
-        // Click opens; a double click (its second click) starts a rename.
-        let open = {
-            let this = this.clone();
-            let key = key.clone();
-            move |event: &ClickEvent, window: &mut Window, cx: &mut App| {
-                let (host, session) = key.clone();
-                this.update(cx, |this, cx| {
-                    if event.click_count() >= 2 {
-                        this.ask_name(Ask::Rename { host, session }, window, cx);
-                    } else {
-                        this.open(host, session, window, cx);
-                    }
-                })
-                .ok();
-            }
-        };
-        let menu = {
-            let this = this.clone();
-            let key = key.clone();
-            move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-                let key = key.clone();
-                menu.item(
-                    PopupMenuItem::new("Rename…").on_click(ask_on_click(&this, move || {
-                        let (host, session) = key.clone();
-                        Ask::Rename { host, session }
-                    })),
-                )
-            }
-        };
-        let suffix = move |_: &mut Window, _: &mut App| {
-            let this = this.clone();
-            let key = key.clone();
-            let status = status_dot(&key, dot, working, tip.clone());
-            let kill = Button::new("kill")
-                .ghost()
-                .xsmall()
-                .on_click(move |_, _, cx| {
-                    // Otherwise the row opens the session too, which disarms the kill.
-                    cx.stop_propagation();
-                    this.update(cx, |this, cx| this.kill(key.clone(), cx)).ok();
-                });
-            let kill = if arming {
-                kill.danger().label("Kill?")
-            } else {
-                kill.icon(IconName::Close).tooltip("Kill session")
-            };
-            h_flex()
-                .gap_1()
-                .items_center()
-                .child(div().text_xs().text_color(muted).child(detail.clone()))
-                .child(status)
-                .child(kill)
-        };
-        let icon = if s.runs_claude() {
-            Icon::empty()
-                .data(CLAUDE_ICON)
-                .text_color(rgb(CLAUDE_ORANGE))
-        } else {
-            Icon::new(IconName::SquareTerminal)
-        };
-        rows::Thread {
-            icon,
-            label: label.into(),
-            active,
-            on_click: Rc::new(open),
-            menu: Rc::new(menu),
-            suffix: Rc::new(move |window, cx| suffix(window, cx).into_any_element()),
-        }
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -1524,7 +585,6 @@ impl Lemen {
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let this = cx.entity().downgrade();
         let toggle = Button::new("toggle-sidebar")
             .icon(if self.collapsed {
                 IconName::PanelLeftOpen
@@ -1534,9 +594,7 @@ impl Lemen {
             .ghost()
             .small()
             .tooltip("Toggle sidebar (⌘B)")
-            .on_click(move |_, _, cx| {
-                this.update(cx, |this, cx| this.toggle_sidebar(cx)).ok();
-            });
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
         let title = match &self.active {
             Some((host, session)) => format!("{}  ·  {host}", actions::label(session)),
             None => String::new(),
@@ -1567,7 +625,6 @@ impl Lemen {
         } else {
             bar = bar.child(div().flex_1());
         }
-        let this = cx.entity().downgrade();
         bar.child(
             Button::new("toggle-notes")
                 .icon(if self.notes_open {
@@ -1578,9 +635,7 @@ impl Lemen {
                 .ghost()
                 .small()
                 .tooltip("Notes")
-                .on_click(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.toggle_notes(cx)).ok();
-                }),
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_notes(cx))),
         )
     }
 }
@@ -1635,7 +690,16 @@ impl Render for Lemen {
                     cx.stop_propagation();
                 }
             }))
-            .child(self.sidebar(cx))
+            .when(!self.collapsed, |this| {
+                this.child(
+                    self.sidebar.clone().cached(
+                        StyleRefinement::default()
+                            .h_full()
+                            .w(SIDEBAR_WIDTH)
+                            .flex_shrink_0(),
+                    ),
+                )
+            })
             .child(
                 v_flex()
                     .flex_1()
@@ -1655,7 +719,12 @@ impl Render for Lemen {
                                         .flex_shrink_0()
                                         .border_l_1()
                                         .border_color(cx.theme().border)
-                                        .child(self.notes.clone()),
+                                        // Cached like the terminal; it redraws on its own changes.
+                                        .child(
+                                            self.notes
+                                                .clone()
+                                                .cached(StyleRefinement::default().size_full()),
+                                        ),
                                 )
                             }),
                     ),
@@ -1668,36 +737,15 @@ impl Render for Lemen {
     }
 }
 
-/// The hosts a folder can be added from: lemen's own, then the SSH config's
-/// other aliases, then this Mac.
-fn host_choices(cfg: &Config) -> Vec<HostChoice> {
-    let mut choices: Vec<HostChoice> = cfg
-        .hosts
-        .iter()
-        .map(|host| HostChoice {
-            host: host.clone(),
-            configured: true,
-        })
-        .collect();
-    let aliases = home()
-        .map(|home| browse::ssh_aliases(&home.join(".ssh/config")))
-        .unwrap_or_default();
-    let known = |name: &str| cfg.hosts.iter().any(|h| h.name == name || h.ssh == name);
-    for alias in aliases {
-        if !known(&alias) {
-            choices.push(HostChoice {
-                host: Host::new(&alias, &alias),
-                configured: false,
-            });
-        }
+/// Moves `items[from]` to `to`. False if that's no move, or either is out
+/// of range.
+fn move_item<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from == to || from >= items.len() || to >= items.len() {
+        return false;
     }
-    if !known("local") {
-        choices.push(HostChoice {
-            host: Host::new("local", "local"),
-            configured: false,
-        });
-    }
-    choices
+    let moved = items.remove(from);
+    items.insert(to, moved);
+    true
 }
 
 fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
@@ -1711,22 +759,6 @@ fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
             .chain(h.other.iter())
             .map(move |s| (h.name.as_str(), s))
     })
-}
-
-/// A worktree's folder color, from its name in the config.
-fn worktree_color(base: &Base, worktree: &str) -> Option<Hsla> {
-    let name = base.worktree_colors.get(worktree)?;
-    let (_, hex) = COLORS.iter().find(|(n, _)| n == name)?;
-    Some(rgb(*hex).into())
-}
-
-/// `blue` as `Blue`, for menus.
-fn title_case(name: &str) -> String {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .map(|c| c.to_uppercase().chain(chars).collect())
-        .unwrap_or_default()
 }
 
 /// A worktree's name in the sidebar: its branch, which tells worktrees
@@ -1748,59 +780,14 @@ fn key(host: &str, s: &Session) -> Key {
     (host.to_string(), s.name.clone())
 }
 
-/// A click handler that opens the name field for `ask()`.
-fn ask_on_click(
-    this: &WeakEntity<Lemen>,
-    ask: impl Fn() -> Ask + 'static,
-) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
-    let this = this.clone();
-    move |_, window, cx| {
-        this.update(cx, |this, cx| this.ask_name(ask(), window, cx))
-            .ok();
-    }
-}
-
-/// A session's status dot; it breathes while Claude works.
-fn status_dot(key: &Key, color: Hsla, working: bool, tip: SharedString) -> AnyElement {
-    let id = SharedString::from(format!("status-{}-{}", key.0, key.1));
-    let dot = div()
-        .id(id.clone())
-        .size_2()
-        .rounded_full()
-        .bg(color)
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
-    if working {
-        dot.with_animation(
-            id,
-            // Every animation frame redraws the window; 15 fps is smooth enough.
-            Animation::new(Duration::from_millis(1600))
-                .repeat()
-                .with_max_fps(15.0)
-                .with_easing(pulsating_between(0.35, 1.0)),
-            |dot, delta| dot.opacity(delta),
-        )
-        .into_any_element()
-    } else {
-        dot.into_any_element()
-    }
-}
-
-fn age(secs: u64) -> String {
-    match secs {
-        0..60 => "now".into(),
-        60..3600 => format!("{}m", secs / 60),
-        3600..86400 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86400),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Ask, HostChoice, Key, Lemen, NotificationEvent};
+    use super::folder_picker::HostChoice;
+    use super::{Ask, Key, Lemen, NotificationEvent};
     use crate::config::{Base, Config};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
-    use crate::test_support::{TmuxServer, wait_until};
+    use crate::test_support::{TempDir, TmuxServer, git_in, wait_until};
     use gpui::VisualTestContext;
     use gpui_kit::component::WindowExt;
     use gpui_kit::{AppContext, Entity, Modifiers, MouseButton, point, px, size};
@@ -1855,16 +842,7 @@ mod tests {
         let server = TmuxServer::new("app");
         server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
         // The PTY reader is a real thread, so this test can't be deterministic.
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        // Wrapped in Root exactly as gpui_kit::open_window does.
-        let mut app = None;
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|cx| Lemen::new(server.config(), None, window, cx));
-            app = Some(view.clone());
-            gpui_kit::base::Root::new(view, window, cx)
-        });
-        let app = app.unwrap();
+        let (app, cx) = rooted(server.config(), cx);
         open(&app, "t", cx);
         let view = app.read_with(cx, |app, _| app.terminals[&key("t")].clone());
 
@@ -1888,15 +866,7 @@ mod tests {
         for name in ["a", "b", "c"] {
             server.tmux(&["new-session", "-d", "-s", name]);
         }
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let mut app = None;
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|cx| Lemen::new(server.config(), None, window, cx));
-            app = Some(view.clone());
-            gpui_kit::base::Root::new(view, window, cx)
-        });
-        let app = app.unwrap();
+        let (app, cx) = rooted(server.config(), cx);
         cx.simulate_resize(size(px(1000.0), px(600.0)));
         cx.run_until_parked();
         let shown = |cx: &mut VisualTestContext| {
@@ -1910,13 +880,7 @@ mod tests {
         };
         assert_eq!(shown(cx), ["a", "b", "c"]);
 
-        let from = cx.debug_bounds("thread-0").expect("a's row").center();
-        let to = cx.debug_bounds("thread-2").expect("c's row").center();
-        let none = Modifiers::none();
-        cx.simulate_mouse_down(from, MouseButton::Left, none);
-        cx.simulate_mouse_move(from + point(px(0.0), px(6.0)), MouseButton::Left, none);
-        cx.simulate_mouse_move(to, MouseButton::Left, none);
-        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        drag("thread-0", "thread-2", cx);
         assert_eq!(shown(cx), ["b", "c", "a"]);
 
         cx.run_until_parked();
@@ -2067,6 +1031,18 @@ mod tests {
         });
     }
 
+    /// Drags one element onto another, by their debug selectors, as a mouse
+    /// does: down, a little move to start the drag, then over and up.
+    fn drag(from: &'static str, to: &'static str, cx: &mut VisualTestContext) {
+        let from = cx.debug_bounds(from).expect(from).center();
+        let to = cx.debug_bounds(to).expect(to).center();
+        let none = Modifiers::none();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from + point(px(0.0), px(6.0)), MouseButton::Left, none);
+        cx.simulate_mouse_move(to, MouseButton::Left, none);
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+    }
+
     /// Wraps the app in Root, as `gpui_kit::open_window` does; dialogs need it.
     fn rooted(
         cfg: Config,
@@ -2121,20 +1097,10 @@ mod tests {
     #[gpui::test]
     fn removing_a_changed_worktree_asks_again(cx: &mut gpui::TestAppContext) {
         let server = TmuxServer::new("rm-dirty");
-        let dir = std::env::temp_dir().join(format!("lemen-rm-dirty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("repo")).unwrap();
-        let repo = dir.canonicalize().unwrap().join("repo");
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .current_dir(&repo)
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?}");
-        };
+        let dir = TempDir::new("rm-dirty");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
         git(&["init", "-q"]);
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         git(&["worktree", "add", "-q", "-b", "draft", "wt"]);
@@ -2146,10 +1112,9 @@ mod tests {
         let path = wt.to_string_lossy().into_owned();
 
         let remove = |force: bool, cx: &mut VisualTestContext| {
-            cx.update(|window, cx| {
-                app.update(cx, |app, cx| {
-                    app.remove_worktree(0, path.clone(), "draft".into(), vec![], force, window, cx)
-                })
+            app.update(cx, |app, cx| {
+                let removal = app.removal(0, path.clone(), "draft".into());
+                app.remove_worktree(removal, force, cx)
             });
             cx.run_until_parked();
         };
@@ -2167,7 +1132,6 @@ mod tests {
         app.read_with(cx, |app, _| {
             assert!(app.cfg.bases[0].worktree_colors.is_empty())
         });
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Names are asked for in the spotlight: a bad one is explained there
@@ -2235,8 +1199,8 @@ mod tests {
             app.set_worktree_color(0, "/srv/api", Some("teal"), cx)
         });
         app.read_with(cx, |app, _| {
-            assert!(super::worktree_color(&app.cfg.bases[0], "/srv/api").is_some());
-            assert!(super::worktree_color(&app.cfg.bases[0], "/srv/api/wt").is_none());
+            assert!(super::sidebar::worktree_color(&app.cfg.bases[0], "/srv/api").is_some());
+            assert!(super::sidebar::worktree_color(&app.cfg.bases[0], "/srv/api/wt").is_none());
         });
         app.update(cx, |app, cx| {
             app.set_worktree_color(0, "/srv/api", None, cx)
@@ -2251,20 +1215,10 @@ mod tests {
     #[gpui::test]
     fn dragging_a_worktree_reorders_its_project(cx: &mut gpui::TestAppContext) {
         let server = TmuxServer::new("drag-wt");
-        let dir = std::env::temp_dir().join(format!("lemen-drag-wt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("api")).unwrap();
-        let repo = dir.canonicalize().unwrap().join("api");
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .current_dir(&repo)
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?}");
-        };
+        let dir = TempDir::new("drag-wt");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
         git(&["init", "-q", "-b", "main"]);
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
@@ -2288,13 +1242,7 @@ mod tests {
         };
         assert_eq!(names(cx), ["main", "a", "b"]);
 
-        let from = cx.debug_bounds("worktree-0").expect("main's row").center();
-        let to = cx.debug_bounds("worktree-2").expect("b's row").center();
-        let none = Modifiers::none();
-        cx.simulate_mouse_down(from, MouseButton::Left, none);
-        cx.simulate_mouse_move(from + point(px(0.0), px(6.0)), MouseButton::Left, none);
-        cx.simulate_mouse_move(to, MouseButton::Left, none);
-        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        drag("worktree-0", "worktree-2", cx);
         assert_eq!(names(cx), ["a", "b", "main"]);
 
         app.update(cx, |app, cx| app.refresh(cx).detach());
@@ -2307,7 +1255,6 @@ mod tests {
                 ("main".to_string(), true)
             ]
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The menus' actions and keys reach the main window: ⌘O opens the
@@ -2329,6 +1276,60 @@ mod tests {
         cx.simulate_keystrokes("cmd-r");
         cx.run_until_parked();
         app.read_with(cx, |app, _| assert!(app.loaded, "a refresh came in"));
+    }
+
+    /// Out of sight, refreshes come every AWAY ticks rather than every
+    /// tick; back in sight, every tick again.
+    #[gpui::test]
+    fn refreshes_slow_down_out_of_sight(cx: &mut gpui::TestAppContext) {
+        // Test windows start inactive.
+        let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
+        // Whether a refresh came in since the last ask.
+        let refreshed = |cx: &mut VisualTestContext| {
+            app.update(cx, |app, _| std::mem::replace(&mut app.loaded, false))
+        };
+        let tick = |cx: &mut VisualTestContext| {
+            cx.executor().advance_clock(super::REFRESH);
+            cx.run_until_parked();
+        };
+        assert!(refreshed(cx), "the first one");
+        for _ in 1..super::AWAY {
+            tick(cx);
+            assert!(!refreshed(cx));
+        }
+        tick(cx);
+        assert!(refreshed(cx));
+
+        cx.update(|window, _| window.activate_window());
+        for _ in 0..2 {
+            tick(cx);
+            assert!(refreshed(cx));
+        }
+    }
+
+    /// Terminal output redraws the terminal alone; the cached sidebar waits
+    /// until the app itself changes.
+    #[gpui::test]
+    fn terminal_output_leaves_the_sidebar_alone(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("cache");
+        server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        open(&app, "t", cx);
+        cx.run_until_parked();
+        let renders =
+            |cx: &mut VisualTestContext| app.read_with(cx, |app, cx| app.sidebar.read(cx).renders);
+        let before = renders(cx);
+        assert!(before > 0, "drawn at least once");
+
+        let terminal = app.read_with(cx, |app, _| app.terminals[&key("t")].clone());
+        terminal.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(renders(cx), before);
+
+        app.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(renders(cx) > before);
     }
 
     #[gpui::test]

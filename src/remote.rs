@@ -14,8 +14,19 @@ const SSH_OPTS: &[&str] = &[
     "ControlPersist=10m",
 ];
 
-/// Options for non-interactive calls: never prompt, fail fast.
-const BATCH_OPTS: &[&str] = &["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
+/// Options for non-interactive calls: never prompt, fail fast. A shared
+/// connection that died (the Mac slept, the network changed) is noticed
+/// within 10 s rather than when TCP gives up, minutes later.
+const BATCH_OPTS: &[&str] = &[
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=2",
+];
 
 pub struct Remote<'a> {
     pub host: &'a Host,
@@ -67,12 +78,16 @@ impl<'a> Remote<'a> {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("starting a shell on {}", self.host.name))?;
-        child
+        // If the shell exits early, its stderr below says why; the broken
+        // pipe this would report doesn't.
+        let _ = child
             .stdin
             .take()
             .expect("piped stdin")
-            .write_all(format!("PATH=\"$HOME/.local/bin:$PATH\"\n{script}").as_bytes())?;
-        let out = child.wait_with_output()?;
+            .write_all(format!("PATH=\"$HOME/.local/bin:$PATH\"\n{script}").as_bytes());
+        let out = child
+            .wait_with_output()
+            .with_context(|| format!("waiting for {}", self.host.name))?;
         check(&out, &self.host.name)?;
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -103,10 +118,22 @@ impl<'a> Remote<'a> {
         // Its own connection rather than the shared one: window resizes have
         // to reach the remote tmux, and through the shared connection they
         // didn't.
-        let mut argv: Vec<String> = ["ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        // Keepalives make a dead connection (the Mac slept) end the terminal
+        // within a minute, so it offers to reconnect.
+        let mut argv: Vec<String> = [
+            "ssh",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         argv.push("-t".into());
         argv.push(self.host.ssh.clone());
         argv.push(format!("sh -c {}", quote(script)));
@@ -117,7 +144,11 @@ impl<'a> Remote<'a> {
 /// Turns a failed command into an error carrying its stderr.
 fn check(out: &Output, what: &str) -> Result<()> {
     if !out.status.success() {
-        bail!("{what}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        match stderr.trim() {
+            "" => bail!("{what}: {}", out.status),
+            stderr => bail!("{what}: {stderr}"),
+        }
     }
     Ok(())
 }

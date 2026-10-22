@@ -433,11 +433,10 @@ mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::{FolderPicker, HostChoice, PickerEvent, folder_path, split};
     use crate::config::Host;
+    use crate::test_support::{TempDir, git_in};
     use gpui::VisualTestContext;
     use gpui_kit::{AppContext, Entity};
     use std::cell::RefCell;
-    use std::path::PathBuf;
-    use std::process::Command;
     use std::rc::Rc;
     use std::time::Duration;
 
@@ -453,20 +452,13 @@ mod tests {
         assert_eq!(folder_path("/"), "/");
     }
 
-    fn temp_repos() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lemen-picker-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn temp_repos() -> TempDir {
+        let dir = TempDir::new("picker");
         for d in ["api/src", "web", "Docs", ".hidden"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
-        let ok = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir.join("api"))
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok);
-        dir.canonicalize().unwrap()
+        git_in(&dir.join("api"), &["init", "-q"]);
+        dir
     }
 
     fn picker(
@@ -596,7 +588,6 @@ mod tests {
 
         cx.simulate_keystrokes("escape");
         assert_eq!(events.borrow().last(), Some(&PickerEvent::Dismiss));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[gpui::test]

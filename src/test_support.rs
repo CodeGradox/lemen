@@ -1,6 +1,7 @@
 //! Helpers for tests that run real tmux and real processes.
 
 use crate::config::Config;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,45 @@ impl Drop for TmuxServer {
         let uid = String::from_utf8_lossy(&uid.stdout);
         let _ = std::fs::remove_file(format!("{dir}/tmux-{}/{}", uid.trim(), self.socket));
     }
+}
+
+/// A fresh folder in the temp dir, removed when dropped, so a failing
+/// test doesn't leave it behind. Its path is the real one: macOS's /tmp is
+/// a link, and git reports real paths.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new(tag: &str) -> TempDir {
+        let dir = std::env::temp_dir().join(format!("lemen-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creating a temp dir");
+        TempDir(dir.canonicalize().expect("the temp dir's real path"))
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Runs git in `dir` as a throwaway author; it must succeed.
+pub fn git_in(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("running git");
+    assert!(out.status.success(), "git {args:?}: {out:?}");
 }
 
 /// Polls `done` until it holds or `timeout` passes; returns whether it held.
