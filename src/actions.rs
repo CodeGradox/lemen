@@ -178,6 +178,19 @@ fn tag(tmux: &str, session: &str, kind: &str) -> String {
     )
 }
 
+/// Records the order threads were dragged into: `@lemen_order` 0, 1, 2, …
+pub fn set_order(cfg: &Config, host: &str, sessions: &[String]) -> Result<()> {
+    let r = Remote::new(cfg.host_or_err(host)?);
+    let tmux = r.tmux();
+    let script: String = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{tmux} set-option -t {}: @lemen_order {i}\n", target(s)))
+        .collect();
+    r.run(&script)?;
+    Ok(())
+}
+
 pub fn kill_session(cfg: &Config, host: &str, session: &str) -> Result<()> {
     let r = Remote::new(cfg.host_or_err(host)?);
     r.run(&format!("{} kill-session -t {}", r.tmux(), target(session)))?;

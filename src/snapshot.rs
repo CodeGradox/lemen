@@ -49,6 +49,8 @@ pub struct Session {
     pub waiting_for: Option<String>,
     /// lemen started it for Claude rather than as a plain shell.
     pub started_claude: bool,
+    /// Its place in its worktree once threads were dragged into an order.
+    pub order: Option<u32>,
 }
 
 impl Session {
@@ -73,7 +75,7 @@ pub enum Activity {
 /// can't contain `:`, so fields are split on a printable marker instead.
 const SEP: &str = "|::|";
 /// The `@muxbox_*` fallbacks read sessions tagged before the rename to lemen.
-const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{?@lemen_state,#{@lemen_state},#{@muxbox_state}}|::|#{?@lemen_worktree,#{@lemen_worktree},#{@muxbox_worktree}}|::|#{?@lemen_kind,#{@lemen_kind},#{@muxbox_kind}}";
+const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{?@lemen_state,#{@lemen_state},#{@muxbox_state}}|::|#{?@lemen_worktree,#{@lemen_worktree},#{@muxbox_worktree}}|::|#{?@lemen_kind,#{@lemen_kind},#{@muxbox_kind}}|::|#{@lemen_order}";
 const PANES: &str = "#{session_name}|::|#{pane_pid}";
 
 pub fn fetch(cfg: &Config) -> Snapshot {
@@ -202,15 +204,23 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
         }
     }
     for w in bases.iter_mut().flat_map(|b| b.worktrees.iter_mut()) {
-        w.sessions.sort_by(|a, b| a.name.cmp(&b.name));
+        sort(&mut w.sessions);
     }
-    other.sort_by(|a, b| a.name.cmp(&b.name));
+    sort(&mut other);
     HostView {
         name: host.name.clone(),
         error: None,
         bases,
         other,
     }
+}
+
+/// Threads in the order they were dragged into; ones never placed follow,
+/// by name.
+fn sort(sessions: &mut [Session]) {
+    sessions.sort_by(|a, b| {
+        (a.order.is_none(), a.order, &a.name).cmp(&(b.order.is_none(), b.order, &b.name))
+    });
 }
 
 fn parse_worktree_line(base: &mut BaseView, line: &str) {
@@ -231,7 +241,7 @@ fn parse_worktree_line(base: &mut BaseView, line: &str) {
 
 fn parse_session(line: &str, now: u64) -> Option<Session> {
     let f: Vec<&str> = line.split(SEP).collect();
-    if f.len() != 7 {
+    if f.len() != 8 {
         return None;
     }
     let activity: u64 = f[3].parse().unwrap_or(now);
@@ -249,6 +259,7 @@ fn parse_session(line: &str, now: u64) -> Option<Session> {
         },
         waiting_for: None,
         started_claude: f[6] == "claude",
+        order: f[7].parse().ok(),
     })
 }
 
@@ -346,9 +357,9 @@ mod tests {
             worktree /home/agent/projects/api\nHEAD abc\nbranch refs/heads/main\n\n\
             worktree /home/agent/projects/api/.claude/worktrees/auth\nHEAD def\nbranch refs/heads/worktree-auth\n\n\
             @@now\n1000\n@@tmux\n\
-            api/auth|::|/home/agent/projects/api|::|1|::|990|::|needs_input|::|/home/agent/projects/api/.claude/worktrees/auth|::|claude\n\
-            api/tests|::|/home/agent/projects/api|::|0|::|400|::||::||::|\n\
-            scratch|::|/tmp|::|0|::|1000|::||::||::|shell\n\
+            api/auth|::|/home/agent/projects/api|::|1|::|990|::|needs_input|::|/home/agent/projects/api/.claude/worktrees/auth|::|claude|::|\n\
+            api/tests|::|/home/agent/projects/api|::|0|::|400|::||::||::||::|\n\
+            scratch|::|/tmp|::|0|::|1000|::||::||::|shell|::|\n\
             @@panes\napi/auth|::|90\napi/tests|::|100\nscratch|::|110\n\
             @@ps\n  90     1\n 100     1\n 110     1\n 200   100\n 250   100\n 300   250\n 400     1\n\
             @@agents\n[\n\
@@ -416,5 +427,25 @@ mod tests {
         assert!(get("old").started_claude);
         assert_eq!(get("old").path, "/srv/a,b");
         assert!(!get("new").started_claude);
+    }
+
+    #[test]
+    fn threads_keep_the_order_they_were_put_in() {
+        let server = TmuxServer::new("order");
+        for name in ["a", "b", "c", "d"] {
+            server.tmux(&["new-session", "-d", "-s", name]);
+        }
+        let names = |cfg: &Config| -> Vec<String> {
+            fetch(cfg).hosts[0]
+                .other
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        let cfg = server.config();
+        assert_eq!(names(&cfg), ["a", "b", "c", "d"]);
+        // d and b were placed; a and c never were, so they follow by name.
+        crate::actions::set_order(&cfg, "local", &["d".into(), "b".into()]).unwrap();
+        assert_eq!(names(&cfg), ["d", "b", "a", "c"]);
     }
 }

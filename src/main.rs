@@ -3,6 +3,7 @@ mod attach;
 mod clip;
 mod config;
 mod gui;
+mod notes;
 mod remote;
 mod snapshot;
 #[cfg(test)]

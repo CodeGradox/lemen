@@ -52,9 +52,12 @@ Run `lemen`. The sidebar lists each base's worktrees and their sessions; it refr
 - **New worktree** starts a thread in a new worktree; **+** on a worktree starts another session in it: **Claude**, or a plain **Shell**. The field that appears in the header asks for a label (`claude` or `shell` to start with; a free random name for a new worktree): press Enter to take it, or type your own. Several sessions can share a label: lemen names the tmux session `<label>--<random words>`, like `claude--calm-heron`, and shows only the label. Claude sessions get Claude's spark as their icon, shells a terminal.
 - **×** on a session, clicked twice, kills it. The worktree stays.
 - Double-click a session, or right-click → **Rename…**, to change its label. Only the thread's tmux name changes (its random words stay); Claude keeps running and its worktree and branch keep their names.
+- Drag a thread onto another in the same worktree to move it to that place. The order is stored on the tmux sessions (`@lemen_order`), so it survives restarts and is the same from any Mac; new threads start at the bottom.
 - `⌘B` or the header button collapses the sidebar. `⌘Q` quits; sessions keep running.
 - `⌘,` (**lemen → Settings…**) opens Settings: the theme (System, Light or Dark) and the terminal's font and size. Changes apply at once and are saved to the config.
 - A terminal whose connection dropped (laptop slept) says so; click it to reconnect.
+
+**Notes:** every worktree has a notepad. The button at the right of the header opens it beside the terminal, on the worktree of the thread you opened last; a worktree's notes icon opens that one's. It shows Markdown, and links (pasted bare URLs too) open with a click. **Edit** opens the Markdown for editing; Esc or **Done** shows it rendered again. Notes are saved as you type, on this Mac, in `~/.lemen/notes/<host>/<worktree path>.md`.
 
 **Images:** drop files on the terminal, or `⌘V` with an image or copied files on the clipboard. lemen uploads them to the host's `upload_dir` and pastes the remote paths. Text pastes as text.
 

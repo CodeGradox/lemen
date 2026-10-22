@@ -4,7 +4,9 @@
 //! so switching is instant and scrollback survives.
 
 mod keys;
+mod notes;
 mod notification;
+mod rows;
 mod settings;
 mod terminal;
 mod terminal_view;
@@ -17,15 +19,18 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenuItem,
 };
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use notes::NotesPanel;
 use notification::{Notification, NotificationEvent};
 use settings::Prefs;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 use terminal_view::TerminalView;
 
@@ -41,6 +46,9 @@ const CLAUDE_ICON: &[u8] = include_bytes!("claude.svg");
 const CLAUDE_ORANGE: u32 = 0xd97757;
 
 type Key = (String, String);
+/// A list of threads: a host's worktree, by path, or with `None` the host's
+/// sessions outside every base.
+type List = (String, Option<String>);
 
 /// What the name field in the header is asking for.
 enum Ask {
@@ -96,6 +104,12 @@ struct Lemen {
     window: AnyWindowHandle,
     /// Notification popups that are showing, one per session.
     popups: HashMap<Key, (WindowHandle<Notification>, Subscription)>,
+    /// Counts changes to the thread order; a snapshot fetched across one
+    /// has the old order and is dropped.
+    order_changes: u64,
+    /// The notes of the last worktree opened, beside the terminal.
+    notes: Entity<NotesPanel>,
+    notes_open: bool,
     _refresh: Task<()>,
     _appearance: Subscription,
 }
@@ -171,6 +185,12 @@ impl Lemen {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Notes live beside the state file, in ~/.lemen/notes; tests have neither.
+        let notes_dir = state_file
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("notes"));
+        let notes = cx.new(|cx| NotesPanel::new(notes_dir, window, cx));
         let restore = state_file
             .as_deref()
             .and_then(|p| Active::load_from(p).ok())
@@ -203,6 +223,9 @@ impl Lemen {
             restore,
             window: window.window_handle(),
             popups: HashMap::new(),
+            order_changes: 0,
+            notes,
+            notes_open: false,
             _refresh: refresh,
             _appearance: appearance,
         }
@@ -212,14 +235,19 @@ impl Lemen {
     fn refresh(&self, cx: &mut Context<Self>) -> Task<()> {
         let cfg = self.cfg.clone();
         let window = self.window;
+        let order_changes = self.order_changes;
         cx.spawn(async move |this, cx| {
             let snap = cx
                 .background_spawn(async move { snapshot::fetch(&cfg) })
                 .await;
             window
                 .update(cx, |_, window, cx| {
-                    this.update(cx, |this, cx| this.set_snapshot(snap, window, cx))
-                        .ok();
+                    this.update(cx, |this, cx| {
+                        if this.order_changes == order_changes {
+                            this.set_snapshot(snap, window, cx)
+                        }
+                    })
+                    .ok();
                 })
                 .ok();
         })
@@ -358,8 +386,37 @@ impl Lemen {
         self.close_popup(&key, cx);
         self.active = Some(key);
         self.confirm_kill = None;
+        if let Some((worktree, label)) = self.worktree_of(&host, &session) {
+            self.notes
+                .update(cx, |n, cx| n.show(&host, &worktree, &label, window, cx));
+        }
         self.remember(host, session);
         view.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// The worktree a session runs in, and its label.
+    fn worktree_of(&self, host: &str, session: &str) -> Option<(String, String)> {
+        let h = self.snap.hosts.iter().find(|h| h.name == host)?;
+        h.bases
+            .iter()
+            .flat_map(|b| b.worktrees.iter().enumerate())
+            .find(|(_, w)| w.sessions.iter().any(|s| s.name == session))
+            .map(|(position, w)| (w.path.clone(), worktree_label(w, position)))
+    }
+
+    /// Opens the notes panel on a worktree's notes.
+    fn open_notes(
+        &mut self,
+        host: &str,
+        worktree: &str,
+        label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.notes
+            .update(cx, |n, cx| n.show(host, worktree, label, window, cx));
+        self.notes_open = true;
         cx.notify();
     }
 
@@ -514,6 +571,52 @@ impl Lemen {
         cx.notify();
     }
 
+    /// Moves a thread within its list: the sidebar shows the new order at
+    /// once, and tmux keeps it.
+    fn reorder(&mut self, list: List, from: usize, to: usize, cx: &mut Context<Self>) {
+        let Some(sessions) = self.list_mut(&list) else {
+            return;
+        };
+        if from == to || from >= sessions.len() || to >= sessions.len() {
+            return;
+        }
+        let moved = sessions.remove(from);
+        sessions.insert(to, moved);
+        let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
+        self.order_changes += 1;
+        cx.notify();
+        let cfg = self.cfg.clone();
+        cx.spawn(async move |this, cx| {
+            let host = list.0;
+            let saved = cx
+                .background_spawn(async move { actions::set_order(&cfg, &host, &names) })
+                .await;
+            this.update(cx, |this, cx| {
+                // Refreshes that started before tmux had the order are stale too.
+                this.order_changes += 1;
+                if let Err(e) = saved {
+                    this.status = Some((format!("{e:#}"), true));
+                }
+                this.refresh(cx).detach();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn list_mut(&mut self, (host, worktree): &List) -> Option<&mut Vec<Session>> {
+        let h = self.snap.hosts.iter_mut().find(|h| &h.name == host)?;
+        match worktree {
+            None => Some(&mut h.other),
+            Some(path) => h
+                .bases
+                .iter_mut()
+                .flat_map(|b| b.worktrees.iter_mut())
+                .find(|w| &w.path == path)
+                .map(|w| &mut w.sessions),
+        }
+    }
+
     /// First click arms, second click kills; the worktree stays.
     fn kill(&mut self, key: Key, cx: &mut Context<Self>) {
         if self.confirm_kill.as_ref() != Some(&key) {
@@ -541,16 +644,16 @@ impl Lemen {
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
-        let mut groups: Vec<SidebarGroup<SidebarMenu>> = vec![];
+        let mut groups: Vec<SidebarGroup<rows::Menu>> = vec![];
         for h in &self.snap.hosts {
             if let Some(e) = &h.error {
                 groups.push(
                     SidebarGroup::new(h.name.clone()).child(
-                        SidebarMenu::new().child(
+                        rows::Menu::default().child(rows::Entry::Item(Box::new(
                             SidebarMenuItem::new(e.clone())
                                 .icon(IconName::TriangleAlert)
                                 .disable(true),
-                        ),
+                        ))),
                     ),
                 );
                 continue;
@@ -558,19 +661,19 @@ impl Lemen {
             for b in &h.bases {
                 let base = &self.cfg.bases[b.index];
                 let index = b.index;
-                let mut menu = SidebarMenu::new().child(
+                let mut menu = rows::Menu::default().child(rows::Entry::Item(Box::new(
                     SidebarMenuItem::new("New worktree")
                         .icon(IconName::Plus)
                         .on_click(ask_on_click(&this, move || Ask::NewWorktree {
                             base: index,
                         })),
-                );
+                )));
                 if let Some(e) = &b.error {
-                    menu = menu.child(
+                    menu = menu.child(rows::Entry::Item(Box::new(
                         SidebarMenuItem::new(e.clone())
                             .icon(IconName::TriangleAlert)
                             .disable(true),
-                    );
+                    )));
                 }
                 let prefix = format!("{}/", base.name());
                 for (wi, w) in b.worktrees.iter().enumerate() {
@@ -579,13 +682,10 @@ impl Lemen {
                 groups.push(SidebarGroup::new(format!("{} · {}", base.name(), h.name)).child(menu));
             }
             if !h.other.is_empty() {
-                let items = h
-                    .other
-                    .iter()
-                    .map(|s| self.session_item(&h.name, s, "", cx));
+                let threads = self.threads(&h.name, None, &h.other, "", cx);
                 groups.push(
                     SidebarGroup::new(format!("other · {}", h.name))
-                        .child(SidebarMenu::new().children(items)),
+                        .child(rows::Menu::default().child(rows::Entry::Threads(threads))),
                 );
             }
         }
@@ -624,17 +724,33 @@ impl Lemen {
         w: &Worktree,
         prefix: &str,
         cx: &mut Context<Self>,
-    ) -> SidebarMenuItem {
-        // The main checkout reads best as its branch; linked ones by directory.
-        let label = match (&w.branch, position) {
-            (Some(branch), 0) => branch.clone(),
-            _ => leaf(&w.path).to_string(),
-        };
+    ) -> rows::Entry {
+        let label = worktree_label(w, position);
         let this = cx.entity().downgrade();
         let worktree = w.path.clone();
+        let (host_name, notes_label) = (host.to_string(), label.clone());
         let add = move |_: &mut Window, _: &mut App| {
+            let notes = {
+                let (this, host, worktree, label) = (
+                    this.clone(),
+                    host_name.clone(),
+                    worktree.clone(),
+                    notes_label.clone(),
+                );
+                Button::new("notes")
+                    .icon(IconName::FileText)
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Notes")
+                    .on_click(move |_, window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.open_notes(&host, &worktree, &label, window, cx)
+                        })
+                        .ok();
+                    })
+            };
             let (this, worktree) = (this.clone(), worktree.clone());
-            Button::new("add")
+            let add = Button::new("add")
                 .icon(IconName::Plus)
                 .ghost()
                 .xsmall()
@@ -651,17 +767,38 @@ impl Lemen {
                         }))
                     };
                     menu.item(item("Claude", false)).item(item("Shell", true))
-                })
+                });
+            h_flex().gap_1().child(notes).child(add)
         };
-        let threads = w
-            .sessions
-            .iter()
-            .map(|s| self.session_item(host, s, prefix, cx));
-        SidebarMenuItem::new(label)
-            .icon(IconName::Folder)
-            .default_open(true)
-            .suffix(add)
-            .children(threads)
+        rows::Entry::Worktree {
+            label: label.into(),
+            suffix: Rc::new(move |window, cx| add(window, cx).into_any_element()),
+            threads: self.threads(host, Some(&w.path), &w.sessions, prefix, cx),
+        }
+    }
+
+    /// Threads that can be dragged into a new order.
+    fn threads(
+        &self,
+        host: &str,
+        worktree: Option<&str>,
+        sessions: &[Session],
+        prefix: &str,
+        cx: &mut Context<Self>,
+    ) -> rows::Threads {
+        let this = cx.entity().downgrade();
+        let list: List = (host.to_string(), worktree.map(str::to_string));
+        rows::Threads {
+            key: format!("{host}\n{}", worktree.unwrap_or_default()).into(),
+            rows: sessions
+                .iter()
+                .map(|s| self.session_item(host, s, prefix, cx))
+                .collect(),
+            reorder: Rc::new(move |from, to, _, cx| {
+                this.update(cx, |this, cx| this.reorder(list.clone(), from, to, cx))
+                    .ok();
+            }),
+        }
     }
 
     fn session_item(
@@ -670,7 +807,7 @@ impl Lemen {
         s: &Session,
         prefix: &str,
         cx: &mut Context<Self>,
-    ) -> SidebarMenuItem {
+    ) -> rows::Thread {
         let this = cx.entity().downgrade();
         let key = key(host, s);
         let active = self.active.as_ref() == Some(&key);
@@ -755,12 +892,14 @@ impl Lemen {
         } else {
             Icon::new(IconName::SquareTerminal)
         };
-        SidebarMenuItem::new(label)
-            .icon(icon)
-            .active(active)
-            .on_click(open)
-            .context_menu(menu)
-            .suffix(suffix)
+        rows::Thread {
+            icon,
+            label: label.into(),
+            active,
+            on_click: Rc::new(open),
+            menu: Rc::new(menu),
+            suffix: Rc::new(move |window, cx| suffix(window, cx).into_any_element()),
+        }
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -832,8 +971,28 @@ impl Lemen {
             bar = bar
                 .child(div().flex_1())
                 .child(div().text_sm().text_color(color).child(message.clone()));
+        } else {
+            bar = bar.child(div().flex_1());
         }
-        bar
+        let this = cx.entity().downgrade();
+        bar.child(
+            Button::new("toggle-notes")
+                .icon(if self.notes_open {
+                    IconName::PanelRightClose
+                } else {
+                    IconName::PanelRightOpen
+                })
+                .ghost()
+                .small()
+                .tooltip("Notes")
+                .on_click(move |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        this.notes_open = !this.notes_open;
+                        cx.notify();
+                    })
+                    .ok();
+                }),
+        )
     }
 }
 
@@ -875,7 +1034,23 @@ impl Render for Lemen {
                     .h_full()
                     .min_w_0()
                     .child(self.header(cx))
-                    .child(div().flex_1().min_h_0().child(main)),
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .child(div().flex_1().min_w_0().h_full().child(main))
+                            .when(self.notes_open, |this| {
+                                this.child(
+                                    div()
+                                        .w(px(360.0))
+                                        .h_full()
+                                        .flex_shrink_0()
+                                        .border_l_1()
+                                        .border_color(cx.theme().border)
+                                        .child(self.notes.clone()),
+                                )
+                            }),
+                    ),
             )
     }
 }
@@ -891,6 +1066,14 @@ fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
             .chain(h.other.iter())
             .map(move |s| (h.name.as_str(), s))
     })
+}
+
+/// The main checkout reads best as its branch; linked ones by directory.
+fn worktree_label(w: &Worktree, position: usize) -> String {
+    match (&w.branch, position) {
+        (Some(branch), 0) => branch.clone(),
+        _ => leaf(&w.path).to_string(),
+    }
 }
 
 fn key(host: &str, s: &Session) -> Key {
@@ -948,10 +1131,10 @@ mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::{Key, Lemen, NotificationEvent};
     use crate::config::Config;
-    use crate::snapshot::{Activity, HostView, Session, Snapshot};
+    use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
     use crate::test_support::{TmuxServer, wait_until};
     use gpui::VisualTestContext;
-    use gpui_kit::{AppContext, Entity, px, size};
+    use gpui_kit::{AppContext, Entity, Modifiers, MouseButton, point, px, size};
     use std::time::Duration;
 
     fn key(s: &str) -> Key {
@@ -969,6 +1152,7 @@ mod tests {
                 activity: *activity,
                 waiting_for: None,
                 started_claude: false,
+                order: None,
             })
             .collect();
         Snapshot {
@@ -1025,6 +1209,134 @@ mod tests {
             large.cols > small.cols && large.lines > small.lines,
             "{small:?} -> {large:?}"
         );
+    }
+
+    /// Dropping a thread on another moves it to that one's place: in the
+    /// sidebar at once, and in tmux for good.
+    #[gpui::test]
+    fn dragging_a_thread_reorders_its_list(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("drag");
+        for name in ["a", "b", "c"] {
+            server.tmux(&["new-session", "-d", "-s", name]);
+        }
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let mut app = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| Lemen::new(server.config(), None, window, cx));
+            app = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let shown = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                app.snap.hosts[0]
+                    .other
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(shown(cx), ["a", "b", "c"]);
+
+        let from = cx.debug_bounds("thread-0").expect("a's row").center();
+        let to = cx.debug_bounds("thread-2").expect("c's row").center();
+        let none = Modifiers::none();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from + point(px(0.0), px(6.0)), MouseButton::Left, none);
+        cx.simulate_mouse_move(to, MouseButton::Left, none);
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        assert_eq!(shown(cx), ["b", "c", "a"]);
+
+        cx.run_until_parked();
+        let kept: Vec<String> = snapshot::fetch(&server.config()).hosts[0]
+            .other
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(kept, ["b", "c", "a"]);
+        assert_eq!(
+            shown(cx),
+            ["b", "c", "a"],
+            "the refresh after the move agrees"
+        );
+    }
+
+    /// Opening a thread points the notes at its worktree without opening
+    /// the panel; a worktree's notes icon opens it.
+    #[gpui::test]
+    fn notes_follow_the_opened_thread(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("notes");
+        let mut cfg = server.config();
+        cfg.bases = toml::from_str::<Config>("[[bases]]\nhost = \"local\"\npath = \"/srv/api\"")
+            .unwrap()
+            .bases;
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| Lemen::new(cfg, None, window, cx));
+        cx.run_until_parked();
+        let worktree = |path: &str, branch: &str, sessions: &[&str]| Worktree {
+            path: path.into(),
+            branch: Some(branch.into()),
+            sessions: snapshot(
+                &sessions
+                    .iter()
+                    .map(|s| (*s, Activity::Idle))
+                    .collect::<Vec<_>>(),
+            )
+            .hosts
+            .remove(0)
+            .other,
+        };
+        let snap = Snapshot {
+            hosts: vec![HostView {
+                name: "local".into(),
+                error: None,
+                bases: vec![BaseView {
+                    index: 0,
+                    error: None,
+                    worktrees: vec![
+                        worktree("/srv/api", "main", &[]),
+                        worktree(
+                            "/srv/api/.claude/worktrees/auth",
+                            "worktree-auth",
+                            &["api/t"],
+                        ),
+                    ],
+                }],
+                other: vec![],
+            }],
+        };
+        cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
+        let notes = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, cx| {
+                let shown = app.notes.read(cx).worktree().map(str::to_string);
+                (shown, app.notes_open)
+            })
+        };
+        assert_eq!(notes(cx), (None, false));
+
+        open(&app, "api/t", cx);
+        assert_eq!(
+            notes(cx),
+            (Some("/srv/api/.claude/worktrees/auth".into()), false)
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_notes("local", "/srv/api", "main", window, cx)
+            })
+        });
+        assert_eq!(notes(cx), (Some("/srv/api".into()), true));
+
+        // Let the terminal's attach attempt end before the server cleans up.
+        wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, cx| {
+                app.terminals.values().all(|t| t.read(cx).exited())
+            })
+        });
     }
 
     #[gpui::test]
