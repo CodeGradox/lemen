@@ -4,11 +4,16 @@ A macOS app for Claude Code sessions that live in tmux on a remote host: a sideb
 
 ## Install
 
+Download `lemen-macos-arm64.dmg` from the [latest release](https://github.com/CodeGradox/lemen/releases/latest), or the [newest build of main](https://github.com/CodeGradox/lemen/releases/download/latest-main/lemen-macos-arm64.dmg), open it and drag lemen into Applications. Both are signed and notarized; they need Apple Silicon and macOS 11 or newer.
+
+From source:
+
 ```sh
-cargo install --path .   # puts lemen in ~/.cargo/bin
+sh scripts/build-app.sh  # build/lemen.app; drag it into Applications
+cargo install --path .   # the lemen command, for `lemen ls`, `lemen paste` and the rest
 ```
 
-Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `git`.
+Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `git`. [docs/releases.md](docs/releases.md) covers the disk image and signed releases.
 
 ## Config
 

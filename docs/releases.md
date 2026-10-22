@@ -1,0 +1,109 @@
+# Building the app and signed releases
+
+lemen ships as `lemen.app` in a disk image: open it, drag lemen onto the
+Applications shortcut, eject it. Releases are Apple Silicon (arm64) only and
+need macOS 11 or newer. The version lives in one place, `Cargo.toml`; the app
+build writes it into `Info.plist`.
+
+## Local builds
+
+```sh
+sh scripts/build-app.sh
+```
+
+builds `build/lemen.app` from a release build and signs it ad hoc. That runs
+on the Mac that built it; a copy downloaded elsewhere would be blocked by
+Gatekeeper, which is what signed releases are for. `BUILD_DIR` moves the
+output. `LEMEN_SIGNING_IDENTITY` signs with another identity; a
+`Developer ID Application: …` identity also turns on the hardened runtime and
+a secure timestamp, as notarization requires. lemen needs no entitlements.
+
+If `Resources/lemen.png` exists (square, at least 1024×1024), the build turns
+it into the app icon with `scripts/build-icon.sh`; without it the app has the
+default icon.
+
+## Disk image
+
+The image opens with `lemen.app` on the left and a shortcut to
+`/Applications` on the right, with an arrow between them. Packaging uses
+[dmgbuild](https://dmgbuild.readthedocs.io/), with hash-locked dependencies
+installed into a private virtual environment (`build/dmg-tools`). It needs
+Python 3.10 or newer; macOS's own `python3` is older, so name another:
+
+```sh
+PYTHON=python3.13 sh scripts/prepare-dmg-tools.sh   # once
+sh scripts/build-dmg.sh build/lemen.app build/lemen.dmg
+```
+
+The packager never signs or changes the app, refuses to replace an existing
+image, and mounts the finished one to check the app's signature and the
+Applications shortcut. `sh scripts/test-dmg.sh` packages a small ad-hoc
+fixture app the same way, without credentials.
+
+## Builds from main
+
+Every push to `main` runs **Build lemen** (`.github/workflows/release.yml`):
+it checks the commit is on `main`, installs the Rust version from
+`mise.toml`, Xcode's Metal toolchain and tmux, and runs the tests, all before
+it touches any secret. Then `scripts/notarize-app.sh` imports the certificate
+into a temporary keychain, builds and signs the app and the disk image,
+submits the image to Apple's notary service, and staples the ticket. The
+result replaces the **latest-main** pre-release, so the newest build is
+always at
+
+https://github.com/CodeGradox/lemen/releases/download/latest-main/lemen-macos-arm64.dmg
+
+A newer push cancels a build still running for an older one, and a build
+that finishes after `main` has moved on doesn't publish.
+
+## Publish a release
+
+Bump `version` in `Cargo.toml`, commit and push to `main`, then tag that
+commit with the same version:
+
+```sh
+GIT_EDITOR=true git tag -a v0.1.0 -m "lemen v0.1.0"
+git push origin refs/tags/v0.1.0
+```
+
+Pushing a new `v*` tag runs the same build, which also checks that the tag
+matches `Cargo.toml` and that the commit is in `main`'s history. It publishes
+`lemen-macos-arm64.dmg` and `SHA256SUMS.txt` as the GitHub Release for the
+tag. Use a new version for each release; updating or deleting a tag doesn't
+rebuild it.
+
+## Apple credentials
+
+lemen uses the same credentials as any other app of the team: the
+**Developer ID Application** certificate (exported with its private key as a
+password-protected `.p12`) and an App Store Connect **team API key** allowed
+to notarize (its `.p8`, key ID and issuer ID). No new certificate or App ID
+is needed.
+
+In the repository's settings:
+
+1. The environment named **release** admits only the `main` branch and `v*`
+   tags (**Selected branches and tags**). Protect `v*` tags against updates
+   and deletion, and protect `main` against force-pushes: whoever can push to
+   `main` can get code signed.
+2. Add these **environment secrets** (not repository secrets):
+
+| Secret | Value |
+| --- | --- |
+| `LEMEN_CERTIFICATE_BASE64` | Single-line base64 of the `.p12` |
+| `LEMEN_CERTIFICATE_PASSWORD` | The `.p12`'s password |
+| `LEMEN_SIGNING_IDENTITY` | The exact identity, e.g. `Developer ID Application: Your Name (TEAMID)` |
+| `LEMEN_NOTARY_KEY_BASE64` | Single-line base64 of the `.p8` |
+| `LEMEN_NOTARY_KEY_ID` | The API key's ID |
+| `LEMEN_NOTARY_ISSUER_ID` | The API key's issuer ID |
+
+Supply them through GitHub's secret settings only; never commit them or paste
+them anywhere else.
+
+## Launched from Finder
+
+An app started from Finder or the Dock gets a short `PATH`
+(`/usr/bin:/bin:/usr/sbin:/sbin`). Remote hosts are unaffected: `ssh` and
+`scp` live in `/usr/bin`, and commands on the host use the host's own
+`PATH`. A host with `ssh = "local"` runs tmux on this Mac, and Homebrew's
+`/opt/homebrew/bin` isn't on that `PATH`; start lemen from a shell for those.

@@ -1,0 +1,182 @@
+name: Build lemen
+
+# Every push to main builds a signed, notarized disk image and replaces the
+# latest-main pre-release with it; a new v* tag publishes that version.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # Updating or deleting a tag must not rebuild a version. The release
+    # environment only admits main and v* tags.
+    if: github.ref == 'refs/heads/main' || (github.event.created == true && startsWith(github.ref, 'refs/tags/v'))
+    name: Sign and notarize arm64
+    environment: release
+    # A newer push to main supersedes a build still running for an older one.
+    concurrency:
+      group: build-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      ARCH: arm64
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - name: Isolate build outputs
+        run: |
+          echo "BUILD_DIR=$RUNNER_TEMP/lemen-release" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/lemen-target" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate the version, and a tag against main
+        id: version
+        run: |
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")" = "$(git rev-parse HEAD)"
+          fi
+          python3 - <<'PY'
+          import os, re, tomllib
+          with open("Cargo.toml", "rb") as source:
+              version = tomllib.load(source)["package"]["version"]
+          assert re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version), "Expected a stable semantic version"
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              assert os.environ["GITHUB_REF_NAME"] == f"v{version}", "Tag must match the version in Cargo.toml"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+          PY
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned toolchain and test before importing secrets
+        run: |
+          test "$(uname -m)" = "$ARCH"
+          xcodebuild -version
+          # GPUI compiles its Metal shaders at build time; Xcode 26 ships the
+          # Metal toolchain as a separate download.
+          xcrun -sdk macosx metal --version >/dev/null 2>&1 ||
+              xcodebuild -downloadComponent MetalToolchain
+          rust="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$rust"
+          rustup toolchain install "$rust" --profile minimal
+          rustup default "$rust"
+          rustc --version
+          # The tests drive real tmux servers.
+          brew install tmux
+          cargo test --locked
+      - name: Prepare pinned disk image tools before importing secrets
+        run: |
+          sh scripts/prepare-dmg-tools.sh
+          sh scripts/test-dmg.sh
+      - name: Import ephemeral identity, sign and notarize app and disk image
+        env:
+          LEMEN_CERTIFICATE_BASE64: ${{ secrets.LEMEN_CERTIFICATE_BASE64 }}
+          LEMEN_CERTIFICATE_PASSWORD: ${{ secrets.LEMEN_CERTIFICATE_PASSWORD }}
+          LEMEN_SIGNING_IDENTITY: ${{ secrets.LEMEN_SIGNING_IDENTITY }}
+          LEMEN_NOTARY_KEY_BASE64: ${{ secrets.LEMEN_NOTARY_KEY_BASE64 }}
+          LEMEN_NOTARY_KEY_ID: ${{ secrets.LEMEN_NOTARY_KEY_ID }}
+          LEMEN_NOTARY_ISSUER_ID: ${{ secrets.LEMEN_NOTARY_ISSUER_ID }}
+        run: sh scripts/notarize-app.sh
+      - name: Verify and collect stapled disk image
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          app="$BUILD_DIR/lemen.app"
+          binary="$app/Contents/MacOS/lemen"
+          dmg="$BUILD_DIR/lemen.dmg"
+          test "$(lipo -archs "$binary")" = "$ARCH"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 11.0
+          xcrun vtool -show-build "$binary"
+          xcrun vtool -show-build "$binary" | grep -Eq 'minos[[:space:]]+11\.0([[:space:]]|$)'
+          codesign --verify --deep --strict --verbose=2 "$app"
+          hdiutil verify "$dmg"
+          codesign --verify --strict --verbose=2 "$dmg"
+          xcrun stapler validate "$dmg"
+          mkdir -p artifacts
+          ditto "$dmg" "artifacts/lemen-macos-$ARCH.dmg"
+          (cd artifacts && shasum -a 256 "lemen-macos-$ARCH.dmg" > SHA256SUMS.txt)
+      - name: Remove any remaining ephemeral credentials
+        if: always()
+        run: |
+          for directory in "$RUNNER_TEMP"/lemen-signing.*; do
+            test -d "$directory" || continue
+            security delete-keychain "$directory/release.keychain-db" >/dev/null 2>&1 || true
+            rm -rf "$directory"
+          done
+      - name: Upload notarized disk image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lemen-macos-arm64
+          path: artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    name: Publish signed download
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_VERSION: ${{ needs.release.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.release.outputs.commit }}
+    steps:
+      - name: Download signed assets from this exact run
+        run: |
+          gh run download "$GITHUB_RUN_ID" \
+            --name lemen-macos-arm64 --dir "$RUNNER_TEMP/signed-downloads"
+      - name: Verify checksums
+        run: |
+          cd "$RUNNER_TEMP/signed-downloads"
+          sha256sum lemen-macos-arm64.dmg | diff - SHA256SUMS.txt
+      - name: Replace the latest-main pre-release
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/signed-downloads"
+          # An older build that finishes late must not replace a newer one.
+          if [ "$(gh api "repos/$GH_REPO/commits/main" --jq .sha)" != "$RELEASE_COMMIT" ]; then
+            echo "main has moved on; its own build publishes."
+            exit 0
+          fi
+          tag=latest-main
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --cleanup-tag --yes
+          fi
+          # A tag left behind by an interrupted run would pin the old commit.
+          if gh api "repos/$GH_REPO/git/refs/tags/$tag" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag"
+          fi
+          gh release create "$tag" --target "$RELEASE_COMMIT" --prerelease \
+            --title "lemen main (${RELEASE_COMMIT:0:7})" \
+            --notes "The latest push to main ($RELEASE_COMMIT), replaced on every push. Requires Apple Silicon and macOS 11 or newer. Open the DMG, drag lemen into Applications, then eject it. Developer ID-signed and Apple-notarized." \
+            lemen-macos-arm64.dmg SHA256SUMS.txt
+      - name: Publish the version from a draft
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/signed-downloads"
+          tag="v$RELEASE_VERSION"
+          # Refuse a tag that moved while the signed build was running.
+          test "$(gh api "repos/$GH_REPO/commits/$GITHUB_REF" --jq .sha)" = "$RELEASE_COMMIT"
+          gh release create "$tag" --verify-tag --target "$RELEASE_COMMIT" \
+            --draft --title "lemen $RELEASE_VERSION" \
+            --notes "Requires Apple Silicon and macOS 11 or newer. Open the DMG, drag lemen into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional."
+          gh release upload "$tag" lemen-macos-arm64.dmg SHA256SUMS.txt
+          gh release edit "$tag" --draft=false --latest
