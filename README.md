@@ -66,7 +66,7 @@ Run `lemen`. The sidebar lists each base's worktrees and their sessions; it refr
 - `⌘,` (**lemen → Settings…**) opens Settings: the theme (System, Light or Dark) and the terminal's font and size. Changes apply at once and are saved to the config.
 - A terminal whose connection dropped (laptop slept) says so; click it to reconnect.
 
-**Notes:** every worktree has a notepad. The button at the right of the header opens it beside the terminal, on the worktree of the thread you opened last; a worktree's notes icon opens that one's. It shows Markdown, and links (pasted bare URLs too) open with a click. **Edit** opens the Markdown for editing; Esc or **Done** shows it rendered again. Notes are saved as you type, on this Mac, in `~/.lemen/notes/<host>/<worktree path>.md`.
+**Notes:** every worktree has a notepad. The button at the right of the header opens it beside the terminal, on the worktree of the thread you opened last; a worktree's notes icon opens that one's. It shows Markdown, and links (pasted bare URLs too) open with a click. **Edit** opens the Markdown for editing until Esc or **Done** shows it rendered again; clicking elsewhere or the emoji picker doesn't end it. Notes are saved as you type, on this Mac, in `~/.lemen/notes/<host>/<worktree path>.md`.
 
 **Images:** drop files on the terminal, or `⌘V` with an image or copied files on the clipboard. lemen uploads them to the host's `upload_dir` and pastes the remote paths. Text pastes as text.
 

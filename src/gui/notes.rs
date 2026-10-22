@@ -38,19 +38,13 @@ impl NotesPanel {
         let editor = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder("Markdown; pasted links become clickable")
         });
-        let events =
-            cx.subscribe_in(
-                &editor,
-                window,
-                |this, _, event: &InputEvent, _, cx| match event {
-                    InputEvent::Change => this.save(cx),
-                    InputEvent::Blur => {
-                        this.editing = false;
-                        cx.notify();
-                    }
-                    _ => {}
-                },
-            );
+        // Editing ends with Done or Esc only: focus also leaves for a click
+        // elsewhere or the emoji picker, and the editor should stay.
+        let events = cx.subscribe_in(&editor, window, |this, _, event: &InputEvent, _, cx| {
+            if let InputEvent::Change = event {
+                this.save(cx)
+            }
+        });
         NotesPanel {
             root,
             shown: None,
@@ -291,6 +285,18 @@ mod tests {
         cx.simulate_input("See https://example.com");
         let saved = notes::load(&notes::file(&root, "agent", "/srv/a")).unwrap();
         assert_eq!(saved, "See https://example.com");
+
+        // Focus leaving (a click elsewhere, the emoji picker) keeps editing;
+        // Esc ends it.
+        // Focus events need an active window; the test platform starts it inactive.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| panel.update(cx, |p, cx| p.focus.focus(window, cx)));
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |p, _| p.editing()));
+        cx.update(|window, cx| panel.update(cx, |p, cx| p.edit(window, cx)));
+        cx.simulate_keystrokes("escape");
+        assert!(!panel.read_with(cx, |p, _| p.editing()));
 
         show(&panel, "/srv/b", cx);
         assert_eq!(panel.read_with(cx, |p, cx| p.text(cx)), "b's notes");
