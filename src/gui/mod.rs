@@ -36,7 +36,7 @@ use std::time::Duration;
 use terminal_view::TerminalView;
 
 actions!(
-    lemen,
+    lemur,
     [
         Quit,
         ToggleSidebar,
@@ -50,7 +50,7 @@ actions!(
     ]
 );
 
-/// lemen's keys; menus show them next to their items.
+/// lemur's keys; menus show them next to their items.
 fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
@@ -103,7 +103,7 @@ struct Prompt {
     _events: Subscription,
 }
 
-struct Lemen {
+struct Lemur {
     cfg: Config,
     /// Where to remember the session you last opened; tests have none.
     state_file: Option<PathBuf>,
@@ -161,16 +161,16 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             // File and View items act on the main window, and are greyed out
             // while another window, like Settings, is in front.
             cx.set_menus([
-                Menu::new("lemen").items([
+                Menu::new("lemur").items([
                     MenuItem::action("Settings…", OpenSettings),
                     MenuItem::separator(),
                     MenuItem::os_submenu("Services", SystemMenuType::Services),
                     MenuItem::separator(),
-                    MenuItem::action("Hide lemen", Hide),
+                    MenuItem::action("Hide lemur", Hide),
                     MenuItem::action("Hide Others", HideOthers),
                     MenuItem::action("Show All", ShowAll),
                     MenuItem::separator(),
-                    MenuItem::action("Quit lemen", Quit),
+                    MenuItem::action("Quit lemur", Quit),
                 ]),
                 Menu::new("File").items([
                     MenuItem::action("Add Project…", AddProject),
@@ -184,7 +184,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             ]);
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
-                    title: Some("lemen".into()),
+                    title: Some("lemur".into()),
                     ..Default::default()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -195,7 +195,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 ..Default::default()
             };
             let (main, _) = gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Lemen::new(cfg, Active::path().ok(), window, cx))
+                cx.new(|cx| Lemur::new(cfg, Active::path().ok(), window, cx))
             })
             .expect("failed to open window");
             // Closing the main window quits; notification popups come and go.
@@ -211,14 +211,14 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-impl Lemen {
+impl Lemur {
     fn new(
         cfg: Config,
         state_file: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Notes live beside the state file, in ~/.lemen/notes; tests have neither.
+        // Notes live beside the state file, in ~/.lemur/notes; tests have neither.
         let notes_dir = state_file
             .as_deref()
             .and_then(Path::parent)
@@ -226,15 +226,15 @@ impl Lemen {
         let notes = cx.new(|cx| NotesPanel::new(notes_dir, window, cx));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        let lemen = cx.weak_entity();
-        let sidebar = cx.new(|_| SidebarView::new(lemen));
+        let lemur = cx.weak_entity();
+        let sidebar = cx.new(|_| SidebarView::new(lemur));
         let sidebar_follows =
             cx.observe_self(|this, cx| this.sidebar.update(cx, |_, cx| cx.notify()));
         let restore = state_file
             .as_deref()
             .and_then(|p| Active::load_from(p).ok())
             .map(|a| (a.host, a.session));
-        // Every tick while you look at lemen; out of sight, where a refresh
+        // Every tick while you look at lemur; out of sight, where a refresh
         // still costs each host a `claude agents`, every AWAY ticks.
         let handle = window.window_handle();
         let refresh = cx.spawn(async move |this, cx| {
@@ -260,7 +260,7 @@ impl Lemen {
                 Theme::sync_system_appearance(Some(window), cx);
             }
         });
-        Lemen {
+        Lemur {
             cfg,
             state_file,
             snap: Snapshot::default(),
@@ -640,7 +640,7 @@ impl Lemen {
     }
 }
 
-impl Render for Lemen {
+impl Render for Lemur {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.active.as_ref().and_then(|k| self.terminals.get(k)) {
             // Cached: sidebar redraws (the breathing dot) don't re-render the
@@ -763,7 +763,7 @@ fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
 
 /// A worktree's name in the sidebar: its branch, which tells worktrees
 /// apart even when their folders share a name. `worktree-` is dropped from
-/// the branches lemen and `claude -w` make, leaving the name you gave. A
+/// the branches lemur and `claude -w` make, leaving the name you gave. A
 /// detached worktree shows its commit.
 fn worktree_label(w: &Worktree) -> String {
     match (&w.branch, &w.head) {
@@ -784,7 +784,7 @@ fn key(host: &str, s: &Session) -> Key {
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::folder_picker::HostChoice;
-    use super::{Ask, Key, Lemen, NotificationEvent};
+    use super::{Ask, Key, Lemur, NotificationEvent};
     use crate::config::{Base, Config};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
     use crate::test_support::{TempDir, TmuxServer, git_in, wait_until};
@@ -822,12 +822,12 @@ mod tests {
     }
 
     /// Applies a snapshot the way a refresh does.
-    fn apply(app: &Entity<Lemen>, sessions: &[(&str, Activity)], cx: &mut VisualTestContext) {
+    fn apply(app: &Entity<Lemur>, sessions: &[(&str, Activity)], cx: &mut VisualTestContext) {
         let snap = snapshot(sessions);
         cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
     }
 
-    fn open(app: &Entity<Lemen>, session: &str, cx: &mut VisualTestContext) {
+    fn open(app: &Entity<Lemur>, session: &str, cx: &mut VisualTestContext) {
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.open("local".into(), session.into(), window, cx)
@@ -908,7 +908,7 @@ mod tests {
             .bases;
         cx.executor().allow_parking();
         cx.update(gpui_kit::init);
-        let (app, cx) = cx.add_window_view(|window, cx| Lemen::new(cfg, None, window, cx));
+        let (app, cx) = cx.add_window_view(|window, cx| Lemur::new(cfg, None, window, cx));
         cx.run_until_parked();
         let worktree = |path: &str, branch: &str, sessions: &[&str]| Worktree {
             path: path.into(),
@@ -1009,7 +1009,7 @@ mod tests {
             gpui_kit::init(cx);
             super::folder_picker::bind_keys(cx);
         });
-        let (app, cx) = cx.add_window_view(|window, cx| Lemen::new(cfg, None, window, cx));
+        let (app, cx) = cx.add_window_view(|window, cx| Lemur::new(cfg, None, window, cx));
         cx.update(|window, cx| app.update(cx, |app, cx| app.open_picker(window, cx)));
         cx.run_until_parked();
         cx.simulate_keystrokes("escape");
@@ -1047,12 +1047,12 @@ mod tests {
     fn rooted(
         cfg: Config,
         cx: &mut gpui::TestAppContext,
-    ) -> (Entity<Lemen>, &mut VisualTestContext) {
+    ) -> (Entity<Lemur>, &mut VisualTestContext) {
         cx.executor().allow_parking();
         cx.update(gpui_kit::init);
         let mut app = None;
         let (_, cx) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|cx| Lemen::new(cfg, None, window, cx));
+            let view = cx.new(|cx| Lemur::new(cfg, None, window, cx));
             app = Some(view.clone());
             gpui_kit::base::Root::new(view, window, cx)
         });
@@ -1337,7 +1337,7 @@ mod tests {
         // No hosts, so the background refresh has nothing to fetch.
         let cfg: Config = toml::from_str("").unwrap();
         cx.update(gpui_kit::init);
-        let (app, cx) = cx.add_window_view(|window, cx| Lemen::new(cfg, None, window, cx));
+        let (app, cx) = cx.add_window_view(|window, cx| Lemur::new(cfg, None, window, cx));
         app.update(cx, |app, _| app.active = Some(key("shown")));
         let working = [
             ("shown", Activity::Working),
@@ -1379,7 +1379,7 @@ mod tests {
         cx.executor().allow_parking();
         cx.update(gpui_kit::init);
         let (app, cx) =
-            cx.add_window_view(|window, cx| Lemen::new(server.config(), None, window, cx));
+            cx.add_window_view(|window, cx| Lemur::new(server.config(), None, window, cx));
         let windows = |cx: &mut VisualTestContext| cx.update(|_, cx| cx.windows().len());
 
         // In the active window: the session you're looking at doesn't pop up,

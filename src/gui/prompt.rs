@@ -1,7 +1,7 @@
 //! Names asked for in the spotlight: for a new worktree, a new thread or
 //! a rename, and what happens once one is given.
 
-use super::{Ask, Key, Lemen, Prompt, sessions, spotlight, worktree_label};
+use super::{Ask, Key, Lemur, Prompt, sessions, spotlight, worktree_label};
 use crate::actions;
 use crate::config::leaf;
 use gpui_kit::component::IconName;
@@ -17,7 +17,7 @@ enum Done {
     },
 }
 
-impl Lemen {
+impl Lemur {
     /// Opens the name field, selected so typing replaces it. It asks for a
     /// label, which several threads can share: it starts as `claude` or
     /// `shell`, a free random name for a worktree, or the current label.

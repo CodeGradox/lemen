@@ -1,4 +1,4 @@
-//! Settings (lemen → Settings…, ⌘,): the theme, and the terminal's font
+//! Settings (lemur → Settings…, ⌘,): the theme, and the terminal's font
 //! and colors. Changes apply at once in every window and are saved to the
 //! config file.
 
@@ -189,7 +189,7 @@ impl SettingsView {
     }
 
     /// The colors for a dark or a light app, each with a reset to
-    /// lemen's own.
+    /// lemur's own.
     fn color_group(&self, dark: bool) -> SettingGroup {
         let items = self.pickers.iter().filter(|p| p.dark == dark).map(|p| {
             let (state, slot) = (p.state.clone(), p.slot);
@@ -206,9 +206,9 @@ impl SettingsView {
             SettingItem::new(p.label, field)
         });
         let (title, description) = if dark {
-            ("Dark", "While lemen is dark. Starts as One Half Dark.")
+            ("Dark", "While lemur is dark. Starts as One Half Dark.")
         } else {
-            ("Light", "While lemen is light. Starts as One Half Light.")
+            ("Light", "While lemur is light. Starts as One Half Light.")
         };
         SettingGroup::new()
             .title(title)
@@ -346,7 +346,7 @@ mod tests {
     use gpui_kit::hsla;
 
     /// A color picked in Settings becomes that slot's color and is kept;
-    /// a reset puts lemen's own back, in the picker too.
+    /// a reset puts lemur's own back, in the picker too.
     #[gpui::test]
     fn picked_terminal_colors_are_kept(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_kit::init);

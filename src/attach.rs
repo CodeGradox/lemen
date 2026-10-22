@@ -1,4 +1,4 @@
-//! Attaching to a session, and remembering which one lemen showed last.
+//! Attaching to a session, and remembering which one lemur showed last.
 
 use crate::config::{Host, home, read_toml};
 use crate::remote::{Remote, target};
@@ -35,7 +35,7 @@ pub fn attach_here(host: &Host, session: &str) -> Result<()> {
     Ok(())
 }
 
-/// The session lemen last showed, for `lemen paste` and `upload`.
+/// The session lemur last showed, for `lemur paste` and `upload`.
 #[derive(Serialize, Deserialize)]
 pub struct Active {
     pub host: String,
@@ -43,9 +43,9 @@ pub struct Active {
 }
 
 impl Active {
-    /// Where lemen remembers it.
+    /// Where lemur remembers it.
     pub fn path() -> Result<PathBuf> {
-        Ok(home()?.join(".lemen/active.toml"))
+        Ok(home()?.join(".lemur/active.toml"))
     }
 
     pub fn save(&self) -> Result<()> {

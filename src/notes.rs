@@ -1,5 +1,5 @@
 //! Notes: one Markdown file per worktree, kept on this Mac under
-//! `~/.lemen/notes/<host>/<worktree path>.md`.
+//! `~/.lemur/notes/<host>/<worktree path>.md`.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn notes_round_trip_and_empty_ones_make_no_file() {
-        let root = std::env::temp_dir().join(format!("lemen-notes-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("lemur-notes-{}", std::process::id()));
         let path = file(&root, "agent", "/srv/api");
         assert_eq!(load(&path).unwrap(), "");
         save(&path, "").unwrap();

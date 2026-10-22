@@ -1,4 +1,4 @@
-//! Sidebar rows lemen draws itself, so threads and worktrees can be
+//! Sidebar rows lemur draws itself, so threads and worktrees can be
 //! dragged into a new order and projects folded:
 //! gpui-component's SidebarMenuItem and SidebarGroup can't. They copy its
 //! look.

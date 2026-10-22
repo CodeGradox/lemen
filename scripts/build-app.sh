@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds build/lemen.app. Signed ad hoc unless LEMEN_SIGNING_IDENTITY names
+# Builds build/lemur.app. Signed ad hoc unless LEMEN_SIGNING_IDENTITY names
 # a Developer ID, which also gets the hardened runtime notarization needs.
 set -eu
 cd "$(dirname "$0")/.."
@@ -16,18 +16,18 @@ print(m["target_directory"])
 ')"
 version="$(printf '%s\n' "$metadata" | sed -n 1p)"
 target_directory="$(printf '%s\n' "$metadata" | sed -n 2p)"
-app="$build_directory/lemen.app"
+app="$build_directory/lemur.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$target_directory/release/lemen" "$app/Contents/MacOS/lemen"
+cp "$target_directory/release/lemur" "$app/Contents/MacOS/lemur"
 cp Resources/Info.plist "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy \
     -c "Add :CFBundleShortVersionString string $version" \
     -c "Add :CFBundleVersion string $version" \
     "$app/Contents/Info.plist"
-rm -f "$app/Contents/Resources/lemen.icns"
-if [ -f Resources/lemen.png ]; then
-    sh scripts/build-icon.sh Resources/lemen.png "$app/Contents/Resources/lemen.icns"
-    /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string lemen" "$app/Contents/Info.plist"
+rm -f "$app/Contents/Resources/lemur.icns"
+if [ -f Resources/lemur.png ]; then
+    sh scripts/build-icon.sh Resources/lemur.png "$app/Contents/Resources/lemur.icns"
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string lemur" "$app/Contents/Info.plist"
 fi
 set -- --force --sign "$signing_identity"
 case "$signing_identity" in

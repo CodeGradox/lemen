@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>lemen</string>
+    <string>lemur</string>
     <key>CFBundleDisplayName</key>
-    <string>lemen</string>
+    <string>lemur</string>
     <key>CFBundleIdentifier</key>
-    <string>com.codegradox.lemen</string>
+    <string>com.codegradox.lemur</string>
     <key>CFBundleExecutable</key>
-    <string>lemen</string>
+    <string>lemur</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -19,6 +19,6 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>lemen</string>
+    <string>lemur</string>
 </dict>
 </plist>

@@ -382,7 +382,7 @@ fn save_image(image: &Image) -> anyhow::Result<PathBuf> {
         _ => "tiff",
     };
     let path = std::env::temp_dir().join(format!(
-        "lemen-paste-{}-{}.{ext}",
+        "lemur-paste-{}-{}.{ext}",
         std::process::id(),
         image.id
     ));

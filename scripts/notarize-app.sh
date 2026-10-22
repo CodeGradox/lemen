@@ -16,7 +16,7 @@ case "$LEMEN_SIGNING_IDENTITY" in
 esac
 
 umask 077
-credentials="$(mktemp -d "$RUNNER_TEMP/lemen-signing.XXXXXX")"
+credentials="$(mktemp -d "$RUNNER_TEMP/lemur-signing.XXXXXX")"
 LEMEN_SIGNING_KEYCHAIN="$credentials/release.keychain-db"
 export LEMEN_SIGNING_KEYCHAIN
 set_keychain_search_list() {
@@ -77,13 +77,13 @@ set_keychain_search_list "$LEMEN_SIGNING_KEYCHAIN"
 # Public app/image contents must remain readable when installed by another user.
 umask 022
 CONFIGURATION=release sh scripts/build-app.sh
-app="$BUILD_DIR/lemen.app"
+app="$BUILD_DIR/lemur.app"
 codesign --verify --deep --strict --verbose=2 "$app"
 codesign -dv --verbose=4 "$app" 2>&1 | grep -F 'Authority=Developer ID Application:'
 codesign -dv --verbose=4 "$app" 2>&1 | grep -F 'runtime'
 codesign -dv --verbose=4 "$app" 2>&1 | grep -F 'Timestamp='
 # Submit the final distribution once; Apple also checks the signed app inside.
-dmg="$BUILD_DIR/lemen.dmg"
+dmg="$BUILD_DIR/lemur.dmg"
 sh scripts/build-dmg.sh "$app" "$dmg"
 codesign --force --sign "$LEMEN_SIGNING_IDENTITY" --keychain "$LEMEN_SIGNING_KEYCHAIN" \
     --timestamp "$dmg"

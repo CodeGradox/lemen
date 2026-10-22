@@ -3,7 +3,7 @@
 
 use super::folder_picker::{FolderPicker, HostChoice, PickerEvent};
 use super::settings::Prefs;
-use super::{Lemen, move_item};
+use super::{Lemur, move_item};
 use crate::actions;
 use crate::browse;
 use crate::config::{Base, Config, Host, home};
@@ -20,7 +20,7 @@ pub(super) struct Removal {
     sessions: Vec<String>,
 }
 
-impl Lemen {
+impl Lemur {
     pub(super) fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let hosts = host_choices(&self.cfg);
         let picker = cx.new(|cx| FolderPicker::new(hosts, window, cx));
@@ -136,7 +136,7 @@ impl Lemen {
         cx.notify();
     }
 
-    /// Asks before taking a project out of lemen; nothing on the host changes.
+    /// Asks before taking a project out of lemur; nothing on the host changes.
     pub(super) fn confirm_remove_project(
         &mut self,
         project: Base,
@@ -145,13 +145,13 @@ impl Lemen {
     ) {
         let this = cx.entity().downgrade();
         let description = format!(
-            "Only lemen forgets it. {} on {}, its worktrees and running threads stay as they are.",
+            "Only lemur forgets it. {} on {}, its worktrees and running threads stay as they are.",
             project.path, project.host
         );
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (this, project) = (this.clone(), project.clone());
             alert
-                .title(format!("Remove {} from lemen?", project.name()))
+                .title(format!("Remove {} from lemur?", project.name()))
                 .description(description.clone())
                 .show_cancel(true)
                 .ok_text("Remove")
@@ -336,7 +336,7 @@ impl Lemen {
     }
 }
 
-/// The hosts a folder can be added from: lemen's own, then the SSH config's
+/// The hosts a folder can be added from: lemur's own, then the SSH config's
 /// other aliases, then this Mac.
 fn host_choices(cfg: &Config) -> Vec<HostChoice> {
     let mut choices: Vec<HostChoice> = cfg

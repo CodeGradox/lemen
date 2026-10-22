@@ -245,7 +245,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("lemen-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("lemur-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         root
     }

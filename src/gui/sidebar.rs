@@ -1,7 +1,7 @@
 //! The sidebar: each project's worktrees and their threads, as rows to
 //! open, fold, drag into order and right-click.
 
-use super::{Ask, Key, Lemen, List, key, rows, worktree_label};
+use super::{Ask, Key, Lemur, List, key, rows, worktree_label};
 use crate::actions;
 use crate::config::{Base, COLORS};
 use crate::snapshot::{Activity, Session, Worktree};
@@ -21,19 +21,19 @@ const CLAUDE_ORANGE: u32 = 0xd97757;
 /// The cached sidebar's width; the sidebar draws itself at it too.
 pub(super) const SIDEBAR_WIDTH: Pixels = px(255.0);
 
-/// Renders `Lemen::sidebar`. As a cached view it's redrawn only when
-/// Lemen changes, or for its own animations and hovers; not for every
+/// Renders `Lemur::sidebar`. As a cached view it's redrawn only when
+/// Lemur changes, or for its own animations and hovers; not for every
 /// frame of terminal output.
 pub(super) struct SidebarView {
-    lemen: WeakEntity<Lemen>,
+    lemur: WeakEntity<Lemur>,
     #[cfg(test)]
     pub(super) renders: usize,
 }
 
 impl SidebarView {
-    pub(super) fn new(lemen: WeakEntity<Lemen>) -> Self {
+    pub(super) fn new(lemur: WeakEntity<Lemur>) -> Self {
         SidebarView {
-            lemen,
+            lemur,
             #[cfg(test)]
             renders: 0,
         }
@@ -46,14 +46,14 @@ impl Render for SidebarView {
         {
             self.renders += 1;
         }
-        match self.lemen.upgrade() {
-            Some(lemen) => lemen.update(cx, |lemen, cx| lemen.sidebar(cx).into_any_element()),
+        match self.lemur.upgrade() {
+            Some(lemur) => lemur.update(cx, |lemur, cx| lemur.sidebar(cx).into_any_element()),
             None => div().into_any_element(),
         }
     }
 }
 
-impl Lemen {
+impl Lemur {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let mut groups: Vec<rows::Group> = vec![];
@@ -148,7 +148,7 @@ impl Lemen {
                     h_flex()
                         .w_full()
                         .justify_between()
-                        .child(div().font_semibold().child("lemen"))
+                        .child(div().font_semibold().child("lemur"))
                         .child(h_flex().gap_1().child(add).child(refresh)),
                 ),
             )
@@ -450,7 +450,7 @@ fn title_case(name: &str) -> String {
 
 /// A click handler that opens the name field for `ask()`.
 fn ask_on_click(
-    this: &WeakEntity<Lemen>,
+    this: &WeakEntity<Lemur>,
     ask: impl Fn() -> Ask + 'static,
 ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     let this = this.clone();

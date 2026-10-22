@@ -65,7 +65,7 @@ pub struct Session {
     pub activity: Activity,
     /// What Claude is waiting on, when it needs input.
     pub waiting_for: Option<String>,
-    /// lemen started it for Claude rather than as a plain shell.
+    /// lemur started it for Claude rather than as a plain shell.
     pub started_claude: bool,
     /// Its place in its worktree once threads were dragged into an order.
     pub order: Option<u32>,
@@ -92,10 +92,12 @@ pub enum Activity {
 /// tmux prints control characters such as tabs as `_`, and session names
 /// can't contain `:`, so fields are split on a printable marker instead.
 const SEP: &str = "|::|";
-/// The `@muxbox_*` fallbacks read sessions tagged before the rename to lemen.
-const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{?@lemen_state,#{@lemen_state},#{@muxbox_state}}|::|#{?@lemen_worktree,#{@lemen_worktree},#{@muxbox_worktree}}|::|#{?@lemen_kind,#{@lemen_kind},#{@muxbox_kind}}|::|#{@lemen_order}";
+/// A session without a `@lemur_*` tag is read by its older names, from
+/// before the renames: `@lemen_*`, then `@muxbox_*`. tmux takes an order of
+/// `0` for false, so the old order is a field of its own.
+const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{?@lemur_state,#{@lemur_state},#{?@lemen_state,#{@lemen_state},#{@muxbox_state}}}|::|#{?@lemur_worktree,#{@lemur_worktree},#{?@lemen_worktree,#{@lemen_worktree},#{@muxbox_worktree}}}|::|#{?@lemur_kind,#{@lemur_kind},#{?@lemen_kind,#{@lemen_kind},#{@muxbox_kind}}}|::|#{@lemur_order}|::|#{@lemen_order}";
 /// How many fields `FIELDS` asks tmux for.
-const FIELD_COUNT: usize = 8;
+const FIELD_COUNT: usize = 9;
 const PANES: &str = "#{session_name}|::|#{pane_pid}";
 
 /// What Claude is doing. `claude agents` lists every running session with
@@ -337,7 +339,7 @@ fn parse_session(line: &str, now: u64) -> Option<Session> {
         },
         waiting_for: None,
         started_claude: f[6] == "claude",
-        order: f[7].parse().ok(),
+        order: f[7].parse().or_else(|_| f[8].parse()).ok(),
     })
 }
 
@@ -469,9 +471,9 @@ mod tests {
             worktree /home/agent/projects/api/.claude/worktrees/auth\nHEAD def\nbranch refs/heads/worktree-auth\n\n\
             worktree /home/agent/projects/api/.worktrees/x/api\nHEAD 0123456789abcdef\ndetached\n\n\
             @@now\n1000\n@@tmux\n\
-            api/auth|::|/home/agent/projects/api|::|1|::|990|::|needs_input|::|/home/agent/projects/api/.claude/worktrees/auth|::|claude|::|\n\
-            api/tests|::|/home/agent/projects/api|::|0|::|400|::||::||::||::|\n\
-            scratch|::|/tmp|::|0|::|1000|::||::||::|shell|::|\n\
+            api/auth|::|/home/agent/projects/api|::|1|::|990|::|needs_input|::|/home/agent/projects/api/.claude/worktrees/auth|::|claude|::||::|\n\
+            api/tests|::|/home/agent/projects/api|::|0|::|400|::||::||::||::||::|\n\
+            scratch|::|/tmp|::|0|::|1000|::||::||::|shell|::||::|\n\
             @@panes\napi/auth|::|90\napi/tests|::|100\nscratch|::|110\n\
             @@ps\n  90     1\n 100     1\n 110     1\n 200   100\n 250   100\n 300   250\n 400     1\n\
             @@agents\n[\n\
@@ -538,7 +540,7 @@ mod tests {
     fn hooks_report_when_claude_agents_cant() {
         let cfg = cfg();
         let out = "@@now\n1000\n@@tmux\n\
-            api/auth|::|/srv|::|0|::|990|::|needs_input|::||::|claude|::|\n\
+            api/auth|::|/srv|::|0|::|990|::|needs_input|::||::|claude|::||::|\n\
             @@panes\napi/auth|::|90\n@@ps\n  90     1\n@@agents\n";
         let h = parse(&cfg, &cfg.hosts[0], out);
         assert_eq!(h.other[0].activity, Activity::NeedsInput);
@@ -560,28 +562,45 @@ mod tests {
         assert_eq!(h.bases[0].error.as_deref(), Some("no such directory"));
     }
 
+    /// Sessions tagged by muxbox or lemen still read right; the newest
+    /// name wins, even with an order of 0.
     #[test]
-    fn reads_tags_from_before_the_rename() {
+    fn reads_tags_from_before_the_renames() {
         let server = TmuxServer::new("tags");
-        server.tmux(&["new-session", "-d", "-s", "old"]);
-        server.tmux(&["new-session", "-d", "-s", "new"]);
-        server.tmux(&["set-option", "-t", "=old:", "@muxbox_kind", "claude"]);
-        server.tmux(&["set-option", "-t", "=old:", "@muxbox_worktree", "/srv/a,b"]);
-        server.tmux(&["set-option", "-t", "=new:", "@lemen_kind", "shell"]);
-        server.tmux(&["set-option", "-t", "=new:", "@muxbox_kind", "claude"]);
+        let tag = |session: &str, option: &str, value: &str| {
+            server.tmux(&["set-option", "-t", &format!("={session}:"), option, value]);
+        };
+        for session in ["muxbox", "lemen", "lemur"] {
+            server.tmux(&["new-session", "-d", "-s", session]);
+        }
+        tag("muxbox", "@muxbox_kind", "claude");
+        tag("muxbox", "@muxbox_worktree", "/srv/a,b");
+        tag("lemen", "@lemen_kind", "claude");
+        tag("lemen", "@lemen_worktree", "/srv/c,d");
+        tag("lemen", "@lemen_order", "0");
+        tag("lemen", "@muxbox_kind", "shell");
+        tag("lemur", "@lemur_kind", "shell");
+        tag("lemur", "@lemen_kind", "claude");
+        tag("lemur", "@lemur_order", "0");
+        tag("lemur", "@lemen_order", "3");
         let snap = fetch(&server.config());
         let other = &snap.hosts[0].other;
         let get = |name| other.iter().find(|s| s.name == name).expect(name);
-        assert!(get("old").started_claude);
-        assert_eq!(get("old").path, "/srv/a,b");
-        assert!(!get("new").started_claude);
+        assert!(get("muxbox").started_claude);
+        assert_eq!(get("muxbox").path, "/srv/a,b");
+        assert_eq!(get("muxbox").order, None);
+        assert!(get("lemen").started_claude);
+        assert_eq!(get("lemen").path, "/srv/c,d");
+        assert_eq!(get("lemen").order, Some(0));
+        assert!(!get("lemur").started_claude);
+        assert_eq!(get("lemur").order, Some(0));
     }
 
     /// A folder without git is one row, holding the threads started in it.
     #[test]
     fn a_folder_without_git_is_a_single_row() {
         let server = TmuxServer::new("plain");
-        let dir = std::env::temp_dir().join(format!("lemen-plain-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lemur-plain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let real = dir.canonicalize().unwrap().to_string_lossy().into_owned();
         server.tmux(&["new-session", "-d", "-s", "notes/claude--calm-heron"]);
@@ -589,7 +608,7 @@ mod tests {
             "set-option",
             "-t",
             "=notes/claude--calm-heron:",
-            "@lemen_worktree",
+            "@lemur_worktree",
             &real,
         ]);
         let mut cfg = server.config();

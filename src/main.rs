@@ -126,7 +126,7 @@ fn main() -> Result<()> {
         }
         Cmd::Paste { host, session } => {
             let (host, session) = actions::resolve_target(&cfg, host, session)?;
-            let dir = std::env::temp_dir().join(format!("lemen-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("lemur-{}", std::process::id()));
             std::fs::create_dir_all(&dir)?;
             let png = dir.join("clipboard.png");
             let sent = clip::clipboard_png(&png)

@@ -27,7 +27,7 @@ mkdir -p "$(dirname "$destination")"
 temporary="$(mktemp -d "$(dirname "$destination")/icon.XXXXXX")"
 trap 'rm -rf "$temporary"' EXIT
 trap 'exit 1' HUP INT TERM
-iconset="$temporary/lemen.iconset"
+iconset="$temporary/lemur.iconset"
 mkdir "$iconset"
 for size in 16 32 128 256 512; do
     sips -s format png -z "$size" "$size" "$source_image" \

@@ -214,8 +214,8 @@ pub const LIGHT: Palette = Palette {
     cursor: rgb(0x4f525e),
 };
 
-/// Sets one color of the dark or light palette, or with `None` puts lemen's
-/// own back; the config keeps only what differs from lemen's own.
+/// Sets one color of the dark or light palette, or with `None` puts lemur's
+/// own back; the config keeps only what differs from lemur's own.
 pub fn set_color(terminal: &mut Terminal, dark: bool, slot: Slot, color: Option<Rgb>) {
     let defaults = Palette::default_for(dark);
     let mut palette = Palette::themed(dark, terminal);
@@ -242,12 +242,12 @@ const fn rgb(hex: u32) -> Rgb {
 }
 
 impl Palette {
-    /// lemen's own colors for dark or light.
+    /// lemur's own colors for dark or light.
     pub fn default_for(dark: bool) -> &'static Palette {
         if dark { &DARK } else { &LIGHT }
     }
 
-    /// The colors for dark or light: Settings' over lemen's own.
+    /// The colors for dark or light: Settings' over lemur's own.
     pub fn themed(dark: bool, terminal: &Terminal) -> Palette {
         let mut palette = *Palette::default_for(dark);
         let colors = if dark {
@@ -458,7 +458,7 @@ mod tests {
             Some("#ff0000")
         );
         assert_eq!(Palette::themed(false, &terminal), LIGHT);
-        // Back to lemen's own empties it again.
+        // Back to lemur's own empties it again.
         set_color(&mut terminal, true, Slot::Background, None);
         set_color(&mut terminal, true, Slot::Ansi(9), None);
         assert_eq!(terminal.dark, TerminalColors::default());

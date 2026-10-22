@@ -23,7 +23,7 @@ pub const COLORS: [(&str, u32); 10] = [
     ("gray", 0x6b7280),
 ];
 
-/// Terminal font sizes lemen accepts, in points.
+/// Terminal font sizes lemur accepts, in points.
 pub const FONT_SIZES: RangeInclusive<f64> = 6.0..=72.0;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,7 +68,7 @@ pub struct Terminal {
     pub font_family: String,
     /// In points.
     pub font_size: f64,
-    /// Colors over lemen's own for a dark app, then a light one.
+    /// Colors over lemur's own for a dark app, then a light one.
     pub dark: TerminalColors,
     pub light: TerminalColors,
 }
@@ -85,7 +85,7 @@ impl Default for Terminal {
 }
 
 /// Terminal colors as WezTerm names them, each `#rrggbb`; what's left out
-/// is lemen's own.
+/// is lemur's own.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TerminalColors {
@@ -172,7 +172,7 @@ pub struct Base {
 }
 
 fn default_upload_dir() -> String {
-    "~/.lemen/uploads".into()
+    "~/.lemur/uploads".into()
 }
 
 fn default_claude() -> String {
@@ -228,10 +228,13 @@ impl Base {
 
 impl Config {
     pub fn path() -> Result<PathBuf> {
-        if let Some(p) = std::env::var_os("LEMEN_CONFIG") {
+        // `LEMEN_CONFIG` from before the rename still works.
+        if let Some(p) =
+            std::env::var_os("LEMUR_CONFIG").or_else(|| std::env::var_os("LEMEN_CONFIG"))
+        {
             return Ok(p.into());
         }
-        Ok(home()?.join(".config/lemen/config.toml"))
+        Ok(home()?.join(".config/lemur/config.toml"))
     }
 
     pub fn load() -> Result<Config> {
@@ -420,7 +423,7 @@ pub fn write_whole(path: &Path, contents: &str) -> Result<()> {
     let name = target
         .file_name()
         .with_context(|| format!("{} has no file name", target.display()))?;
-    let temporary = target.with_file_name(format!(".{}.lemen-new", name.to_string_lossy()));
+    let temporary = target.with_file_name(format!(".{}.lemur-new", name.to_string_lossy()));
     std::fs::write(&temporary, contents)
         .with_context(|| format!("writing {}", temporary.display()))?;
     if let Ok(meta) = std::fs::metadata(&target) {
@@ -510,7 +513,7 @@ mod tests {
 
     #[test]
     fn saving_settings_keeps_the_rest_of_the_file() {
-        let path = std::env::temp_dir().join(format!("lemen-save-{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!("lemur-save-{}.toml", std::process::id()));
         let original = "\
 # my hosts
 [[hosts]]
@@ -561,7 +564,7 @@ path = \"~/projects/api\"
 
     #[test]
     fn saving_a_folder_adds_it_and_a_new_host() {
-        let path = std::env::temp_dir().join(format!("lemen-folder-{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!("lemur-folder-{}.toml", std::process::id()));
         let original = "\
 theme = \"dark\"   # keep me
 

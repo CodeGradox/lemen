@@ -1,5 +1,5 @@
 //! Finding folders to add: host aliases from the SSH config, and the
-//! folders on a host, listed over the connection lemen already uses.
+//! folders on a host, listed over the connection lemur already uses.
 
 use crate::config::Host;
 use crate::remote::{Remote, sh_path};

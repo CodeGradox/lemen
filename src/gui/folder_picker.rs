@@ -1,5 +1,5 @@
 //! Adding a folder, as in Zed's remote project picker: pick a host
-//! (lemen's own, an SSH alias, or this Mac), then type or pick a path while
+//! (lemur's own, an SSH alias, or this Mac), then type or pick a path while
 //! the folders on that host are suggested.
 
 use super::spotlight;

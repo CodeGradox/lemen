@@ -1,4 +1,4 @@
-name: Build lemen
+name: Build lemur
 
 # Every push to main builds a signed, notarized disk image and replaces the
 # latest-main pre-release with it; a new v* tag publishes that version.
@@ -31,8 +31,8 @@ jobs:
     steps:
       - name: Isolate build outputs
         run: |
-          echo "BUILD_DIR=$RUNNER_TEMP/lemen-release" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/lemen-target" >> "$GITHUB_ENV"
+          echo "BUILD_DIR=$RUNNER_TEMP/lemur-release" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/lemur-target" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -88,9 +88,9 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          app="$BUILD_DIR/lemen.app"
-          binary="$app/Contents/MacOS/lemen"
-          dmg="$BUILD_DIR/lemen.dmg"
+          app="$BUILD_DIR/lemur.app"
+          binary="$app/Contents/MacOS/lemur"
+          dmg="$BUILD_DIR/lemur.dmg"
           test "$(lipo -archs "$binary")" = "$ARCH"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$VERSION"
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 11.0
@@ -101,12 +101,12 @@ jobs:
           codesign --verify --strict --verbose=2 "$dmg"
           xcrun stapler validate "$dmg"
           mkdir -p artifacts
-          ditto "$dmg" "artifacts/lemen-macos-$ARCH.dmg"
-          (cd artifacts && shasum -a 256 "lemen-macos-$ARCH.dmg" > SHA256SUMS.txt)
+          ditto "$dmg" "artifacts/lemur-macos-$ARCH.dmg"
+          (cd artifacts && shasum -a 256 "lemur-macos-$ARCH.dmg" > SHA256SUMS.txt)
       - name: Remove any remaining ephemeral credentials
         if: always()
         run: |
-          for directory in "$RUNNER_TEMP"/lemen-signing.*; do
+          for directory in "$RUNNER_TEMP"/lemur-signing.*; do
             test -d "$directory" || continue
             security delete-keychain "$directory/release.keychain-db" >/dev/null 2>&1 || true
             rm -rf "$directory"
@@ -114,7 +114,7 @@ jobs:
       - name: Upload notarized disk image
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: lemen-macos-arm64
+          name: lemur-macos-arm64
           path: artifacts/
           if-no-files-found: error
           compression-level: 0
@@ -140,11 +140,11 @@ jobs:
       - name: Download signed assets from this exact run
         run: |
           gh run download "$GITHUB_RUN_ID" \
-            --name lemen-macos-arm64 --dir "$RUNNER_TEMP/signed-downloads"
+            --name lemur-macos-arm64 --dir "$RUNNER_TEMP/signed-downloads"
       - name: Verify checksums
         run: |
           cd "$RUNNER_TEMP/signed-downloads"
-          sha256sum lemen-macos-arm64.dmg | diff - SHA256SUMS.txt
+          sha256sum lemur-macos-arm64.dmg | diff - SHA256SUMS.txt
       - name: Replace the latest-main pre-release
         if: github.ref == 'refs/heads/main'
         run: |
@@ -164,9 +164,9 @@ jobs:
             gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag"
           fi
           gh release create "$tag" --target "$RELEASE_COMMIT" --prerelease \
-            --title "lemen main (${RELEASE_COMMIT:0:7})" \
-            --notes "The latest push to main ($RELEASE_COMMIT), replaced on every push. Requires Apple Silicon and macOS 11 or newer. Open the DMG, drag lemen into Applications, then eject it. Developer ID-signed and Apple-notarized." \
-            lemen-macos-arm64.dmg SHA256SUMS.txt
+            --title "lemur main (${RELEASE_COMMIT:0:7})" \
+            --notes "The latest push to main ($RELEASE_COMMIT), replaced on every push. Requires Apple Silicon and macOS 11 or newer. Open the DMG, drag lemur into Applications, then eject it. Developer ID-signed and Apple-notarized." \
+            lemur-macos-arm64.dmg SHA256SUMS.txt
       - name: Publish the version from a draft
         if: github.ref_type == 'tag'
         run: |
@@ -176,7 +176,7 @@ jobs:
           # Refuse a tag that moved while the signed build was running.
           test "$(gh api "repos/$GH_REPO/commits/$GITHUB_REF" --jq .sha)" = "$RELEASE_COMMIT"
           gh release create "$tag" --verify-tag --target "$RELEASE_COMMIT" \
-            --draft --title "lemen $RELEASE_VERSION" \
-            --notes "Requires Apple Silicon and macOS 11 or newer. Open the DMG, drag lemen into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional."
-          gh release upload "$tag" lemen-macos-arm64.dmg SHA256SUMS.txt
+            --draft --title "lemur $RELEASE_VERSION" \
+            --notes "Requires Apple Silicon and macOS 11 or newer. Open the DMG, drag lemur into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional."
+          gh release upload "$tag" lemur-macos-arm64.dmg SHA256SUMS.txt
           gh release edit "$tag" --draft=false --latest

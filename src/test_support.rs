@@ -14,7 +14,7 @@ pub struct TmuxServer {
 impl TmuxServer {
     pub fn new(tag: &str) -> TmuxServer {
         TmuxServer {
-            socket: format!("lemen-test-{tag}-{}", std::process::id()),
+            socket: format!("lemur-test-{tag}-{}", std::process::id()),
         }
     }
 
@@ -56,7 +56,7 @@ pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new(tag: &str) -> TempDir {
-        let dir = std::env::temp_dir().join(format!("lemen-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lemur-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("creating a temp dir");
         TempDir(dir.canonicalize().expect("the temp dir's real path"))
