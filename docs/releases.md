@@ -18,9 +18,12 @@ output. `LEMEN_SIGNING_IDENTITY` signs with another identity; a
 `Developer ID Application: …` identity also turns on the hardened runtime and
 a secure timestamp, as notarization requires. lemen needs no entitlements.
 
-If `Resources/lemen.png` exists (square, at least 1024×1024), the build turns
-it into the app icon with `scripts/build-icon.sh`; without it the app has the
-default icon.
+The build turns `Resources/lemen.png` (square, at least 1024×1024) into the
+app icon with `scripts/build-icon.sh`; without it the app has the default
+icon. To replace the logo, prepare the new original once with libvips (`brew
+install vips`): `sh scripts/optimize-icon.sh /path/to/original.png
+Resources/lemen.png` scales it to 1024×1024 sRGB, keeps full transparency so
+gradients don't band, and strips metadata.
 
 ## Disk image
 
