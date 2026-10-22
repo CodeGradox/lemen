@@ -23,6 +23,8 @@ Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `g
 
 ```toml
 # theme = "system"                # or "light" / "dark"; must come before the tables
+# sidebar_width = 255             # pixels; dragging the sidebar's edge sets it
+# notes_width = 360               # pixels; dragging the notes panel's edge sets it
 
 # [terminal]
 # font_family = "Menlo"
@@ -53,7 +55,7 @@ path = "~/projects/api"
 # worktree_colors = { "/path/to/worktree" = "blue" }  # red orange yellow green teal cyan blue purple pink gray
 ```
 
-Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, and the sidebar writes a project's `collapsed`, `worktree_order` and `worktree_colors`; the rest of the file, comments included, stays as it is.
+Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, and the sidebar writes a project's `collapsed`, `worktree_order` and `worktree_colors`; the rest of the file, comments included, stays as it is.
 
 With the default `worktree_dir`, new worktree threads run `claude -w <name>` and Claude creates the worktree. Any other `worktree_dir` (relative to the repo, absolute, or `~/...`) makes lemur run `git worktree add -b worktree-<name>` there first.
 

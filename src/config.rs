@@ -31,6 +31,12 @@ pub const FONT_SIZES: RangeInclusive<f64> = 6.0..=72.0;
 pub struct Config {
     #[serde(default)]
     pub theme: ThemeChoice,
+    /// The sidebar's width in pixels, as last dragged; unset is lemur's own.
+    #[serde(default)]
+    pub sidebar_width: Option<f32>,
+    /// The notes panel's width in pixels, as last dragged.
+    #[serde(default)]
+    pub notes_width: Option<f32>,
     #[serde(default)]
     pub terminal: Terminal,
     #[serde(default)]
@@ -361,6 +367,22 @@ impl Config {
         })
     }
 
+    /// Saves the side panels' widths, as dragged, to the config file at
+    /// `path`. A panel at lemur's own width is left out of the file.
+    pub fn save_panel_widths(path: &Path, sidebar: Option<f32>, notes: Option<f32>) -> Result<()> {
+        edit(path, |doc| {
+            for (key, width) in [("sidebar_width", sidebar), ("notes_width", notes)] {
+                match width {
+                    Some(width) => doc[key] = toml_edit::value(width.round() as i64),
+                    None => {
+                        doc.remove(key);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Takes a folder (a base) out of the config file at `path`; its host
     /// stays.
     pub fn remove_folder(path: &Path, base: &Base) -> Result<()> {
@@ -559,6 +581,26 @@ path = \"~/projects/api\"
         assert_eq!(cfg.terminal.font_size, 12.5);
         assert_eq!(cfg.terminal.dark.background.as_deref(), Some("#000000"));
         assert!(saved.contains("[terminal.dark]"), "{saved}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_panel_widths_keeps_them_before_the_tables() {
+        let path = std::env::temp_dir().join(format!("lemur-widths-{}.toml", std::process::id()));
+        std::fs::write(&path, "[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n").unwrap();
+        Config::save_panel_widths(&path, Some(300.4), None).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("sidebar_width = 300\n"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!((cfg.sidebar_width, cfg.notes_width), (Some(300.0), None));
+        assert_eq!(cfg.hosts[0].name, "agent");
+
+        // Back at lemur's own width, a panel leaves the file.
+        Config::save_panel_widths(&path, None, Some(420.0)).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("sidebar_width"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!((cfg.sidebar_width, cfg.notes_width), (None, Some(420.0)));
         let _ = std::fs::remove_file(path);
     }
 

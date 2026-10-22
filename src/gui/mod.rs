@@ -23,6 +23,7 @@ use crate::snapshot::{self, Activity, Session, Snapshot, Worktree};
 use folder_picker::FolderPicker;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::InputState;
+use gpui_kit::component::resizable::{HandleEdge, resize_handle};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -72,6 +73,32 @@ const REFRESH: Duration = Duration::from_secs(3);
 /// Out of sight, the sidebar refreshes every this many REFRESH ticks.
 const AWAY: u32 = 5;
 
+/// The notes panel's width until its edge is dragged.
+const NOTES_WIDTH: Pixels = px(360.0);
+/// The narrowest a dragged side panel gets, and the room it leaves the
+/// terminal.
+const MIN_SIDEBAR: Pixels = px(180.0);
+const MIN_NOTES: Pixels = px(240.0);
+const MIN_TERMINAL: Pixels = px(320.0);
+
+/// A side panel, resized by dragging its inner edge.
+#[derive(Clone, Copy)]
+enum Panel {
+    Sidebar,
+    Notes,
+}
+
+/// The drag of a side panel's edge; the window follows it and sets the
+/// width. It draws nothing at the pointer.
+#[derive(Clone)]
+struct ResizePanel(Panel);
+
+impl Render for ResizePanel {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
 type Key = (String, String);
 /// A list of threads: a host's worktree, by path, or with `None` the host's
 /// sessions outside every base.
@@ -112,6 +139,9 @@ struct Lemur {
     terminals: HashMap<Key, Entity<TerminalView>>,
     active: Option<Key>,
     collapsed: bool,
+    /// The side panels' widths; the config keeps them once a drag ends.
+    sidebar_width: Pixels,
+    notes_width: Pixels,
     prompt: Option<Prompt>,
     confirm_kill: Option<Key>,
     /// A session being renamed keeps its terminal while its old name disappears.
@@ -260,6 +290,8 @@ impl Lemur {
                 Theme::sync_system_appearance(Some(window), cx);
             }
         });
+        let sidebar_width = cfg.sidebar_width.map_or(SIDEBAR_WIDTH, px).max(MIN_SIDEBAR);
+        let notes_width = cfg.notes_width.map_or(NOTES_WIDTH, px).max(MIN_NOTES);
         Lemur {
             cfg,
             state_file,
@@ -268,6 +300,8 @@ impl Lemur {
             terminals: HashMap::new(),
             active: None,
             collapsed: false,
+            sidebar_width,
+            notes_width,
             prompt: None,
             confirm_kill: None,
             renaming: None,
@@ -584,6 +618,50 @@ impl Lemur {
         cx.notify();
     }
 
+    /// Follows the pointer (`x`) dragging a side panel's edge across the
+    /// window (`bounds`).
+    fn resize_panel(
+        &mut self,
+        panel: Panel,
+        x: Pixels,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = |open: bool, width: Pixels| if open { width } else { px(0.0) };
+        match panel {
+            Panel::Sidebar => {
+                let room =
+                    bounds.size.width - shown(self.notes_open, self.notes_width) - MIN_TERMINAL;
+                self.sidebar_width = panel_width(x - bounds.left(), MIN_SIDEBAR, room);
+            }
+            Panel::Notes => {
+                let room =
+                    bounds.size.width - shown(!self.collapsed, self.sidebar_width) - MIN_TERMINAL;
+                self.notes_width = panel_width(bounds.right() - x, MIN_NOTES, room);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Keeps the side panels' widths in the config file once a drag has
+    /// changed them; lemur's own widths are left out of it.
+    fn save_panel_widths(&mut self, cx: &mut Context<Self>) {
+        let kept = |width: Pixels, default: Pixels| (width != default).then(|| f32::from(width));
+        let widths = (
+            kept(self.sidebar_width, SIDEBAR_WIDTH),
+            kept(self.notes_width, NOTES_WIDTH),
+        );
+        if widths == (self.cfg.sidebar_width, self.cfg.notes_width) {
+            return;
+        }
+        (self.cfg.sidebar_width, self.cfg.notes_width) = widths;
+        if let Some(file) = Prefs::get(cx).config_file()
+            && let Err(e) = Config::save_panel_widths(file, widths.0, widths.1)
+        {
+            self.fail(e, cx);
+        }
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let toggle = Button::new("toggle-sidebar")
             .icon(if self.collapsed {
@@ -690,14 +768,34 @@ impl Render for Lemur {
                     cx.stop_propagation();
                 }
             }))
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ResizePanel>, _, cx| {
+                let panel = e.drag(cx).0;
+                this.resize_panel(panel, e.event.position.x, e.bounds, cx);
+            }))
+            // A drag ends wherever the button comes up: on the handle, which
+            // hides the window behind it from the pointer, too.
+            .capture_any_mouse_up(cx.listener(|this, _, _, cx| this.save_panel_widths(cx)))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.save_panel_widths(cx)),
+            )
             .when(!self.collapsed, |this| {
                 this.child(
-                    self.sidebar.clone().cached(
-                        StyleRefinement::default()
-                            .h_full()
-                            .w(SIDEBAR_WIDTH)
-                            .flex_shrink_0(),
-                    ),
+                    div()
+                        .relative()
+                        .h_full()
+                        .w(self.sidebar_width)
+                        .flex_shrink_0()
+                        .child(
+                            self.sidebar
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        )
+                        .child(panel_edge(
+                            "sidebar-edge",
+                            Panel::Sidebar,
+                            HandleEdge::Trailing,
+                        )),
                 )
             })
             .child(
@@ -714,17 +812,22 @@ impl Render for Lemur {
                             .when(self.notes_open, |this| {
                                 this.child(
                                     div()
-                                        .w(px(360.0))
+                                        .relative()
+                                        .w(self.notes_width)
                                         .h_full()
                                         .flex_shrink_0()
-                                        .border_l_1()
-                                        .border_color(cx.theme().border)
                                         // Cached like the terminal; it redraws on its own changes.
                                         .child(
                                             self.notes
                                                 .clone()
                                                 .cached(StyleRefinement::default().size_full()),
-                                        ),
+                                        )
+                                        // Its line is the panel's left border.
+                                        .child(panel_edge(
+                                            "notes-edge",
+                                            Panel::Notes,
+                                            HandleEdge::Leading,
+                                        )),
                                 )
                             }),
                     ),
@@ -735,6 +838,21 @@ impl Render for Lemur {
             // and can't be clicked, so clicks elsewhere keep their focus.
             .child(div().absolute().track_focus(&self.focus))
     }
+}
+
+/// A dragged side panel's width: `wanted` in whole pixels, at most `room`
+/// and at least `min`; in a narrow window `min` wins.
+fn panel_width(wanted: Pixels, min: Pixels, room: Pixels) -> Pixels {
+    wanted.round().min(room).max(min)
+}
+
+/// The band on a side panel's inner `edge` that resizes it.
+fn panel_edge(id: &'static str, panel: Panel, edge: HandleEdge) -> impl IntoElement {
+    resize_handle(id, Axis::Horizontal)
+        .inside(edge)
+        .on_drag(ResizePanel(panel), |drag, _, _, cx| {
+            cx.new(|_| drag.clone())
+        })
 }
 
 /// Moves `items[from]` to `to`. False if that's no move, or either is out
@@ -784,13 +902,16 @@ fn key(host: &str, s: &Session) -> Key {
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::folder_picker::HostChoice;
-    use super::{Ask, Key, Lemur, NotificationEvent};
+    use super::{
+        Ask, Key, Lemur, MIN_NOTES, MIN_SIDEBAR, MIN_TERMINAL, NOTES_WIDTH, NotificationEvent,
+        SIDEBAR_WIDTH,
+    };
     use crate::config::{Base, Config};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
     use crate::test_support::{TempDir, TmuxServer, git_in, wait_until};
     use gpui::VisualTestContext;
     use gpui_kit::component::WindowExt;
-    use gpui_kit::{AppContext, Entity, Modifiers, MouseButton, point, px, size};
+    use gpui_kit::{AppContext, Entity, Modifiers, MouseButton, Pixels, point, px, size};
     use std::time::Duration;
 
     fn key(s: &str) -> Key {
@@ -895,6 +1016,51 @@ mod tests {
             ["b", "c", "a"],
             "the refresh after the move agrees"
         );
+    }
+
+    /// Dragging a side panel's inner edge resizes it: down to its minimum,
+    /// and up to what leaves the terminal its own. The config keeps the
+    /// widths, but not lemur's own.
+    #[gpui::test]
+    fn dragging_a_side_panels_edge_resizes_it(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("resize-panels");
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let widths = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| (app.sidebar_width, app.notes_width))
+        };
+        let kept = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| (app.cfg.sidebar_width, app.cfg.notes_width))
+        };
+        // The bands lie just inside the panels' inner edges.
+        let across = |from: Pixels, to: Pixels, cx: &mut VisualTestContext| {
+            let (from, to) = (point(from, px(300.0)), point(to, px(300.0)));
+            let none = Modifiers::none();
+            cx.simulate_mouse_down(from, MouseButton::Left, none);
+            cx.simulate_mouse_move(from + point(px(0.0), px(6.0)), MouseButton::Left, none);
+            cx.simulate_mouse_move(to, MouseButton::Left, none);
+            cx.simulate_mouse_up(to, MouseButton::Left, none);
+        };
+
+        across(SIDEBAR_WIDTH - px(2.0), px(400.4), cx);
+        assert_eq!(widths(cx).0, px(400.0));
+        assert_eq!(kept(cx), (Some(400.0), None));
+        across(px(398.0), px(20.0), cx);
+        assert_eq!(widths(cx).0, MIN_SIDEBAR);
+        across(MIN_SIDEBAR - px(2.0), px(900.0), cx);
+        assert_eq!(widths(cx).0, px(1000.0) - MIN_TERMINAL);
+        across(px(1000.0) - MIN_TERMINAL - px(2.0), SIDEBAR_WIDTH, cx);
+        assert_eq!(kept(cx), (None, None), "back at lemur's own width");
+
+        app.update(cx, |app, cx| app.toggle_notes(cx));
+        cx.run_until_parked();
+        let edge = |width: Pixels| px(1000.0) - width + px(2.0);
+        across(edge(NOTES_WIDTH), px(200.0), cx);
+        assert_eq!(widths(cx).1, px(1000.0) - SIDEBAR_WIDTH - MIN_TERMINAL);
+        across(edge(widths(cx).1), px(990.0), cx);
+        assert_eq!(widths(cx).1, MIN_NOTES);
+        assert_eq!(kept(cx), (None, Some(f32::from(MIN_NOTES))));
     }
 
     /// Opening a thread points the notes at its worktree without opening

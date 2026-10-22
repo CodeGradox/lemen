@@ -18,7 +18,7 @@ use std::time::Duration;
 const CLAUDE_ICON: &[u8] = include_bytes!("claude.svg");
 const CLAUDE_ORANGE: u32 = 0xd97757;
 
-/// The cached sidebar's width; the sidebar draws itself at it too.
+/// The sidebar's width until its edge is dragged.
 pub(super) const SIDEBAR_WIDTH: Pixels = px(255.0);
 
 /// Renders `Lemur::sidebar`. As a cached view it's redrawn only when
@@ -142,7 +142,7 @@ impl Lemur {
         // Collapsing hides the cached view whole (see render).
         Sidebar::new("sessions")
             .collapsible(SidebarCollapsible::None)
-            .w(SIDEBAR_WIDTH)
+            .w(self.sidebar_width)
             .header(
                 SidebarHeader::new().child(
                     h_flex()
