@@ -39,6 +39,11 @@ impl Prefs {
         }
     }
 
+    /// The config file changes are saved to; tests have none.
+    pub fn config_file(&self) -> Option<&std::path::Path> {
+        self.file.as_deref()
+    }
+
     /// The current settings; the defaults until the app sets them.
     pub fn get(cx: &App) -> &Prefs {
         static DEFAULT: LazyLock<Prefs> = LazyLock::new(Prefs::default);

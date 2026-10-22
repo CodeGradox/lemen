@@ -46,8 +46,9 @@ With the default `worktree_dir`, new worktree threads run `claude -w <name>` and
 
 ## Use
 
-Run `lemen`. The sidebar lists each base's worktrees and their sessions; it refreshes every 3 s.
+Run `lemen`. The sidebar lists each base's worktrees and their sessions; it refreshes every 3 s. A worktree shows as its branch (`worktree-` dropped from the branches lemen and `claude -w` make), or its commit when detached.
 
+- **+** at the top of the sidebar adds a folder, as in Zed: pick a host (yours from the config, an alias from `~/.ssh/config`, or This Mac; or type `user@host`), then type the path while its folders are suggested (↑↓ to choose, Tab to go into one, Enter to add). A git repository shows each of its worktrees; a folder without git is a single row, with no **New worktree**. A folder inside a repository adds the repository. It's saved to the config as a `[[bases]]` entry, with a `[[hosts]]` entry for a new host.
 - Click a session to show it. Each opened session keeps its own terminal, so switching is instant. lemen reopens the last session on launch.
 - **New worktree** starts a thread in a new worktree; **+** on a worktree starts another session in it: **Claude**, or a plain **Shell**. The field that appears in the header asks for a label (`claude` or `shell` to start with; a free random name for a new worktree): press Enter to take it, or type your own. Several sessions can share a label: lemen names the tmux session `<label>--<random words>`, like `claude--calm-heron`, and shows only the label. Claude sessions get Claude's spark as their icon, shells a terminal.
 - **×** on a session, clicked twice, kills it. The worktree stays.

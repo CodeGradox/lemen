@@ -63,7 +63,7 @@ impl Default for Terminal {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Host {
     pub name: String,
@@ -102,7 +102,30 @@ fn default_worktree_dir() -> String {
     CLAUDE_WORKTREES.into()
 }
 
+impl Host {
+    /// A host reached at `ssh` (or "local"), with the default settings.
+    pub fn new(name: &str, ssh: &str) -> Host {
+        Host {
+            name: name.into(),
+            ssh: ssh.into(),
+            upload_dir: default_upload_dir(),
+            tmux_socket: None,
+            claude: default_claude(),
+        }
+    }
+}
+
 impl Base {
+    /// The repo at `path` on `host`, with the default settings.
+    pub fn new(host: &str, path: &str) -> Base {
+        Base {
+            host: host.into(),
+            path: path.into(),
+            name: None,
+            worktree_dir: default_worktree_dir(),
+        }
+    }
+
     pub fn name(&self) -> String {
         let name = self.name.as_deref().unwrap_or_else(|| leaf(&self.path));
         // tmux reserves `.` and `:` in target names.
@@ -148,27 +171,35 @@ impl Config {
     /// Writes the settings the Settings window changes into the config file
     /// at `path`, leaving everything else in it, comments included, as is.
     pub fn save_settings(path: &Path, theme: ThemeChoice, terminal: &Terminal) -> Result<()> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut doc: toml_edit::DocumentMut = text
-            .parse()
-            .with_context(|| format!("parsing {}", path.display()))?;
-        doc["theme"] = toml_edit::value(theme.as_str());
-        let table = doc
-            .entry("terminal")
-            .or_insert_with(toml_edit::table)
-            .as_table_like_mut()
-            .context("terminal in the config is not a table")?;
-        table.insert("font_family", toml_edit::value(&terminal.font_family));
-        // Whole sizes read best without the ".0".
-        let size = terminal.font_size;
-        let size = if size.fract() == 0.0 {
-            toml_edit::value(size as i64)
-        } else {
-            toml_edit::value(size)
-        };
-        table.insert("font_size", size);
-        std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+        edit(path, |doc| {
+            doc["theme"] = toml_edit::value(theme.as_str());
+            let table = doc
+                .entry("terminal")
+                .or_insert_with(toml_edit::table)
+                .as_table_like_mut()
+                .context("terminal in the config is not a table")?;
+            table.insert("font_family", toml_edit::value(&terminal.font_family));
+            // Whole sizes read best without the ".0".
+            let size = terminal.font_size;
+            let size = if size.fract() == 0.0 {
+                toml_edit::value(size as i64)
+            } else {
+                toml_edit::value(size)
+            };
+            table.insert("font_size", size);
+            Ok(())
+        })
+    }
+
+    /// Adds a folder (a base) to the config file at `path`, and its host
+    /// when `new_host` says the file doesn't have it yet.
+    pub fn save_folder(path: &Path, new_host: Option<&Host>, base: &Base) -> Result<()> {
+        edit(path, |doc| {
+            if let Some(h) = new_host {
+                push_table(doc, "hosts", &[("name", &h.name), ("ssh", &h.ssh)])?;
+            }
+            push_table(doc, "bases", &[("host", &base.host), ("path", &base.path)])
+        })
     }
 
     pub fn host(&self, name: &str) -> Option<&Host> {
@@ -183,6 +214,33 @@ impl Config {
     pub fn base_by_name(&self, name: &str) -> Option<usize> {
         self.bases.iter().position(|b| b.name() == name)
     }
+}
+
+/// Changes the config file at `path` in place: what `change` doesn't touch,
+/// comments included, stays as it is.
+fn edit(path: &Path, change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>) -> Result<()> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    change(&mut doc)?;
+    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Appends a `[[key]]` table with `fields`.
+fn push_table(doc: &mut toml_edit::DocumentMut, key: &str, fields: &[(&str, &str)]) -> Result<()> {
+    let tables = doc
+        .entry(key)
+        .or_insert_with(|| toml_edit::Item::ArrayOfTables(Default::default()))
+        .as_array_of_tables_mut()
+        .with_context(|| format!("{key} in the config is not a list of [[{key}]] tables"))?;
+    let mut table = toml_edit::Table::new();
+    for (k, v) in fields {
+        table.insert(k, toml_edit::value(*v));
+    }
+    tables.push(table);
+    Ok(())
 }
 
 /// The last component of a path: `api` for `~/code/api/`.
@@ -268,6 +326,53 @@ path = \"~/projects/api\"
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.theme, ThemeChoice::System);
         assert_eq!(cfg.terminal.font_size, 12.5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_a_folder_adds_it_and_a_new_host() {
+        let path = std::env::temp_dir().join(format!("lemen-folder-{}.toml", std::process::id()));
+        let original = "\
+theme = \"dark\"   # keep me
+
+[[hosts]]
+name = \"agent\"
+ssh = \"agent\"
+
+[[bases]]
+host = \"agent\"
+path = \"~/projects/api\"
+";
+        std::fs::write(&path, original).unwrap();
+        // A folder on a host the file already has, then one on a new host.
+        Config::save_folder(&path, None, &Base::new("agent", "~/projects/web")).unwrap();
+        let app = Host::new("app", "app");
+        Config::save_folder(&path, Some(&app), &Base::new("app", "/srv/site")).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep me"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        let hosts: Vec<&str> = cfg.hosts.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(hosts, ["agent", "app"]);
+        let bases: Vec<(&str, &str)> = cfg
+            .bases
+            .iter()
+            .map(|b| (b.host.as_str(), b.path.as_str()))
+            .collect();
+        assert_eq!(
+            bases,
+            [
+                ("agent", "~/projects/api"),
+                ("agent", "~/projects/web"),
+                ("app", "/srv/site")
+            ]
+        );
+        assert_eq!(cfg.bases[2].worktree_dir, CLAUDE_WORKTREES);
+
+        // A file with no hosts or bases yet gets its first ones.
+        std::fs::write(&path, "# empty\n").unwrap();
+        Config::save_folder(&path, Some(&app), &Base::new("app", "/srv/site")).unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((cfg.hosts.len(), cfg.bases.len()), (1, 1));
         let _ = std::fs::remove_file(path);
     }
 }

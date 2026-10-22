@@ -3,6 +3,7 @@
 //! Every session you open keeps its own terminal (`tmux attach` over SSH),
 //! so switching is instant and scrollback survives.
 
+mod folder_picker;
 mod keys;
 mod notes;
 mod notification;
@@ -13,8 +14,10 @@ mod terminal_view;
 
 use crate::actions;
 use crate::attach::Active;
-use crate::config::{Config, ThemeChoice, leaf};
+use crate::browse;
+use crate::config::{Base, Config, Host, ThemeChoice, home, leaf};
 use crate::snapshot::{self, Activity, Session, Snapshot, Worktree};
+use folder_picker::{FolderPicker, HostChoice, PickerEvent};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
@@ -110,6 +113,8 @@ struct Lemen {
     /// The notes of the last worktree opened, beside the terminal.
     notes: Entity<NotesPanel>,
     notes_open: bool,
+    /// Adding a folder, over the window.
+    picker: Option<(Entity<FolderPicker>, Subscription)>,
     _refresh: Task<()>,
     _appearance: Subscription,
 }
@@ -132,6 +137,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 KeyBinding::new("tab", NoAction, Some(terminal_view::CONTEXT)),
                 KeyBinding::new("shift-tab", NoAction, Some(terminal_view::CONTEXT)),
             ]);
+            folder_picker::bind_keys(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
             cx.on_action(|_: &Hide, cx| cx.hide());
@@ -226,6 +232,7 @@ impl Lemen {
             order_changes: 0,
             notes,
             notes_open: false,
+            picker: None,
             _refresh: refresh,
             _appearance: appearance,
         }
@@ -400,9 +407,9 @@ impl Lemen {
         let h = self.snap.hosts.iter().find(|h| h.name == host)?;
         h.bases
             .iter()
-            .flat_map(|b| b.worktrees.iter().enumerate())
-            .find(|(_, w)| w.sessions.iter().any(|s| s.name == session))
-            .map(|(position, w)| (w.path.clone(), worktree_label(w, position)))
+            .flat_map(|b| b.worktrees.iter())
+            .find(|w| w.sessions.iter().any(|s| s.name == session))
+            .map(|w| (w.path.clone(), worktree_label(w)))
     }
 
     /// Opens the notes panel on a worktree's notes.
@@ -417,6 +424,58 @@ impl Lemen {
         self.notes
             .update(cx, |n, cx| n.show(host, worktree, label, window, cx));
         self.notes_open = true;
+        cx.notify();
+    }
+
+    fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hosts = host_choices(&self.cfg);
+        let picker = cx.new(|cx| FolderPicker::new(hosts, window, cx));
+        let events = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {
+            if let PickerEvent::Add { host, path } = event {
+                this.add_folder(host.clone(), path.clone(), cx);
+            }
+            this.close_picker(window, cx);
+        });
+        self.picker = Some((picker, events));
+        cx.notify();
+    }
+
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        if let Some(view) = self.active.as_ref().and_then(|k| self.terminals.get(k)) {
+            view.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Adds a repository to the sidebar, and to the config file so it stays.
+    fn add_folder(&mut self, choice: HostChoice, path: String, cx: &mut Context<Self>) {
+        let host = choice.host;
+        if self
+            .cfg
+            .bases
+            .iter()
+            .any(|b| b.host == host.name && b.path == path)
+        {
+            self.status = Some((format!("{path} is in the sidebar already"), false));
+            cx.notify();
+            return;
+        }
+        let new_host = self.cfg.host(&host.name).is_none();
+        let base = Base::new(&host.name, &path);
+        if let Some(file) = Prefs::get(cx).config_file() {
+            let saved = Config::save_folder(file, new_host.then_some(&host), &base);
+            if let Err(e) = saved {
+                self.status = Some((format!("{e:#}"), true));
+                cx.notify();
+                return;
+            }
+        }
+        if new_host {
+            self.cfg.hosts.push(host);
+        }
+        self.cfg.bases.push(base);
+        self.refresh(cx).detach();
         cx.notify();
     }
 
@@ -661,13 +720,17 @@ impl Lemen {
             for b in &h.bases {
                 let base = &self.cfg.bases[b.index];
                 let index = b.index;
-                let mut menu = rows::Menu::default().child(rows::Entry::Item(Box::new(
-                    SidebarMenuItem::new("New worktree")
-                        .icon(IconName::Plus)
-                        .on_click(ask_on_click(&this, move || Ask::NewWorktree {
-                            base: index,
-                        })),
-                )));
+                let mut menu = rows::Menu::default();
+                // A folder without git has no worktrees to add.
+                if !b.plain {
+                    menu = menu.child(rows::Entry::Item(Box::new(
+                        SidebarMenuItem::new("New worktree")
+                            .icon(IconName::Plus)
+                            .on_click(ask_on_click(&this, move || Ask::NewWorktree {
+                                base: index,
+                            })),
+                    )));
+                }
                 if let Some(e) = &b.error {
                     menu = menu.child(rows::Entry::Item(Box::new(
                         SidebarMenuItem::new(e.clone())
@@ -676,8 +739,8 @@ impl Lemen {
                     )));
                 }
                 let prefix = format!("{}/", base.name());
-                for (wi, w) in b.worktrees.iter().enumerate() {
-                    menu = menu.child(self.worktree_item(&h.name, index, wi, w, &prefix, cx));
+                for w in &b.worktrees {
+                    menu = menu.child(self.worktree_item(&h.name, index, w, &prefix, cx));
                 }
                 groups.push(SidebarGroup::new(format!("{} · {}", base.name(), h.name)).child(menu));
             }
@@ -689,6 +752,18 @@ impl Lemen {
                 );
             }
         }
+        let add = {
+            let this = this.clone();
+            Button::new("add-folder")
+                .icon(IconName::Plus)
+                .ghost()
+                .xsmall()
+                .tooltip("Add folder")
+                .on_click(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.open_picker(window, cx))
+                        .ok();
+                })
+        };
         let refresh = {
             let this = this.clone();
             Button::new("refresh")
@@ -709,7 +784,7 @@ impl Lemen {
                         .w_full()
                         .justify_between()
                         .child(div().font_semibold().child("lemen"))
-                        .child(refresh),
+                        .child(h_flex().gap_1().child(add).child(refresh)),
                 ),
             )
             .children(groups)
@@ -720,12 +795,11 @@ impl Lemen {
         &self,
         host: &str,
         base: usize,
-        position: usize,
         w: &Worktree,
         prefix: &str,
         cx: &mut Context<Self>,
     ) -> rows::Entry {
-        let label = worktree_label(w, position);
+        let label = worktree_label(w);
         let this = cx.entity().downgrade();
         let worktree = w.path.clone();
         let (host_name, notes_label) = (host.to_string(), label.clone());
@@ -1016,7 +1090,27 @@ impl Render for Lemen {
                     "Loading sessions…"
                 }),
         };
+        let picker = self.picker.as_ref().map(|(picker, _)| {
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .justify_center()
+                .pt(px(72.0))
+                .bg(gpui_kit::black().opacity(0.2))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_picker(window, cx)),
+                )
+                .child(
+                    div()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(picker.clone()),
+                )
+        });
         h_flex()
+            .relative()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -1052,7 +1146,40 @@ impl Render for Lemen {
                             }),
                     ),
             )
+            .children(picker)
     }
+}
+
+/// The hosts a folder can be added from: lemen's own, then the SSH config's
+/// other aliases, then this Mac.
+fn host_choices(cfg: &Config) -> Vec<HostChoice> {
+    let mut choices: Vec<HostChoice> = cfg
+        .hosts
+        .iter()
+        .map(|host| HostChoice {
+            host: host.clone(),
+            configured: true,
+        })
+        .collect();
+    let aliases = home()
+        .map(|home| browse::ssh_aliases(&home.join(".ssh/config")))
+        .unwrap_or_default();
+    let known = |name: &str| cfg.hosts.iter().any(|h| h.name == name || h.ssh == name);
+    for alias in aliases {
+        if !known(&alias) {
+            choices.push(HostChoice {
+                host: Host::new(&alias, &alias),
+                configured: false,
+            });
+        }
+    }
+    if !known("local") {
+        choices.push(HostChoice {
+            host: Host::new("local", "local"),
+            configured: false,
+        });
+    }
+    choices
 }
 
 fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
@@ -1068,11 +1195,18 @@ fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
     })
 }
 
-/// The main checkout reads best as its branch; linked ones by directory.
-fn worktree_label(w: &Worktree, position: usize) -> String {
-    match (&w.branch, position) {
-        (Some(branch), 0) => branch.clone(),
-        _ => leaf(&w.path).to_string(),
+/// A worktree's name in the sidebar: its branch, which tells worktrees
+/// apart even when their folders share a name. `worktree-` is dropped from
+/// the branches lemen and `claude -w` make, leaving the name you gave. A
+/// detached worktree shows its commit.
+fn worktree_label(w: &Worktree) -> String {
+    match (&w.branch, &w.head) {
+        (Some(branch), _) => branch
+            .strip_prefix("worktree-")
+            .unwrap_or(branch)
+            .to_string(),
+        (None, Some(head)) => format!("{} (detached)", &head[..head.len().min(7)]),
+        (None, None) => leaf(&w.path).to_string(),
     }
 }
 
@@ -1129,7 +1263,7 @@ fn age(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Key, Lemen, NotificationEvent};
+    use super::{HostChoice, Key, Lemen, NotificationEvent};
     use crate::config::Config;
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
     use crate::test_support::{TmuxServer, wait_until};
@@ -1280,6 +1414,7 @@ mod tests {
         let worktree = |path: &str, branch: &str, sessions: &[&str]| Worktree {
             path: path.into(),
             branch: Some(branch.into()),
+            head: None,
             sessions: snapshot(
                 &sessions
                     .iter()
@@ -1297,6 +1432,7 @@ mod tests {
                 bases: vec![BaseView {
                     index: 0,
                     error: None,
+                    plain: false,
                     worktrees: vec![
                         worktree("/srv/api", "main", &[]),
                         worktree(
@@ -1336,6 +1472,61 @@ mod tests {
             app.read_with(cx, |app, cx| {
                 app.terminals.values().all(|t| t.read(cx).exited())
             })
+        });
+    }
+
+    #[test]
+    fn worktrees_are_named_after_their_branch() {
+        let worktree = |branch: Option<&str>, head: Option<&str>| super::Worktree {
+            path: "/srv/web/.worktrees/equal-burrow/web".into(),
+            branch: branch.map(str::to_string),
+            head: head.map(str::to_string),
+            sessions: vec![],
+        };
+        let label = |b, h| super::worktree_label(&worktree(b, h));
+        assert_eq!(
+            label(Some("feature/cleaning-app-react"), Some("abc")),
+            "feature/cleaning-app-react"
+        );
+        assert_eq!(label(Some("worktree-auth"), None), "auth");
+        assert_eq!(label(None, Some("0123456789abcdef")), "0123456 (detached)");
+        // A bare repository has neither.
+        assert_eq!(label(None, None), "web");
+    }
+
+    /// The picker closes with Esc; a folder it adds joins the sidebar once.
+    #[gpui::test]
+    fn an_added_folder_joins_the_sidebar_once(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("add");
+        let cfg = server.config();
+        let local = HostChoice {
+            host: cfg.hosts[0].clone(),
+            configured: true,
+        };
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            super::folder_picker::bind_keys(cx);
+        });
+        let (app, cx) = cx.add_window_view(|window, cx| Lemen::new(cfg, None, window, cx));
+        cx.update(|window, cx| app.update(cx, |app, cx| app.open_picker(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        app.read_with(cx, |app, _| assert!(app.picker.is_none()));
+
+        for _ in 0..2 {
+            app.update(cx, |app, cx| {
+                app.add_folder(local.clone(), "/srv/api".into(), cx)
+            });
+        }
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let bases: Vec<&str> = app.cfg.bases.iter().map(|b| b.path.as_str()).collect();
+            assert_eq!(bases, ["/srv/api"]);
+            assert_eq!(app.cfg.hosts.len(), 1);
+            assert_eq!(app.snap.hosts[0].bases.len(), 1, "the refresh lists it");
+            let status = app.status.as_ref().map(|(s, _)| s.as_str());
+            assert_eq!(status, Some("/srv/api is in the sidebar already"));
         });
     }
 

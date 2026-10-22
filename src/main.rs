@@ -1,5 +1,6 @@
 mod actions;
 mod attach;
+mod browse;
 mod clip;
 mod config;
 mod gui;

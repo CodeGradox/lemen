@@ -27,12 +27,17 @@ pub struct BaseView {
     pub error: Option<String>,
     /// The main checkout comes first, as `git worktree list` prints it.
     pub worktrees: Vec<Worktree>,
+    /// Not a git repository: its one "worktree" is the folder itself, and
+    /// no others can be added.
+    pub plain: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct Worktree {
     pub path: String,
     pub branch: Option<String>,
+    /// The commit checked out.
+    pub head: Option<String>,
     pub sessions: Vec<Session>,
 }
 
@@ -116,7 +121,7 @@ fn script(cfg: &Config, host: &Host, remote: &Remote) -> String {
         .filter(|(_, b)| b.host == host.name)
     {
         s += &format!(
-            "echo '@@base {i}'\n( cd {} 2>/dev/null || {{ echo '@@error no such directory'; exit 0; }}; git worktree list --porcelain 2>/dev/null || echo '@@error not a git repository' )\n",
+            "echo '@@base {i}'\n( cd {} 2>/dev/null || {{ echo '@@error no such directory'; exit 0; }}; git worktree list --porcelain 2>/dev/null || echo \"@@plain $(pwd -P)\" )\n",
             sh_path(&b.path)
         );
     }
@@ -149,6 +154,7 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
                     index,
                     error: None,
                     worktrees: vec![],
+                    plain: false,
                 });
                 section = "base";
                 continue;
@@ -226,12 +232,25 @@ fn sort(sessions: &mut [Session]) {
 fn parse_worktree_line(base: &mut BaseView, line: &str) {
     if let Some(e) = line.strip_prefix("@@error ") {
         base.error = Some(e.to_string());
+    } else if let Some(p) = line.strip_prefix("@@plain ") {
+        base.plain = true;
+        base.worktrees.push(Worktree {
+            path: p.to_string(),
+            branch: None,
+            head: None,
+            sessions: vec![],
+        });
     } else if let Some(p) = line.strip_prefix("worktree ") {
         base.worktrees.push(Worktree {
             path: p.to_string(),
             branch: None,
+            head: None,
             sessions: vec![],
         });
+    } else if let Some(h) = line.strip_prefix("HEAD ")
+        && let Some(w) = base.worktrees.last_mut()
+    {
+        w.head = Some(h.to_string());
     } else if let Some(b) = line.strip_prefix("branch ")
         && let Some(w) = base.worktrees.last_mut()
     {
@@ -356,6 +375,7 @@ mod tests {
         let out = "@@base 0\n\
             worktree /home/agent/projects/api\nHEAD abc\nbranch refs/heads/main\n\n\
             worktree /home/agent/projects/api/.claude/worktrees/auth\nHEAD def\nbranch refs/heads/worktree-auth\n\n\
+            worktree /home/agent/projects/api/.worktrees/x/api\nHEAD 0123456789abcdef\ndetached\n\n\
             @@now\n1000\n@@tmux\n\
             api/auth|::|/home/agent/projects/api|::|1|::|990|::|needs_input|::|/home/agent/projects/api/.claude/worktrees/auth|::|claude|::|\n\
             api/tests|::|/home/agent/projects/api|::|0|::|400|::||::||::||::|\n\
@@ -370,8 +390,10 @@ mod tests {
             ]\n";
         let h = parse(&cfg, &cfg.hosts[0], out);
         let wts = &h.bases[0].worktrees;
-        assert_eq!(wts.len(), 2);
+        assert_eq!(wts.len(), 3);
         assert_eq!(wts[0].branch.as_deref(), Some("main"));
+        assert_eq!(wts[2].branch, None);
+        assert_eq!(wts[2].head.as_deref(), Some("0123456789abcdef"));
         assert_eq!(
             wts[0]
                 .sessions
@@ -427,6 +449,38 @@ mod tests {
         assert!(get("old").started_claude);
         assert_eq!(get("old").path, "/srv/a,b");
         assert!(!get("new").started_claude);
+    }
+
+    /// A folder without git is one row, holding the threads started in it.
+    #[test]
+    fn a_folder_without_git_is_a_single_row() {
+        let server = TmuxServer::new("plain");
+        let dir = std::env::temp_dir().join(format!("lemen-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+        server.tmux(&["new-session", "-d", "-s", "notes/claude--calm-heron"]);
+        server.tmux(&[
+            "set-option",
+            "-t",
+            "=notes/claude--calm-heron:",
+            "@lemen_worktree",
+            &real,
+        ]);
+        let mut cfg = server.config();
+        cfg.bases
+            .push(crate::config::Base::new("local", &dir.to_string_lossy()));
+
+        let snap = fetch(&cfg);
+        let base = &snap.hosts[0].bases[0];
+        assert!(base.plain);
+        assert_eq!(base.error, None);
+        assert_eq!(base.worktrees.len(), 1);
+        assert_eq!(base.worktrees[0].path, real);
+        assert_eq!(
+            base.worktrees[0].sessions[0].name,
+            "notes/claude--calm-heron"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
