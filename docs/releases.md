@@ -104,5 +104,8 @@ them anywhere else.
 An app started from Finder or the Dock gets a short `PATH`
 (`/usr/bin:/bin:/usr/sbin:/sbin`). Remote hosts are unaffected: `ssh` and
 `scp` live in `/usr/bin`, and commands on the host use the host's own
-`PATH`. A host with `ssh = "local"` runs tmux on this Mac, and Homebrew's
-`/opt/homebrew/bin` isn't on that `PATH`; start lemur from a shell for those.
+`PATH`. A host with `ssh = "local"` runs tmux on this Mac, often from
+Homebrew's `/opt/homebrew/bin`, so at startup lemur asks your login shell
+(`$SHELL -l`) for its `PATH` and adds the folders its own lacks, after its
+own. A shell that takes longer than 2 seconds leaves the `PATH` as it was;
+start lemur from a shell then.

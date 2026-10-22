@@ -4,6 +4,7 @@ mod browse;
 mod clip;
 mod config;
 mod gui;
+mod login_path;
 mod notes;
 mod remote;
 mod snapshot;
@@ -73,7 +74,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load()?;
     match cli.cmd.unwrap_or(Cmd::Gui) {
-        Cmd::Gui => gui::run(cfg),
+        Cmd::Gui => {
+            login_path::add();
+            gui::run(cfg)
+        }
         Cmd::Ls => {
             print_tree(&cfg, &snapshot::fetch(&cfg));
             Ok(())
