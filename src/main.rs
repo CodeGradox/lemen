@@ -43,6 +43,13 @@ enum Cmd {
         /// Start just a shell instead of Claude (in an existing worktree)
         #[arg(long, requires = "worktree")]
         shell: bool,
+        /// Branch to create for a new worktree; without one it's detached
+        #[arg(long, conflicts_with = "worktree")]
+        branch: Option<String>,
+        /// What a new worktree starts from, like origin/main; the default
+        /// branch if unset
+        #[arg(long, conflicts_with = "worktree")]
+        from: Option<String>,
     },
     /// Attach this terminal to a session
     Attach { host: String, session: String },
@@ -87,6 +94,8 @@ fn main() -> Result<()> {
             name,
             worktree,
             shell,
+            branch,
+            from,
         } => {
             let b = cfg
                 .base_by_name(&base)
@@ -95,7 +104,20 @@ fn main() -> Result<()> {
             let thread = actions::unique_thread(&name, |_| false);
             let (host, session) = match worktree {
                 Some(w) => actions::new_thread_in(&cfg, b, &w, &thread, shell)?,
-                None => actions::new_worktree_thread(&cfg, b, &name, &thread)?,
+                None => {
+                    let (started, note) = actions::new_worktree_thread(
+                        &cfg,
+                        b,
+                        &name,
+                        &thread,
+                        branch.as_deref(),
+                        from.as_deref(),
+                    )?;
+                    if let Some(note) = note {
+                        eprintln!("{note}");
+                    }
+                    started
+                }
             };
             println!("started {session} on {host}");
             Ok(())

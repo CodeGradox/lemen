@@ -4,12 +4,24 @@
 use super::{Ask, Key, Lemur, Prompt, sessions, spotlight, worktree_label};
 use crate::actions;
 use crate::config::leaf;
-use gpui_kit::component::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::select::{SearchableVec, Select, SelectState};
+use gpui_kit::component::{ActiveTheme, IconName, IndexPath, Sizable, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
+/// A new worktree's branch, empty for none, and the branch it starts
+/// from, picked from the host's branches once they've loaded.
+pub(super) struct WorktreeFields {
+    pub(super) branch: Entity<InputState>,
+    pub(super) from: Entity<SelectState<SearchableVec<String>>>,
+    _events: Subscription,
+    _load: Task<()>,
+}
+
 enum Done {
-    Started(Key),
+    /// With a note about how it went, if there's one.
+    Started(Key, Option<String>),
     Renamed {
         host: String,
         old: String,
@@ -56,13 +68,69 @@ impl Lemur {
             i.focus(window, cx);
             i.select_all(window, cx);
         });
+        let worktree = match &what {
+            Ask::NewWorktree { base } => Some(self.worktree_fields(*base, window, cx)),
+            _ => None,
+        };
         self.prompt = Some(Prompt {
             what,
             input,
+            worktree,
             error: None,
             _events: events,
         });
         cx.notify();
+    }
+
+    /// The branch field, empty, and the branches of `base` to start from,
+    /// the default one picked once they've loaded. Without them, the host
+    /// picks its default branch.
+    fn worktree_fields(
+        &self,
+        base: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> WorktreeFields {
+        let branch = cx.new(|cx| InputState::new(window, cx).placeholder("none, to detach"));
+        let from = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx)
+                .searchable(true)
+        });
+        let events =
+            cx.subscribe_in(
+                &branch,
+                window,
+                |this, _, event: &InputEvent, _, cx| match event {
+                    InputEvent::PressEnter { .. } => this.submit(cx),
+                    InputEvent::Change => {
+                        if let Some(prompt) = &mut this.prompt {
+                            prompt.error = None;
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            );
+        let cfg = self.cfg.clone();
+        let load = self.in_background(
+            cx,
+            move || actions::branches(&cfg, base),
+            |this, branches, window, cx| {
+                let fields = this.prompt.as_ref().and_then(|p| p.worktree.as_ref());
+                if let (Ok(branches), Some(fields)) = (branches, fields) {
+                    fields.from.update(cx, |from, cx| {
+                        from.set_items(SearchableVec::new(branches), window, cx);
+                        from.set_selected_index(Some(IndexPath::default()), window, cx);
+                    });
+                }
+            },
+        );
+        WorktreeFields {
+            branch,
+            from,
+            _events: events,
+            _load: load,
+        }
     }
 
     /// The name field, in the spotlight: what it's for, the name, and a
@@ -108,6 +176,23 @@ impl Lemur {
                     .p_1()
                     .child(Input::new(&prompt.input).appearance(false)),
             )
+            .when_some(prompt.worktree.as_ref(), |card, fields| {
+                card.child(
+                    v_flex()
+                        .px_3()
+                        .pb_2()
+                        .gap_2()
+                        .child(field("Branch", Input::new(&fields.branch).small(), cx))
+                        .child(field(
+                            "From",
+                            Select::new(&fields.from)
+                                .small()
+                                .placeholder("the default branch")
+                                .search_placeholder("Search branches"),
+                            cx,
+                        )),
+                )
+            })
             .child(footer)
     }
 
@@ -122,7 +207,17 @@ impl Lemur {
         };
         let text = prompt.input.read(cx).value().to_string();
         let name = text.trim().to_string();
-        if let Err(e) = actions::validate_name(&name) {
+        let (branch, from) = match &prompt.worktree {
+            Some(fields) => {
+                let branch = fields.branch.read(cx).value().trim().to_string();
+                let from = fields.from.read(cx).selected_value().cloned();
+                ((!branch.is_empty()).then_some(branch), from)
+            }
+            None => (None, None),
+        };
+        let valid = actions::validate_name(&name)
+            .and_then(|()| branch.as_deref().map_or(Ok(()), actions::validate_branch));
+        if let Err(e) = valid {
             prompt.error = Some((format!("{e:#}"), text));
             cx.notify();
             return;
@@ -149,16 +244,21 @@ impl Lemur {
         self.in_background(
             cx,
             move || match what {
-                Ask::NewWorktree { base } => {
-                    actions::new_worktree_thread(&cfg, base, &name, &thread).map(Done::Started)
-                }
+                Ask::NewWorktree { base } => actions::new_worktree_thread(
+                    &cfg,
+                    base,
+                    &name,
+                    &thread,
+                    branch.as_deref(),
+                    from.as_deref(),
+                )
+                .map(|(started, note)| Done::Started(started, note)),
                 Ask::NewThread {
                     base,
                     worktree,
                     shell,
-                } => {
-                    actions::new_thread_in(&cfg, base, &worktree, &thread, shell).map(Done::Started)
-                }
+                } => actions::new_thread_in(&cfg, base, &worktree, &thread, shell)
+                    .map(|started| Done::Started(started, None)),
                 Ask::Rename { host, session } => {
                     actions::rename_session(&cfg, &host, &session, &name).map(|new| Done::Renamed {
                         host,
@@ -170,8 +270,8 @@ impl Lemur {
             |this, done, window, cx| {
                 this.renaming = None;
                 match done {
-                    Ok(Done::Started((host, session))) => {
-                        this.status = None;
+                    Ok(Done::Started((host, session), note)) => {
+                        this.status = note.map(|note| (note, false));
                         this.open(host, session, window, cx);
                     }
                     Ok(Done::Renamed { host, old, new }) => {
@@ -230,4 +330,20 @@ impl Lemur {
             sessions(&self.snap).any(|(h, s)| h == b.host && s.name == session)
         })
     }
+}
+
+/// A line of the new worktree's fields: what it is, then the field.
+fn field(label: &str, input: impl IntoElement, cx: &App) -> Div {
+    let selector = format!("field {label}");
+    h_flex()
+        .debug_selector(move || selector)
+        .gap_2()
+        .child(
+            div()
+                .w(px(56.0))
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(div().flex_1().child(input))
 }

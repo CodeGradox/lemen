@@ -125,6 +125,8 @@ enum Ask {
 struct Prompt {
     what: Ask,
     input: Entity<InputState>,
+    /// For a new worktree, its branch and what it starts from.
+    worktree: Option<prompt::WorktreeFields>,
     /// Why the name typed can't be used, and that name.
     error: Option<(String, String)>,
     _events: Subscription,
@@ -881,15 +883,15 @@ fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
 
 /// A worktree's name in the sidebar: its branch, which tells worktrees
 /// apart even when their folders share a name. `worktree-` is dropped from
-/// the branches lemur and `claude -w` make, leaving the name you gave. A
-/// detached worktree shows its commit.
+/// the branches lemur and `claude -w` made, leaving the name you gave. A
+/// detached worktree shows its folder's name, the one you gave lemur.
 fn worktree_label(w: &Worktree) -> String {
     match (&w.branch, &w.head) {
         (Some(branch), _) => branch
             .strip_prefix("worktree-")
             .unwrap_or(branch)
             .to_string(),
-        (None, Some(head)) => format!("{} (detached)", &head[..head.len().min(7)]),
+        (None, Some(_)) => format!("{} (detached)", leaf(&w.path)),
         (None, None) => leaf(&w.path).to_string(),
     }
 }
@@ -1156,7 +1158,7 @@ mod tests {
             "feature/cleaning-app-react"
         );
         assert_eq!(label(Some("worktree-auth"), None), "auth");
-        assert_eq!(label(None, Some("0123456789abcdef")), "0123456 (detached)");
+        assert_eq!(label(None, Some("0123456789abcdef")), "web (detached)");
         // A bare repository has neither.
         assert_eq!(label(None, None), "web");
     }
@@ -1279,7 +1281,9 @@ mod tests {
 
         let remove = |force: bool, cx: &mut VisualTestContext| {
             app.update(cx, |app, cx| {
-                let removal = app.removal(0, path.clone(), "draft".into());
+                let mut removal = app.removal(0, path.clone(), "draft".into());
+                // Only deleting its folder would lose the changes.
+                removal.delete = true;
                 app.remove_worktree(removal, force, cx)
             });
             cx.run_until_parked();
@@ -1298,6 +1302,158 @@ mod tests {
         app.read_with(cx, |app, _| {
             assert!(app.cfg.bases[0].worktree_colors.is_empty())
         });
+    }
+
+    /// The remove dialog takes a worktree out of git and keeps its folder,
+    /// unless its box is ticked; then the folder goes too.
+    #[gpui::test]
+    fn removing_a_worktree_deletes_its_folder_when_ticked(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("rm-tick");
+        let dir = TempDir::new("rm-tick");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", "-b", "kept", "wt/kept"]);
+        git(&["worktree", "add", "-q", "-b", "gone", "wt/gone"]);
+        let (kept, gone) = (repo.join("wt/kept"), repo.join("wt/gone"));
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let confirm = |worktree: &std::path::Path, cx: &mut VisualTestContext| {
+            let path = worktree.to_string_lossy().into_owned();
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    let removal = app.removal(0, path, "x".into());
+                    app.confirm_remove_worktree(removal, None, window, cx)
+                })
+            });
+            cx.run_until_parked();
+            assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        };
+        let listed = || {
+            let out = std::process::Command::new("git")
+                .args(["worktree", "list"])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        confirm(&kept, cx);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(wait_until(Duration::from_secs(5), || !listed().contains("wt/kept")));
+        assert!(kept.exists() && !kept.join(".git").exists());
+
+        confirm(&gone, cx);
+        let tick = cx.debug_bounds("delete-folder").expect("the box").center();
+        cx.simulate_click(tick, Modifiers::none());
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(wait_until(Duration::from_secs(5), || !gone.exists()));
+        assert!(!listed().contains("wt/gone"));
+    }
+
+    /// A new worktree's prompt offers the host's branches to start from,
+    /// the default one first; the worktree gets the branch typed, or with
+    /// none is detached. Picking another branch keeps the prompt open.
+    #[gpui::test]
+    fn a_new_worktree_gets_the_branch_and_start_asked_for(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("new-wt-ui");
+        let dir = TempDir::new("new-wt-ui");
+        let origin = dir.join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        git_in(&origin, &["init", "-q", "-b", "main"]);
+        git_in(&origin, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git_in(&dir, &["clone", "-q", "origin", "repo"]);
+        let repo = dir.join("repo");
+        git_in(&repo, &["branch", "side"]);
+        let mut cfg = server.config();
+        // Typed into the new sessions; nothing to start.
+        cfg.hosts[0].claude = "true".into();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let ask = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.ask_name(Ask::NewWorktree { base: 0 }, window, cx)
+                })
+            });
+            cx.run_until_parked();
+        };
+        let from = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, cx| {
+                let fields = app.prompt.as_ref()?.worktree.as_ref()?;
+                fields.from.read(cx).selected_value().cloned()
+            })
+        };
+        let branch_field = |cx: &mut VisualTestContext| {
+            let branch = app.read_with(cx, |app, _| {
+                app.prompt
+                    .as_ref()
+                    .unwrap()
+                    .worktree
+                    .as_ref()
+                    .unwrap()
+                    .branch
+                    .clone()
+            });
+            cx.update(|window, cx| branch.update(cx, |input, cx| input.focus(window, cx)));
+        };
+        let current = |name: &str| {
+            let out = std::process::Command::new("git")
+                .args(["branch", "--show-current"])
+                .current_dir(repo.join(".claude/worktrees").join(name))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        ask(cx);
+        assert_eq!(from(cx).as_deref(), Some("origin/main"));
+        cx.simulate_input("feat");
+        branch_field(cx);
+        cx.simulate_input("feature/x");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let made = repo.join(".claude/worktrees/feat");
+        assert!(wait_until(Duration::from_secs(5), || made.exists()));
+        assert_eq!(current("feat"), "feature/x");
+
+        // Another start, picked from the list, and no branch.
+        ask(cx);
+        cx.simulate_input("loose");
+        let picker = cx.debug_bounds("field From").expect("the start").center();
+        // Esc closes the list first, not the prompt.
+        cx.simulate_click(picker, Modifiers::none());
+        cx.simulate_keystrokes("escape");
+        app.read_with(cx, |app, _| {
+            assert!(app.prompt.is_some(), "Esc closed the prompt")
+        });
+        cx.simulate_click(picker, Modifiers::none());
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert!(app.prompt.is_some(), "still asking"));
+        let picked = from(cx);
+        assert!(
+            picked.as_deref().is_some_and(|b| b != "origin/main"),
+            "{picked:?}"
+        );
+        cx.update(|window, cx| {
+            let input = app.read(cx).prompt.as_ref().unwrap().input.clone();
+            input.update(cx, |input, cx| input.focus(window, cx))
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let made = repo.join(".claude/worktrees/loose");
+        assert!(wait_until(Duration::from_secs(5), || made.exists()));
+        assert_eq!(current("loose"), "", "detached");
     }
 
     /// Names are asked for in the spotlight: a bad one is explained there

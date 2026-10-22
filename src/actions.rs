@@ -1,5 +1,5 @@
 use crate::attach::Active;
-use crate::config::{CLAUDE_WORKTREES, Config, Host};
+use crate::config::{Config, Host};
 use crate::remote::{Remote, quote, sh_path, target};
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -76,33 +76,128 @@ pub fn label(name: &str) -> &str {
     }
 }
 
+/// Refuses branch names git wouldn't take, before the host is asked.
+pub fn validate_branch(name: &str) -> Result<()> {
+    let bad = name.is_empty()
+        || name == "@"
+        || name.starts_with(['-', '/', '.'])
+        || name.ends_with(['/', '.'])
+        || name.ends_with(".lock")
+        || ["..", "//", "/.", "@{"].iter().any(|s| name.contains(s))
+        || name
+            .chars()
+            .any(|c| c.is_ascii_control() || " ~^:?*[\\".contains(c));
+    if bad {
+        bail!("{name} can't be a branch name");
+    }
+    Ok(())
+}
+
+/// A shell function that prints the branch new worktrees start from by
+/// default: the remote's default branch (`origin/HEAD`, else `origin/main`
+/// or `origin/master`), else the branch checked out.
+const DEFAULT_BRANCH: &str = r#"default_branch() {
+    git symbolic-ref -q --short refs/remotes/origin/HEAD && return
+    for b in origin/main origin/master; do
+        if git rev-parse -q --verify "refs/remotes/$b" >/dev/null; then echo "$b"; return; fi
+    done
+    git symbolic-ref -q --short HEAD || echo HEAD
+}"#;
+
+/// The branches a new worktree of `base` can start from: the default one
+/// first, then the remotes' branches, then the local ones.
+pub fn branches(cfg: &Config, base: usize) -> Result<Vec<String>> {
+    let b = &cfg.bases[base];
+    let r = Remote::new(cfg.host_or_err(&b.host)?);
+    let out = r.run(&format!(
+        "set -e\ncd {}\n{DEFAULT_BRANCH}\ndefault_branch\ngit for-each-ref --format='%(refname)' refs/remotes refs/heads\n",
+        sh_path(&b.path)
+    ))?;
+    Ok(parse_branches(&out))
+}
+
+/// `branches` from the default branch's line, then one full ref name a line.
+fn parse_branches(out: &str) -> Vec<String> {
+    let mut lines = out.lines();
+    let default = lines.next().unwrap_or_default().trim();
+    let (mut remote, mut local) = (Vec::new(), Vec::new());
+    for name in lines {
+        if let Some(branch) = name.strip_prefix("refs/remotes/") {
+            // A remote's HEAD only points at its default branch.
+            if !branch.ends_with("/HEAD") {
+                remote.push(branch);
+            }
+        } else if let Some(branch) = name.strip_prefix("refs/heads/") {
+            local.push(branch);
+        }
+    }
+    std::iter::once(default)
+        .chain(remote.into_iter().chain(local).filter(|b| *b != default))
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Starts Claude in a new worktree `name` of `base`, in a session for
-/// thread `thread`. Returns (host, session).
+/// thread `thread`. The worktree checks out a new `branch`, or with none
+/// its start, detached. It starts from `from`, or the default branch; a
+/// remote's branch is fetched first. Returns (host, session), and a note
+/// if that fetch failed and the worktree starts where it was last fetched.
 pub fn new_worktree_thread(
     cfg: &Config,
     base: usize,
     name: &str,
     thread: &str,
-) -> Result<(String, String)> {
+    branch: Option<&str>,
+    from: Option<&str>,
+) -> Result<((String, String), Option<String>)> {
     validate_name(name)?;
+    if let Some(branch) = branch {
+        validate_branch(branch)?;
+    }
     let b = &cfg.bases[base];
-    start_session(cfg, base, thread, |host, tmux, session| {
-        let (repo, s) = (sh_path(&b.path), quote(session));
-        if b.uses_claude_worktrees() {
-            // Claude creates the worktree itself; the session starts in the repo.
-            format!(
-                "cd {repo}\ndir=\"$(pwd -P)/{CLAUDE_WORKTREES}/{name}\"\n{tmux} new-session -d -s {s} -c \"$(pwd -P)\"\n{}",
-                launch(tmux, session, &format!("{} -w {name}", host.claude)),
-            )
-        } else {
-            let wt = sh_path(&b.worktree_dir);
-            format!(
-                "cd {repo}\nmkdir -p {wt}\ngit worktree add -q -b {branch} {wt}/{name}\ndir=\"$(cd {wt}/{name} && pwd -P)\"\n{tmux} new-session -d -s {s} -c \"$dir\"\n{}",
-                launch(tmux, session, &host.claude),
-                branch = quote(&format!("worktree-{name}")),
-            )
-        }
-    })
+    let (from, fetched) = fetch_start(cfg, base, from)?;
+    let checkout = match branch {
+        Some(branch) => format!("--no-track -b {}", quote(branch)),
+        None => "--detach".to_string(),
+    };
+    let started = start_session(cfg, base, thread, |host, tmux, session| {
+        let (repo, wt, s) = (sh_path(&b.path), sh_path(&b.worktree_dir), quote(session));
+        format!(
+            "cd {repo}\nmkdir -p {wt}\ngit worktree add -q {checkout} {wt}/{name} {}\ndir=\"$(cd {wt}/{name} && pwd -P)\"\n{tmux} new-session -d -s {s} -c \"$dir\"\n{}",
+            quote(&from),
+            launch(tmux, session, &host.claude),
+        )
+    })?;
+    let note = (!fetched)
+        .then(|| format!("couldn't fetch {from}; the worktree starts where it was last fetched"));
+    Ok((started, note))
+}
+
+/// What a new worktree of `base` starts from: `from`, or the default
+/// branch. A remote's branch is fetched first; false if that failed.
+fn fetch_start(cfg: &Config, base: usize, from: Option<&str>) -> Result<(String, bool)> {
+    let b = &cfg.bases[base];
+    let r = Remote::new(cfg.host_or_err(&b.host)?);
+    let from = from.map_or_else(|| "\"$(default_branch)\"".to_string(), quote);
+    // No prompts: nobody could answer one.
+    let out = r.run(&format!(
+        r#"set -e
+cd {}
+{DEFAULT_BRANCH}
+from={from}
+fetched=yes
+remote=${{from%%/*}}
+if [ "$remote" != "$from" ] && git remote | grep -qxF "$remote"; then
+    GIT_TERMINAL_PROMPT=0 git fetch -q "$remote" "${{from#*/}}" </dev/null 2>/dev/null || fetched=no
+fi
+printf '%s\n%s\n' "$from" "$fetched"
+"#,
+        sh_path(&b.path)
+    ))?;
+    let mut lines = out.lines();
+    let from = lines.next().unwrap_or_default().to_string();
+    Ok((from, lines.next() == Some("yes")))
 }
 
 /// Starts Claude, or with `shell` just a shell, in an existing worktree, in
@@ -192,16 +287,20 @@ pub fn set_order(cfg: &Config, host: &str, sessions: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Removes a linked worktree of `base`, folder and all; its branch stays.
-/// Git keeps one that is locked or has uncommitted changes unless `force`,
-/// which unlocks it and throws the changes away. Once it's gone, the
-/// threads that ran in it, `sessions`, are closed.
+/// Takes a linked worktree of `base` out of git; its branch stays, and its
+/// folder stays as plain files unless `delete`. Git keeps a locked one, and
+/// when deleting, one with uncommitted changes, unless `force`, which
+/// unlocks it and throws the changes away. Once git has let go of it, the
+/// threads that ran in it, `sessions`, are closed. Then whatever is left of
+/// a deleted folder goes too: git can't delete read-only folders, and a
+/// thread may have written more.
 pub fn remove_worktree(
     cfg: &Config,
     base: usize,
     worktree: &str,
     sessions: &[String],
     force: bool,
+    delete: bool,
 ) -> Result<()> {
     let b = &cfg.bases[base];
     let r = Remote::new(cfg.host_or_err(&b.host)?);
@@ -210,18 +309,46 @@ pub fn remove_worktree(
         .iter()
         .map(|s| format!("{tmux} kill-session -t {} 2>/dev/null || true\n", target(s)))
         .collect();
-    let wt = quote(worktree);
+    let unlock = if force {
+        "git worktree unlock \"$wt\" 2>/dev/null || true\n"
+    } else {
+        ""
+    };
     // In English, as `why_kept` reads git's refusals.
-    let remove = if force {
+    let script = if delete {
+        let remove = if force { "remove --force" } else { "remove" };
         format!(
-            "LC_ALL=C git worktree unlock {wt} 2>/dev/null || true\nLC_ALL=C git worktree remove --force {wt}"
+            r#"{unlock}if ! out=$(LC_ALL=C git worktree {remove} "$wt" 2>&1); then
+    # Git refused, unless it let go and just couldn't delete all of the folder.
+    if git worktree list --porcelain | grep -qxF "worktree $wt"; then
+        printf '%s\n' "$out" >&2
+        exit 1
+    fi
+fi
+{close}if [ -e "$wt" ]; then
+    chmod -R u+w "$wt"
+    rm -rf "$wt"
+fi
+"#
         )
     } else {
-        format!("LC_ALL=C git worktree remove {wt}")
+        // Without its .git file, git prunes it and leaves the rest. A
+        // lock would keep it, so it's refused the way git refuses.
+        format!(
+            r#"{unlock}lock=$(git worktree list --porcelain | awk -v wt="$wt" '/^worktree / {{ here = (substr($0, 10) == wt) }} here && /^locked/ {{ print "x" substr($0, 8); exit }}')
+if [ -n "$lock" ]; then
+    echo "cannot remove a locked working tree, lock reason: ${{lock#x}}" >&2
+    exit 1
+fi
+rm -f "$wt/.git"
+git worktree prune
+{close}"#
+        )
     };
     r.run(&format!(
-        "set -e\ncd {}\n{remove}\n{close}",
-        sh_path(&b.path)
+        "set -e\ncd {}\nwt={}\n{script}",
+        sh_path(&b.path),
+        quote(worktree)
     ))?;
     Ok(())
 }
@@ -379,6 +506,8 @@ pub fn resolve_target(
 mod tests {
     use super::*;
     use crate::test_support::{TempDir, TmuxServer, git_in};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     /// Removing a worktree deletes it and then closes its threads; one with
     /// changes needs force, and nothing is closed until it's gone.
@@ -420,13 +549,21 @@ mod tests {
                 .any(|l| l == s)
         };
 
-        remove_worktree(&cfg, 0, &a.to_string_lossy(), &["repo/a1".into()], false).unwrap();
+        remove_worktree(
+            &cfg,
+            0,
+            &a.to_string_lossy(),
+            &["repo/a1".into()],
+            false,
+            true,
+        )
+        .unwrap();
         assert!(!a.exists());
         assert!(!alive("repo/a1"));
 
         std::fs::write(b.join("draft.txt"), "unsaved").unwrap();
         let b_path = b.to_string_lossy().into_owned();
-        let err = remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], false).unwrap_err();
+        let err = remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], false, true).unwrap_err();
         assert_eq!(why_kept(&err), Some(Kept::Changes), "{err:#}");
         assert!(b.exists() && alive("repo/b1"));
         // Locked, as Claude Code locks its worktree: force unlocks it too.
@@ -437,16 +574,183 @@ mod tests {
             "claude session draft (pid 1)",
             "wt/b",
         ]);
-        let err = remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], false).unwrap_err();
+        let err = remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], false, true).unwrap_err();
         assert_eq!(
             why_kept(&err),
             Some(Kept::Locked("claude session draft (pid 1)".into())),
             "{err:#}"
         );
         assert!(b.exists() && alive("repo/b1"));
-        remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], true).unwrap();
+        remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], true, true).unwrap();
         assert!(!b.exists());
         assert!(!alive("repo/b1"));
+    }
+
+    /// The worktrees git lists, by path.
+    fn listed(repo: &Path) -> Vec<String> {
+        let out = git_out(repo, &["worktree", "list", "--porcelain"]);
+        out.lines()
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// What a git command in `dir` prints; it must succeed.
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("running git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Kept, a removed worktree's folder stays with its files, changes
+    /// included, as plain files; a lock still needs force. Deleted, it goes
+    /// even when git can't delete all of it.
+    #[test]
+    fn removing_a_worktree_keeps_its_folder_unless_deleted() {
+        let server = TmuxServer::new("keep-wt");
+        let dir = TempDir::new("keep-wt");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
+        git(&["worktree", "add", "-q", "-b", "b", "wt/b"]);
+        let (a, b) = (repo.join("wt/a"), repo.join("wt/b"));
+        let (a_path, b_path) = (a.to_string_lossy(), b.to_string_lossy());
+        server.tmux(&["new-session", "-d", "-s", "repo/a1", "-c", &a_path]);
+        // Keeps the tmux server up once repo/a1 is closed.
+        server.tmux(&["new-session", "-d", "-s", "other"]);
+        let mut cfg = server.config();
+        cfg.bases
+            .push(crate::config::Base::new("local", &repo.to_string_lossy()));
+
+        std::fs::write(a.join("draft.txt"), "unsaved").unwrap();
+        git(&["worktree", "lock", "wt/a"]);
+        let err = remove_worktree(&cfg, 0, &a_path, &["repo/a1".into()], false, false).unwrap_err();
+        assert_eq!(why_kept(&err), Some(Kept::Locked(String::new())), "{err:#}");
+        assert!(listed(&repo).contains(&a_path.to_string()));
+        remove_worktree(&cfg, 0, &a_path, &["repo/a1".into()], true, false).unwrap();
+        assert!(!listed(&repo).contains(&a_path.to_string()));
+        assert_eq!(
+            std::fs::read_to_string(a.join("draft.txt")).unwrap(),
+            "unsaved"
+        );
+        assert!(!a.join(".git").exists());
+        assert_eq!(
+            server
+                .tmux(&["list-sessions", "-F", "#{session_name}"])
+                .trim(),
+            "other"
+        );
+        assert_eq!(git_out(&repo, &["branch", "--list", "a"]), "a");
+
+        // A read-only folder, as Go's module cache makes, stops git halfway.
+        let cache = b.join("cache/mod");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("go.mod"), "module x").unwrap();
+        let read_only = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&cache, read_only).unwrap();
+        remove_worktree(&cfg, 0, &b_path, &[], true, true).unwrap();
+        assert!(!b.exists());
+        assert!(!listed(&repo).contains(&b_path.to_string()));
+    }
+
+    /// A repo cloned from `origin`, which then gets a commit the clone
+    /// hasn't fetched. Both are on `main`; the config's one base is the clone.
+    fn cloned(tag: &str, server: &TmuxServer) -> (TempDir, Config) {
+        let dir = TempDir::new(tag);
+        let origin = dir.join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        git_in(&origin, &["init", "-q", "-b", "main"]);
+        git_in(&origin, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git_in(&dir, &["clone", "-q", "origin", "repo"]);
+        git_in(&origin, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let mut cfg = server.config();
+        // Typed into the new sessions; nothing to start.
+        cfg.hosts[0].claude = "true".into();
+        cfg.bases.push(crate::config::Base::new(
+            "local",
+            &dir.join("repo").to_string_lossy(),
+        ));
+        (dir, cfg)
+    }
+
+    #[test]
+    fn branches_start_with_the_default_one() {
+        let server = TmuxServer::new("branches");
+        let (dir, cfg) = cloned("branches", &server);
+        git_in(&dir.join("repo"), &["branch", "local-only"]);
+        assert_eq!(
+            branches(&cfg, 0).unwrap(),
+            ["origin/main", "local-only", "main"]
+        );
+        assert_eq!(
+            parse_branches("main\nrefs/heads/main\nrefs/heads/x\n"),
+            ["main", "x"]
+        );
+    }
+
+    /// A new worktree gets the branch it's given, untracked, or is
+    /// detached without one; it starts from the default branch as just
+    /// fetched, or what it was told. A fetch that fails leaves a note.
+    #[test]
+    fn a_new_worktree_starts_from_the_fetched_default_branch() {
+        let server = TmuxServer::new("new-wt");
+        let (dir, cfg) = cloned("new-wt", &server);
+        let repo = dir.join("repo");
+        let worktree = |name: &str| repo.join(".claude/worktrees").join(name);
+        let subject = |name: &str| git_out(&worktree(name), &["log", "-1", "--format=%s"]);
+
+        let ((_, session), note) =
+            new_worktree_thread(&cfg, 0, "feat", "feat--a", Some("feature/x"), None).unwrap();
+        assert_eq!(note, None);
+        assert!(session.ends_with("feat--a"), "{session}");
+        assert_eq!(
+            git_out(&worktree("feat"), &["branch", "--show-current"]),
+            "feature/x"
+        );
+        assert_eq!(subject("feat"), "two");
+        let upstream = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "feature/x@{upstream}"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(!upstream.status.success(), "feature/x tracks {upstream:?}");
+
+        new_worktree_thread(&cfg, 0, "loose", "loose--a", None, None).unwrap();
+        assert_eq!(
+            git_out(&worktree("loose"), &["branch", "--show-current"]),
+            ""
+        );
+        assert_eq!(subject("loose"), "two");
+
+        // The local main is still at what was cloned.
+        new_worktree_thread(&cfg, 0, "old", "old--a", None, Some("main")).unwrap();
+        assert_eq!(subject("old"), "one");
+
+        git_in(&repo, &["remote", "set-url", "origin", "/nonexistent/repo"]);
+        let (_, note) = new_worktree_thread(&cfg, 0, "offline", "offline--a", None, None).unwrap();
+        assert!(note.is_some_and(|n| n.contains("origin/main")));
+        assert_eq!(subject("offline"), "two");
+
+        assert!(new_worktree_thread(&cfg, 0, "bad", "bad--a", Some("a b"), None).is_err());
+    }
+
+    #[test]
+    fn branch_names_are_checked() {
+        for ok in ["feature/x", "fix-1", "a.b", "release/2.0"] {
+            assert!(validate_branch(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", "-x", "a b", "a..b", "a/", "/a", "a.lock", "a~1", "x:y", "@", "a@{b",
+        ] {
+            assert!(validate_branch(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

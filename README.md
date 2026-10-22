@@ -57,17 +57,17 @@ path = "~/projects/api"
 
 Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, and the sidebar writes a project's `collapsed`, `worktree_order` and `worktree_colors`; the rest of the file, comments included, stays as it is.
 
-With the default `worktree_dir`, new worktree threads run `claude -w <name>` and Claude creates the worktree. Any other `worktree_dir` (relative to the repo, absolute, or `~/...`) makes lemur run `git worktree add -b worktree-<name>` there first.
+New worktrees go in `worktree_dir` (relative to the repo, absolute, or `~/...`): lemur runs `git worktree add` there, then starts Claude in it.
 
 ## Use
 
-Run `lemur`. The sidebar lists each base's worktrees and their sessions; it refreshes every 3 s. A worktree shows as its branch (`worktree-` dropped from the branches lemur and `claude -w` make), or its commit when detached.
+Run `lemur`. The sidebar lists each base's worktrees and their sessions; it refreshes every 3 s. A worktree shows as its branch (`worktree-` dropped from the branches `claude -w` and older lemurs made), or its folder's name when detached.
 
 - **+** at the top of the sidebar adds a folder, as in Zed: pick a host (yours from the config, an alias from `~/.ssh/config`, or This Mac; or type `user@host`), then type the path while its folders are suggested (↑↓ to choose, Tab to go into one, Enter to add). A git repository shows each of its worktrees; a folder without git is a single row, with no **New worktree**. A folder inside a repository adds the repository. It's saved to the config as a `[[bases]]` entry, with a `[[hosts]]` entry for a new host.
 - Click a session to show it. Each opened session keeps its own terminal, so switching is instant. lemur reopens the last session on launch.
-- **New worktree** starts a thread in a new worktree; **+** on a worktree starts another session in it: **Claude**, or a plain **Shell**. A spotlight asks for a label (`claude` or `shell` to start with; a free random name for a new worktree): press Enter to take it, or type your own; Esc or a click outside cancels. Several sessions can share a label: lemur names the tmux session `<label>--<random words>`, like `claude--calm-heron`, and shows only the label. Claude sessions get Claude's spark as their icon, shells a terminal.
+- **New worktree** starts a thread in a new worktree; **+** on a worktree starts another session in it: **Claude**, or a plain **Shell**. A spotlight asks for a label (`claude` or `shell` to start with; a free random name for a new worktree): press Enter to take it, or type your own; Esc or a click outside cancels. For a new worktree it also asks for a **Branch** to create, empty for a detached worktree, and what to start **From**, picked from the host's branches; that starts at the default branch (`origin/HEAD`, like `origin/main`). A remote's branch is fetched first; if that fails, the worktree starts where it was last fetched, and the header says so. Several sessions can share a label: lemur names the tmux session `<label>--<random words>`, like `claude--calm-heron`, and shows only the label. Claude sessions get Claude's spark as their icon, shells a terminal.
 - **×** on a session, clicked twice, kills it. The worktree stays.
-- Right-click a worktree → **Remove worktree…** to delete it on the host (`git worktree remove`); its branch stays, and once it's gone its threads are closed. One that's locked (Claude Code locks the worktree its session runs in) or has uncommitted changes asks again before **Remove anyway**, which unlocks it and drops those changes. The main checkout and plain folders can't be removed this way.
+- Right-click a worktree → **Remove worktree…** to take it out of git; its branch stays, and once git has let go its threads are closed. Its folder stays on the host as plain files unless you tick **Also delete**, which deletes it, read-only parts included. One that's locked (Claude Code locks the worktree its session runs in) asks again before **Remove anyway**, which unlocks it; so does deleting one with uncommitted changes, which drops them. The main checkout and plain folders can't be removed this way.
 - Click a project's name to fold it away, or open it again.
 - Right-click a worktree → **Color** to give its folder icon one of ten colors.
 - Drag a worktree onto another in the same project to move it there.
@@ -85,7 +85,7 @@ Run `lemur`. The sidebar lists each base's worktrees and their sessions; it refr
 
 **Scrolling and selection** belong to tmux: `set -g mouse on` on the host lets you scroll with the wheel and select with the mouse. tmux sends copied text to the terminal (OSC 52), and lemur puts it on your Mac clipboard.
 
-CLI: `lemur ls`, `lemur new <base> <name> [--worktree <path> [--shell]]`, `lemur attach <host> <session>`, `lemur rename <host> <session> <name>`, `lemur upload <files>...`, `lemur paste` (clipboard image to the last session lemur showed).
+CLI: `lemur ls`, `lemur new <base> <name> [--branch <branch>] [--from <branch>]` (a new worktree; detached without `--branch`) or `lemur new <base> <name> --worktree <path> [--shell]`, `lemur attach <host> <session>`, `lemur rename <host> <session> <name>`, `lemur upload <files>...`, `lemur paste` (clipboard image to the last session lemur showed).
 
 ### Status dots
 

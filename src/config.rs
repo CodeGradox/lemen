@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-/// Where `claude -w` puts worktrees; bases using it let Claude create them.
+/// Where new worktrees go unless a base says otherwise; `claude -w` puts
+/// its own there too.
 pub const CLAUDE_WORKTREES: &str = ".claude/worktrees";
 
 /// The colors a worktree's folder icon can have, by the name the config
@@ -225,10 +226,6 @@ impl Base {
     /// The tmux session for thread `thread` of this base: `<base>/<thread>`.
     pub fn session_name(&self, thread: &str) -> String {
         format!("{}/{thread}", self.name())
-    }
-
-    pub fn uses_claude_worktrees(&self) -> bool {
-        self.worktree_dir.trim_end_matches('/') == CLAUDE_WORKTREES
     }
 }
 

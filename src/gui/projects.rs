@@ -8,8 +8,11 @@ use crate::actions;
 use crate::browse;
 use crate::config::{Base, Config, Host, home};
 use gpui_kit::component::button::ButtonVariant;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, WindowExt};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::{ActiveTheme, Icon, IconName, WindowExt, v_flex};
 use gpui_kit::*;
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// A worktree to remove, and the threads that close with it.
 #[derive(Clone)]
@@ -18,6 +21,8 @@ pub(super) struct Removal {
     worktree: String,
     label: String,
     sessions: Vec<String>,
+    /// Its folder goes too; otherwise its files stay, out of git.
+    pub(super) delete: bool,
 }
 
 impl Lemur {
@@ -212,12 +217,13 @@ impl Lemur {
             worktree,
             label,
             sessions,
+            delete: false,
         }
     }
 
-    /// Asks before removing a worktree: that deletes its folder on the host
-    /// and closes the threads in it. With `kept`, git refused, and this
-    /// asks whether to force it.
+    /// Asks before removing a worktree: git forgets it and the threads in
+    /// it close; deleting its folder on the host is up to you. With `kept`,
+    /// git refused, and this asks whether to force it.
     pub(super) fn confirm_remove_worktree(
         &mut self,
         removal: Removal,
@@ -230,8 +236,11 @@ impl Lemur {
             worktree,
             label,
             sessions,
+            delete,
         } = &removal;
         let force = kept.is_some();
+        // The first time asks whether to delete the folder too.
+        let mut ask_delete = None;
         let (title, description, ok) = match kept {
             None => {
                 let host = &self.cfg.bases[*base].host;
@@ -240,9 +249,10 @@ impl Lemur {
                     1 => " Its thread will be closed.".into(),
                     n => format!(" Its {n} threads will be closed."),
                 };
+                ask_delete = Some(format!("Also delete {worktree} on {host}"));
                 (
                     format!("Remove worktree {label}?"),
-                    format!("This deletes {worktree} on {host}. Its branch stays.{threads}"),
+                    format!("Git forgets it, and its branch stays.{threads}"),
                     "Remove",
                 )
             }
@@ -257,27 +267,49 @@ impl Lemur {
                 } else {
                     format!(" by {reason}")
                 };
+                let then = if *delete {
+                    format!("unlocks and deletes {worktree}, with any uncommitted changes in it")
+                } else {
+                    format!("unlocks it; its files stay in {worktree}")
+                };
                 (
                     format!("{label} is locked"),
-                    format!(
-                        "Git keeps it{why}. Removing it anyway unlocks and deletes {worktree}, with any uncommitted changes in it."
-                    ),
+                    format!("Git keeps it{why}. Removing it anyway {then}."),
                     "Remove anyway",
                 )
             }
         };
+        let delete = Rc::new(Cell::new(*delete));
         let this = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (this, removal) = (this.clone(), removal.clone());
+            let (this, removal, delete) = (this.clone(), removal.clone(), delete.clone());
+            let mut text = v_flex().gap_3().child(description.clone());
+            if let Some(label) = &ask_delete {
+                let delete = delete.clone();
+                text = text.child(
+                    div().debug_selector(|| "delete-folder".into()).child(
+                        Checkbox::new("delete-folder")
+                            .label(label.clone())
+                            .checked(delete.get())
+                            .on_click(move |checked, window, _| {
+                                delete.set(*checked);
+                                window.refresh();
+                            }),
+                    ),
+                );
+            }
             alert
                 .icon(Icon::new(IconName::TriangleAlert).text_color(cx.theme().warning))
                 .title(title.clone())
-                .description(description.clone())
+                .description(text)
                 .show_cancel(true)
                 .ok_text(ok)
                 .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
-                    let removal = removal.clone();
+                    let removal = Removal {
+                        delete: delete.get(),
+                        ..removal.clone()
+                    };
                     this.update(cx, |this, cx| this.remove_worktree(removal, force, cx))
                         .ok();
                     true
@@ -298,11 +330,12 @@ impl Lemur {
             base,
             worktree,
             sessions,
+            delete,
             ..
         } = removal.clone();
         self.in_background(
             cx,
-            move || actions::remove_worktree(&cfg, base, &worktree, &sessions, force),
+            move || actions::remove_worktree(&cfg, base, &worktree, &sessions, force, delete),
             move |this, removed, window, cx| {
                 this.status = None;
                 match removed {
