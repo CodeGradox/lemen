@@ -1,5 +1,6 @@
-//! Sidebar rows lemen draws itself, so threads can be dragged into a new
-//! order: gpui-component's SidebarMenuItem can't be dragged. They copy its
+//! Sidebar rows lemen draws itself, so threads and worktrees can be
+//! dragged into a new order and projects folded:
+//! gpui-component's SidebarMenuItem and SidebarGroup can't. They copy its
 //! look.
 
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -13,10 +14,11 @@ use gpui_kit::*;
 use std::rc::Rc;
 
 pub type OnClick = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
-pub type MenuBuilder = Rc<dyn Fn(PopupMenu, &mut Window, &mut App) -> PopupMenu>;
+pub type MenuBuilder = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
 pub type Suffix = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
-/// Moves the thread at the first index to the second.
+/// Moves the row at the first index to the second.
 pub type Reorder = Rc<dyn Fn(usize, usize, &mut Window, &mut App)>;
+pub type Toggle = Rc<dyn Fn(&mut Window, &mut App)>;
 
 #[derive(Clone)]
 pub struct Thread {
@@ -48,6 +50,8 @@ pub enum Entry {
         suffix: Suffix,
         /// Its right-click menu, if it has one.
         menu: Option<MenuBuilder>,
+        /// Its folder icon's color.
+        color: Option<Hsla>,
         threads: Threads,
     },
     /// Threads with no worktree row above them.
@@ -59,11 +63,19 @@ pub enum Entry {
 pub struct Menu {
     entries: Vec<Entry>,
     collapsed: bool,
+    /// Lets the worktrees be dragged into a new order: the list's key, and
+    /// what moves one.
+    worktree_order: Option<(SharedString, Reorder)>,
 }
 
 impl Menu {
     pub fn child(mut self, entry: Entry) -> Self {
         self.entries.push(entry);
+        self
+    }
+
+    pub fn reorder_worktrees(mut self, key: impl Into<SharedString>, reorder: Reorder) -> Self {
+        self.worktree_order = Some((key.into(), reorder));
         self
     }
 }
@@ -87,6 +99,8 @@ impl SidebarItem for Menu {
         cx: &mut App,
     ) -> impl IntoElement {
         let id: SharedString = id.into().to_string().into();
+        let order = self.worktree_order;
+        let mut worktrees = 0;
         v_flex()
             .gap_2()
             .children(self.entries.into_iter().enumerate().map(|(ix, entry)| {
@@ -97,8 +111,18 @@ impl SidebarItem for Menu {
                         label,
                         suffix,
                         menu,
+                        color,
                         threads,
-                    } => worktree(id, label, suffix, menu, threads, window, cx),
+                    } => {
+                        let look = WorktreeLook {
+                            color,
+                            drag: order
+                                .clone()
+                                .map(|(key, reorder)| (key, worktrees, reorder)),
+                        };
+                        worktrees += 1;
+                        worktree(id, label, suffix, menu, threads, look, window, cx)
+                    }
                     Entry::Threads(threads) => thread_list(threads, window, cx),
                 }
             }))
@@ -106,12 +130,14 @@ impl SidebarItem for Menu {
 }
 
 /// A project in the sidebar: its name over its rows, with a menu for it on
-/// hover (⋯) and on right-click. Stands in for gpui-component's
-/// SidebarGroup, which has neither.
+/// hover (⋯) and on right-click; clicking the name folds the rows away.
+/// Stands in for gpui-component's SidebarGroup, which does neither.
 #[derive(Clone)]
 pub struct Group {
     label: SharedString,
     menu: Option<MenuBuilder>,
+    folded: bool,
+    toggle: Option<Toggle>,
     rows: Menu,
 }
 
@@ -120,12 +146,21 @@ impl Group {
         Group {
             label: label.into(),
             menu: None,
+            folded: false,
+            toggle: None,
             rows,
         }
     }
 
     pub fn menu(mut self, menu: MenuBuilder) -> Self {
         self.menu = Some(menu);
+        self
+    }
+
+    /// Folds the rows away (`folded`); clicking the name calls `toggle`.
+    pub fn foldable(mut self, folded: bool, toggle: Toggle) -> Self {
+        self.folded = folded;
+        self.toggle = Some(toggle);
         self
     }
 }
@@ -151,8 +186,23 @@ impl SidebarItem for Group {
         let id: SharedString = id.into().to_string().into();
         let theme = cx.theme();
         let hover_group = SharedString::from(format!("{id}-header"));
+        let muted = theme.sidebar_foreground.opacity(0.7);
+        let label = self.label.clone();
+        let name = h_flex()
+            .gap_1p5()
+            .items_center()
+            .when(self.toggle.is_some(), |this| {
+                this.child(
+                    Icon::new(IconName::ChevronRight)
+                        .size_3()
+                        .text_color(muted)
+                        .when(!self.folded, |this| this.rotate(percentage(90. / 360.))),
+                )
+            })
+            .child(self.label);
         let header = h_flex()
             .id("header")
+            .debug_selector(move || format!("project {label}"))
             .group(hover_group.clone())
             .flex_shrink_0()
             .px_2()
@@ -160,16 +210,23 @@ impl SidebarItem for Group {
             .justify_between()
             .rounded(theme.radius)
             .text_xs()
-            .text_color(theme.sidebar_foreground.opacity(0.7))
-            .child(self.label);
+            .text_color(muted)
+            .child(name)
+            .when_some(self.toggle, |this, toggle| {
+                this.cursor_pointer()
+                    .on_click(move |_, window, cx| toggle(window, cx))
+            });
         let header = match self.menu {
             Some(menu) => {
                 let dropdown = menu.clone();
                 header
                     .child(
                         div()
+                            .id("menu")
                             .invisible()
                             .group_hover(hover_group, |style| style.visible())
+                            // Opening the menu doesn't fold the project.
+                            .on_click(|_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new("menu")
                                     .icon(IconName::Ellipsis)
@@ -186,11 +243,14 @@ impl SidebarItem for Group {
         v_flex()
             .id(id.clone())
             .child(header)
-            .child(self.rows.render(format!("{id}-rows"), window, cx))
+            .when(!self.folded, |this| {
+                this.child(self.rows.render(format!("{id}-rows"), window, cx))
+            })
     }
 }
 
-/// What a dragged thread carries; it also draws the label under the pointer.
+/// What a dragged thread or worktree carries; it also draws the label
+/// under the pointer.
 #[derive(Clone)]
 struct Dragged {
     list: SharedString,
@@ -255,23 +315,33 @@ fn row(
         )
 }
 
+/// How a worktree row shows: its folder's color, and, when it can be
+/// dragged, the list's key, its place and what moves it.
+struct WorktreeLook {
+    color: Option<Hsla>,
+    drag: Option<(SharedString, usize, Reorder)>,
+}
+
 /// A worktree row, open by default; its caret folds the threads away.
+#[allow(clippy::too_many_arguments)]
 fn worktree(
     id: SharedString,
     label: SharedString,
     suffix: Suffix,
     menu: Option<MenuBuilder>,
     threads: Threads,
+    look: WorktreeLook,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     let has_threads = !threads.rows.is_empty();
     let open = window.use_keyed_state(id.clone(), cx, |_, _| true);
     let is_open = has_threads && *open.read(cx);
+    let icon = Icon::new(IconName::Folder).when_some(look.color, |i, c| i.text_color(c));
     let header = row(
         "worktree",
-        Icon::new(IconName::Folder),
-        label,
+        icon,
+        label.clone(),
         false,
         suffix(window, cx),
         cx,
@@ -295,6 +365,11 @@ fn worktree(
                 }),
         )
     });
+    let header = match look.drag {
+        Some((key, index, reorder)) => draggable(header, key, index, label, reorder, cx)
+            .debug_selector(move || format!("worktree-{index}")),
+        None => header,
+    };
     let header = match menu {
         Some(menu) => header
             .context_menu(move |m, window, cx| menu(m, window, cx))
@@ -320,52 +395,63 @@ fn worktree(
         .into_any_element()
 }
 
+/// Makes a row draggable within the list `key`: dropped on another row of
+/// it, it takes that row's place.
+fn draggable(
+    row: Stateful<Div>,
+    key: SharedString,
+    index: usize,
+    label: SharedString,
+    reorder: Reorder,
+    cx: &App,
+) -> Stateful<Div> {
+    let line = cx.theme().drag_border;
+    let dragged = Dragged {
+        list: key.clone(),
+        index,
+        label,
+    };
+    row.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+        .can_drop(move |value, _, _| {
+            value
+                .downcast_ref::<Dragged>()
+                .is_some_and(|d| d.list == key)
+        })
+        // A line on the side the row will land.
+        .drag_over::<Dragged>(move |style, dragged, _, _| {
+            if dragged.index > index {
+                style.border_t_2().border_color(line)
+            } else if dragged.index < index {
+                style.border_b_2().border_color(line)
+            } else {
+                style
+            }
+        })
+        .on_drop(move |dragged: &Dragged, window, cx| {
+            if dragged.index != index {
+                reorder(dragged.index, index, window, cx);
+            }
+        })
+}
+
 fn thread_list(threads: Threads, window: &mut Window, cx: &mut App) -> AnyElement {
     let Threads { key, rows, reorder } = threads;
-    let line = cx.theme().drag_border;
     v_flex()
         .gap_1()
         .children(rows.into_iter().enumerate().map(|(ix, t)| {
-            let dragged = Dragged {
-                list: key.clone(),
-                index: ix,
-                label: t.label.clone(),
-            };
-            let list = key.clone();
-            let reorder = reorder.clone();
             let (on_click, menu) = (t.on_click, t.menu);
-            row(
+            let row = row(
                 SharedString::from(format!("thread-{ix}")),
                 t.icon,
-                t.label,
+                t.label.clone(),
                 t.active,
                 (t.suffix)(window, cx),
                 cx,
             )
             .debug_selector(move || format!("thread-{ix}"))
-            .on_click(move |event, window, cx| on_click(event, window, cx))
-            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            .can_drop(move |value, _, _| {
-                value
-                    .downcast_ref::<Dragged>()
-                    .is_some_and(|d| d.list == list)
-            })
-            // A line on the side the thread will land.
-            .drag_over::<Dragged>(move |style, dragged, _, _| {
-                if dragged.index > ix {
-                    style.border_t_2().border_color(line)
-                } else if dragged.index < ix {
-                    style.border_b_2().border_color(line)
-                } else {
-                    style
-                }
-            })
-            .on_drop(move |dragged: &Dragged, window, cx| {
-                if dragged.index != ix {
-                    reorder(dragged.index, ix, window, cx);
-                }
-            })
-            .context_menu(move |m, window, cx| menu(m, window, cx))
+            .on_click(move |event, window, cx| on_click(event, window, cx));
+            draggable(row, key.clone(), ix, t.label, reorder.clone(), cx)
+                .context_menu(move |m, window, cx| menu(m, window, cx))
         }))
         .into_any_element()
 }

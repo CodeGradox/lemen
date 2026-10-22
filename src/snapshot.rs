@@ -38,6 +38,9 @@ pub struct Worktree {
     pub branch: Option<String>,
     /// The commit checked out.
     pub head: Option<String>,
+    /// The repository's own checkout (git lists it first), or a plain
+    /// folder: the project itself rather than a linked worktree.
+    pub main: bool,
     pub sessions: Vec<Session>,
 }
 
@@ -194,6 +197,17 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
         }
     }
 
+    // Worktrees dragged into an order keep it; others follow in git's.
+    for b in &mut bases {
+        let order = &cfg.bases[b.index].worktree_order;
+        b.worktrees.sort_by_key(|w| {
+            order
+                .iter()
+                .position(|p| *p == w.path)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
     let claude = claude_activity(&agents, &panes, &parents);
     for s in &mut sessions {
         if let Some((activity, waiting_for)) = claude.get(&s.name) {
@@ -238,13 +252,16 @@ fn parse_worktree_line(base: &mut BaseView, line: &str) {
             path: p.to_string(),
             branch: None,
             head: None,
+            main: true,
             sessions: vec![],
         });
     } else if let Some(p) = line.strip_prefix("worktree ") {
+        let main = base.worktrees.is_empty();
         base.worktrees.push(Worktree {
             path: p.to_string(),
             branch: None,
             head: None,
+            main,
             sessions: vec![],
         });
     } else if let Some(h) = line.strip_prefix("HEAD ")
@@ -421,6 +438,23 @@ mod tests {
         assert!(wts[1].sessions[0].runs_claude());
         assert!(tests.runs_claude());
         assert!(!h.other[0].runs_claude());
+    }
+
+    #[test]
+    fn worktrees_keep_the_order_they_were_put_in() {
+        let mut cfg = cfg();
+        cfg.bases[0].worktree_order = vec!["/r/c".into(), "/r".into()];
+        let out = "@@base 0\nworktree /r\nworktree /r/a\nworktree /r/b\nworktree /r/c\n@@now\n1\n@@tmux\n";
+        let h = parse(&cfg, &cfg.hosts[0], out);
+        let paths: Vec<&str> = h.bases[0]
+            .worktrees
+            .iter()
+            .map(|w| w.path.as_str())
+            .collect();
+        assert_eq!(paths, ["/r/c", "/r", "/r/a", "/r/b"]);
+        // Moved or not, the main checkout is known.
+        let main: Vec<bool> = h.bases[0].worktrees.iter().map(|w| w.main).collect();
+        assert_eq!(main, [false, true, false, false]);
     }
 
     #[test]

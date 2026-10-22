@@ -16,7 +16,7 @@ mod terminal_view;
 use crate::actions;
 use crate::attach::Active;
 use crate::browse;
-use crate::config::{Base, Config, Host, ThemeChoice, home, leaf};
+use crate::config::{Base, COLORS, Config, Host, ThemeChoice, home, leaf};
 use crate::snapshot::{self, Activity, Session, Snapshot, Worktree};
 use folder_picker::{FolderPicker, HostChoice, PickerEvent};
 use gpui_kit::component::WindowExt;
@@ -846,7 +846,7 @@ impl Lemen {
                     this.update(cx, |this, cx| {
                         this.status = None;
                         match removed {
-                            Ok(()) => {}
+                            Ok(()) => this.forget_worktree(base, &worktree, cx),
                             // Git keeps a locked or changed worktree unless forced.
                             Err(e) => match (force, actions::why_kept(&e)) {
                                 (false, Some(kept)) => this.confirm_force_remove(
@@ -920,6 +920,141 @@ impl Lemen {
                     true
                 })
         });
+    }
+
+    /// A project's menu: removing it.
+    fn project_menu(&self, index: usize, cx: &mut Context<Self>) -> rows::MenuBuilder {
+        let this = cx.entity().downgrade();
+        let project = self.cfg.bases[index].clone();
+        Rc::new(move |menu, _, _| {
+            let (this, project) = (this.clone(), project.clone());
+            menu.item(
+                PopupMenuItem::new("Remove project…").on_click(move |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.confirm_remove_project(project.clone(), window, cx)
+                    })
+                    .ok();
+                }),
+            )
+        })
+    }
+
+    /// The colors a worktree's folder can take, as a submenu: each with its
+    /// swatch, the current one checked, and none.
+    fn color_menu(
+        &self,
+        index: usize,
+        worktree: &str,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let this = cx.entity().downgrade();
+        let current = self.cfg.bases[index].worktree_colors.get(worktree).cloned();
+        let worktree = worktree.to_string();
+        move |menu, _, _| {
+            let set = |color: Option<&'static str>| {
+                let (this, worktree) = (this.clone(), worktree.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    this.update(cx, |this, cx| {
+                        this.set_worktree_color(index, &worktree, color, cx)
+                    })
+                    .ok();
+                }
+            };
+            let menu = COLORS.iter().fold(menu, |menu, &(name, hex)| {
+                menu.item(
+                    PopupMenuItem::element(move |_, _| {
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().size_3().rounded_full().bg(rgb(hex)))
+                            .child(title_case(name))
+                    })
+                    .checked(current.as_deref() == Some(name))
+                    .on_click(set(Some(name))),
+                )
+            });
+            menu.separator().item(
+                PopupMenuItem::new("No color")
+                    .checked(current.is_none())
+                    .on_click(set(None)),
+            )
+        }
+    }
+
+    /// Folds a project away in the sidebar, or opens it again.
+    fn toggle_project(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(base) = self.cfg.bases.get_mut(index) else {
+            return;
+        };
+        base.collapsed = !base.collapsed;
+        self.save_look(index, cx);
+    }
+
+    /// Colors a worktree's folder icon, or with `None` takes its color off.
+    fn set_worktree_color(
+        &mut self,
+        index: usize,
+        worktree: &str,
+        color: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(base) = self.cfg.bases.get_mut(index) else {
+            return;
+        };
+        match color {
+            Some(color) => base
+                .worktree_colors
+                .insert(worktree.to_string(), color.to_string()),
+            None => base.worktree_colors.remove(worktree),
+        };
+        self.save_look(index, cx);
+    }
+
+    /// Forgets a removed worktree's color and place in the order.
+    fn forget_worktree(&mut self, index: usize, worktree: &str, cx: &mut Context<Self>) {
+        let Some(base) = self.cfg.bases.get_mut(index) else {
+            return;
+        };
+        let had_color = base.worktree_colors.remove(worktree).is_some();
+        let placed = base.worktree_order.len();
+        base.worktree_order.retain(|p| p != worktree);
+        if had_color || base.worktree_order.len() != placed {
+            self.save_look(index, cx);
+        }
+    }
+
+    /// Moves a worktree within its project: the sidebar shows the new order
+    /// at once, and the config keeps it.
+    fn reorder_worktrees(&mut self, index: usize, from: usize, to: usize, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .snap
+            .hosts
+            .iter_mut()
+            .flat_map(|h| h.bases.iter_mut())
+            .find(|b| b.index == index)
+        else {
+            return;
+        };
+        if from == to || from >= view.worktrees.len() || to >= view.worktrees.len() {
+            return;
+        }
+        let moved = view.worktrees.remove(from);
+        view.worktrees.insert(to, moved);
+        self.cfg.bases[index].worktree_order =
+            view.worktrees.iter().map(|w| w.path.clone()).collect();
+        // A refresh already under way sorts by the old order.
+        self.changes += 1;
+        self.save_look(index, cx);
+    }
+
+    /// Keeps a project's color, fold and worktree order in the config file.
+    fn save_look(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(file) = Prefs::get(cx).config_file()
+            && let Err(e) = Config::save_project_look(file, &self.cfg.bases[index])
+        {
+            self.status = Some((format!("{e:#}"), true));
+        }
+        cx.notify();
     }
 
     /// Asks before taking a project out of lemen; nothing on the host changes.
@@ -1028,7 +1163,15 @@ impl Lemen {
             for b in &h.bases {
                 let base = &self.cfg.bases[b.index];
                 let index = b.index;
-                let mut menu = rows::Menu::default();
+                let reorder: rows::Reorder = {
+                    let this = this.clone();
+                    Rc::new(move |from, to, _, cx| {
+                        this.update(cx, |this, cx| this.reorder_worktrees(index, from, to, cx))
+                            .ok();
+                    })
+                };
+                let mut menu = rows::Menu::default()
+                    .reorder_worktrees(format!("project {}\n{}", base.host, base.path), reorder);
                 // A folder without git has no worktrees to add.
                 if !b.plain {
                     menu = menu.child(rows::Entry::Item(Box::new(
@@ -1047,27 +1190,23 @@ impl Lemen {
                     )));
                 }
                 let prefix = format!("{}/", base.name());
-                for (position, w) in b.worktrees.iter().enumerate() {
+                for w in &b.worktrees {
                     // The main checkout and a plain folder are the project itself.
-                    let removable = !b.plain && position > 0;
+                    let removable = !w.main;
                     menu =
                         menu.child(self.worktree_item(&h.name, index, w, removable, &prefix, cx));
                 }
-                let project = base.clone();
-                let this = this.clone();
-                let remove: rows::MenuBuilder = Rc::new(move |menu, _, _| {
-                    let (this, project) = (this.clone(), project.clone());
-                    menu.item(PopupMenuItem::new("Remove project…").on_click(
-                        move |_, window, cx| {
-                            this.update(cx, |this, cx| {
-                                this.confirm_remove_project(project.clone(), window, cx)
-                            })
+                let toggle: rows::Toggle = {
+                    let this = this.clone();
+                    Rc::new(move |_, cx| {
+                        this.update(cx, |this, cx| this.toggle_project(index, cx))
                             .ok();
-                        },
-                    ))
-                });
+                    })
+                };
                 groups.push(
-                    rows::Group::new(format!("{} · {}", base.name(), h.name), menu).menu(remove),
+                    rows::Group::new(format!("{} · {}", base.name(), h.name), menu)
+                        .foldable(base.collapsed, toggle)
+                        .menu(self.project_menu(index, cx)),
                 );
             }
             if !h.other.is_empty() {
@@ -1127,27 +1266,38 @@ impl Lemen {
         cx: &mut Context<Self>,
     ) -> rows::Entry {
         let label = worktree_label(w);
-        let menu: Option<rows::MenuBuilder> = removable.then(|| {
+        // Color for every worktree; removing only for linked ones.
+        let menu: rows::MenuBuilder = {
             let this = cx.entity().downgrade();
+            let colors = Rc::new(self.color_menu(base, &w.path, cx));
             let (worktree, label) = (w.path.clone(), label.clone());
-            Rc::new(move |menu: PopupMenu, _: &mut Window, _: &mut App| {
-                let (this, worktree, label) = (this.clone(), worktree.clone(), label.clone());
-                menu.item(
-                    PopupMenuItem::new("Remove worktree…").on_click(move |_, window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.confirm_remove_worktree(
-                                base,
-                                worktree.clone(),
-                                label.clone(),
-                                window,
-                                cx,
-                            )
-                        })
-                        .ok();
-                    }),
-                )
-            }) as rows::MenuBuilder
-        });
+            Rc::new(
+                move |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+                    let colors = colors.clone();
+                    let menu = menu.submenu("Color", window, cx, move |m, w, cx| colors(m, w, cx));
+                    if !removable {
+                        return menu;
+                    }
+                    let (this, worktree, label) = (this.clone(), worktree.clone(), label.clone());
+                    menu.separator()
+                        .item(PopupMenuItem::new("Remove worktree…").on_click(
+                            move |_, window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.confirm_remove_worktree(
+                                        base,
+                                        worktree.clone(),
+                                        label.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                            },
+                        ))
+                },
+            )
+        };
+        let color = worktree_color(&self.cfg.bases[base], &w.path);
         let this = cx.entity().downgrade();
         let worktree = w.path.clone();
         let (host_name, notes_label) = (host.to_string(), label.clone());
@@ -1195,7 +1345,8 @@ impl Lemen {
         rows::Entry::Worktree {
             label: label.into(),
             suffix: Rc::new(move |window, cx| add(window, cx).into_any_element()),
-            menu,
+            menu: Some(menu),
+            color,
             threads: self.threads(host, Some(&w.path), &w.sessions, prefix, cx),
         }
     }
@@ -1274,7 +1425,7 @@ impl Lemen {
         let menu = {
             let this = this.clone();
             let key = key.clone();
-            move |menu: PopupMenu, _: &mut Window, _: &mut App| {
+            move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
                 let key = key.clone();
                 menu.item(
                     PopupMenuItem::new("Rename…").on_click(ask_on_click(&this, move || {
@@ -1518,6 +1669,22 @@ fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
     })
 }
 
+/// A worktree's folder color, from its name in the config.
+fn worktree_color(base: &Base, worktree: &str) -> Option<Hsla> {
+    let name = base.worktree_colors.get(worktree)?;
+    let (_, hex) = COLORS.iter().find(|(n, _)| n == name)?;
+    Some(rgb(*hex).into())
+}
+
+/// `blue` as `Blue`, for menus.
+fn title_case(name: &str) -> String {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 /// A worktree's name in the sidebar: its branch, which tells worktrees
 /// apart even when their folders share a name. `worktree-` is dropped from
 /// the branches lemen and `claude -w` make, leaving the name you gave. A
@@ -1739,6 +1906,7 @@ mod tests {
             path: path.into(),
             branch: Some(branch.into()),
             head: None,
+            main: false,
             sessions: snapshot(
                 &sessions
                     .iter()
@@ -1805,6 +1973,7 @@ mod tests {
             path: "/srv/web/.worktrees/equal-burrow/web".into(),
             branch: branch.map(str::to_string),
             head: head.map(str::to_string),
+            main: false,
             sessions: vec![],
         };
         let label = |b, h| super::worktree_label(&worktree(b, h));
@@ -1945,8 +2114,15 @@ mod tests {
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
         cx.update(|window, cx| window.close_dialog(cx));
 
+        // Its folder color goes with it.
+        app.update(cx, |app, cx| {
+            app.set_worktree_color(0, &path, Some("red"), cx)
+        });
         remove(true, cx);
         assert!(!wt.exists());
+        app.read_with(cx, |app, _| {
+            assert!(app.cfg.bases[0].worktree_colors.is_empty())
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1986,6 +2162,108 @@ mod tests {
 
         cx.simulate_keystrokes("escape");
         app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
+    }
+
+    /// Clicking a project's name folds it away and back; a worktree's
+    /// folder takes a color and gives it up.
+    #[gpui::test]
+    fn projects_fold_and_worktrees_take_a_color(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("fold");
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", "/srv/api"));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let folded =
+            |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.cfg.bases[0].collapsed);
+
+        let header = cx
+            .debug_bounds("project api · local")
+            .expect("header")
+            .center();
+        cx.simulate_click(header, Modifiers::none());
+        assert!(folded(cx));
+        cx.run_until_parked();
+        cx.simulate_click(header, Modifiers::none());
+        assert!(!folded(cx));
+
+        app.update(cx, |app, cx| {
+            app.set_worktree_color(0, "/srv/api", Some("teal"), cx)
+        });
+        app.read_with(cx, |app, _| {
+            assert!(super::worktree_color(&app.cfg.bases[0], "/srv/api").is_some());
+            assert!(super::worktree_color(&app.cfg.bases[0], "/srv/api/wt").is_none());
+        });
+        app.update(cx, |app, cx| {
+            app.set_worktree_color(0, "/srv/api", None, cx)
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.cfg.bases[0].worktree_colors.is_empty())
+        });
+    }
+
+    /// Dropping a worktree on another moves it there, and the next refresh
+    /// keeps that order; the main checkout stays known wherever it is.
+    #[gpui::test]
+    fn dragging_a_worktree_reorders_its_project(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("drag-wt");
+        let dir = std::env::temp_dir().join(format!("lemen-drag-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("api")).unwrap();
+        let repo = dir.canonicalize().unwrap().join("api");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
+        git(&["worktree", "add", "-q", "-b", "b", "wt/b"]);
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let shown = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                app.snap.hosts[0].bases[0]
+                    .worktrees
+                    .iter()
+                    .map(|w| (super::worktree_label(w), w.main))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let names = |cx: &mut VisualTestContext| -> Vec<String> {
+            shown(cx).into_iter().map(|(name, _)| name).collect()
+        };
+        assert_eq!(names(cx), ["main", "a", "b"]);
+
+        let from = cx.debug_bounds("worktree-0").expect("main's row").center();
+        let to = cx.debug_bounds("worktree-2").expect("b's row").center();
+        let none = Modifiers::none();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from + point(px(0.0), px(6.0)), MouseButton::Left, none);
+        cx.simulate_mouse_move(to, MouseButton::Left, none);
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        assert_eq!(names(cx), ["a", "b", "main"]);
+
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        assert_eq!(
+            shown(cx),
+            [
+                ("a".to_string(), false),
+                ("b".to_string(), false),
+                ("main".to_string(), true)
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[gpui::test]

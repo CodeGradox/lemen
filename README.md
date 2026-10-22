@@ -38,9 +38,12 @@ host = "agent"
 path = "~/projects/api"
 # name = "api"                    # defaults to the last path component
 # worktree_dir = ".claude/worktrees"
+# collapsed = true                # folded in the sidebar
+# worktree_order = [...]          # worktree paths, in the order they were dragged into
+# worktree_colors = { "/path/to/worktree" = "blue" }  # red orange yellow green teal cyan blue purple pink gray
 ```
 
-Settings (`⌘,`) writes `theme` and `[terminal]` for you and leaves the rest of the file, comments included, as it is.
+Settings (`⌘,`) writes `theme` and `[terminal]` for you, and the sidebar writes a project's `collapsed`, `worktree_order` and `worktree_colors`; the rest of the file, comments included, stays as it is.
 
 With the default `worktree_dir`, new worktree threads run `claude -w <name>` and Claude creates the worktree. Any other `worktree_dir` (relative to the repo, absolute, or `~/...`) makes lemen run `git worktree add -b worktree-<name>` there first.
 
@@ -53,6 +56,9 @@ Run `lemen`. The sidebar lists each base's worktrees and their sessions; it refr
 - **New worktree** starts a thread in a new worktree; **+** on a worktree starts another session in it: **Claude**, or a plain **Shell**. A spotlight asks for a label (`claude` or `shell` to start with; a free random name for a new worktree): press Enter to take it, or type your own; Esc or a click outside cancels. Several sessions can share a label: lemen names the tmux session `<label>--<random words>`, like `claude--calm-heron`, and shows only the label. Claude sessions get Claude's spark as their icon, shells a terminal.
 - **×** on a session, clicked twice, kills it. The worktree stays.
 - Right-click a worktree → **Remove worktree…** to delete it on the host (`git worktree remove`); its branch stays, and once it's gone its threads are closed. One that's locked (Claude Code locks the worktree its session runs in) or has uncommitted changes asks again before **Remove anyway**, which unlocks it and drops those changes. The main checkout and plain folders can't be removed this way.
+- Click a project's name to fold it away, or open it again.
+- Right-click a worktree → **Color** to give its folder icon one of ten colors.
+- Drag a worktree onto another in the same project to move it there.
 - A project's **⋯** (on hover) or right-click → **Remove project…** takes it out of lemen and the config. Nothing on the host changes, and its running threads move to *other*.
 - Double-click a session, or right-click → **Rename…**, to change its label. Only the thread's tmux name changes (its random words stay); Claude keeps running and its worktree and branch keep their names.
 - Drag a thread onto another in the same worktree to move it to that place. The order is stored on the tmux sessions (`@lemen_order`), so it survives restarts and is the same from any Mac; new threads start at the bottom.

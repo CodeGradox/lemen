@@ -1,11 +1,27 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 /// Where `claude -w` puts worktrees; bases using it let Claude create them.
 pub const CLAUDE_WORKTREES: &str = ".claude/worktrees";
+
+/// The colors a worktree's folder icon can have, by the name the config
+/// uses, as RGB. Mid shades, so they read on light and dark alike.
+pub const COLORS: [(&str, u32); 10] = [
+    ("red", 0xef4444),
+    ("orange", 0xf97316),
+    ("yellow", 0xeab308),
+    ("green", 0x22c55e),
+    ("teal", 0x14b8a6),
+    ("cyan", 0x06b6d4),
+    ("blue", 0x3b82f6),
+    ("purple", 0xa855f7),
+    ("pink", 0xec4899),
+    ("gray", 0x6b7280),
+];
 
 /// Terminal font sizes lemen accepts, in points.
 pub const FONT_SIZES: RangeInclusive<f64> = 6.0..=72.0;
@@ -88,6 +104,16 @@ pub struct Base {
     /// Where new worktrees go: relative to the repo, absolute, or `~/...`.
     #[serde(default = "default_worktree_dir")]
     pub worktree_dir: String,
+    /// Folded away in the sidebar.
+    #[serde(default)]
+    pub collapsed: bool,
+    /// Its worktrees' paths in the order they were dragged into; others
+    /// follow in git's order.
+    #[serde(default)]
+    pub worktree_order: Vec<String>,
+    /// Folder icon colors, one of `COLORS` by worktree path.
+    #[serde(default)]
+    pub worktree_colors: BTreeMap<String, String>,
 }
 
 fn default_upload_dir() -> String {
@@ -123,6 +149,9 @@ impl Base {
             path: path.into(),
             name: None,
             worktree_dir: default_worktree_dir(),
+            collapsed: false,
+            worktree_order: vec![],
+            worktree_colors: BTreeMap::new(),
         }
     }
 
@@ -155,6 +184,16 @@ impl Config {
         for b in &cfg.bases {
             if cfg.host(&b.host).is_none() {
                 bail!("base {} refers to unknown host {}", b.path, b.host);
+            }
+            for color in b.worktree_colors.values() {
+                if !COLORS.iter().any(|(name, _)| name == color) {
+                    let names: Vec<&str> = COLORS.iter().map(|(name, _)| *name).collect();
+                    bail!(
+                        "base {} has worktree color {color}; the colors are {}",
+                        b.path,
+                        names.join(", ")
+                    );
+                }
             }
         }
         if !FONT_SIZES.contains(&cfg.terminal.font_size) {
@@ -199,6 +238,47 @@ impl Config {
                 push_table(doc, "hosts", &[("name", &h.name), ("ssh", &h.ssh)])?;
             }
             push_table(doc, "bases", &[("host", &base.host), ("path", &base.path)])
+        })
+    }
+
+    /// Saves how a project shows in the sidebar (whether it's folded, its
+    /// worktrees' order and colors) to its entry in the config file at
+    /// `path`. Defaults are left out of the file.
+    pub fn save_project_look(path: &Path, base: &Base) -> Result<()> {
+        edit(path, |doc| {
+            let Some(table) = doc
+                .get_mut("bases")
+                .and_then(|b| b.as_array_of_tables_mut())
+                .and_then(|bases| {
+                    bases.iter_mut().find(|t| {
+                        t.get("host").and_then(|v| v.as_str()) == Some(&base.host)
+                            && t.get("path").and_then(|v| v.as_str()) == Some(&base.path)
+                    })
+                })
+            else {
+                return Ok(());
+            };
+            if base.collapsed {
+                table.insert("collapsed", toml_edit::value(true));
+            } else {
+                table.remove("collapsed");
+            }
+            if base.worktree_order.is_empty() {
+                table.remove("worktree_order");
+            } else {
+                let order: toml_edit::Array = base.worktree_order.iter().collect();
+                table.insert("worktree_order", toml_edit::value(order));
+            }
+            if base.worktree_colors.is_empty() {
+                table.remove("worktree_colors");
+            } else {
+                let mut colors = toml_edit::InlineTable::new();
+                for (path, color) in &base.worktree_colors {
+                    colors.insert(path, color.as_str().into());
+                }
+                table.insert("worktree_colors", toml_edit::value(colors));
+            }
+            Ok(())
         })
     }
 
@@ -396,6 +476,28 @@ path = \"~/projects/api\"
         let bases: Vec<&str> = cfg.bases.iter().map(|b| b.path.as_str()).collect();
         assert_eq!(bases, ["~/projects/api", "/srv/site"]);
         assert_eq!(cfg.hosts.len(), 2);
+
+        // A project's look goes in its entry, and its defaults come out.
+        let mut site = cfg.bases[1].clone();
+        site.collapsed = true;
+        site.worktree_colors
+            .insert("/srv/site/.worktrees/b".into(), "blue".into());
+        site.worktree_order = vec!["/srv/site/.worktrees/b".into(), "/srv/site".into()];
+        Config::save_project_look(&path, &site).unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.bases[1].worktree_colors, site.worktree_colors);
+        assert!(cfg.bases[1].collapsed);
+        assert_eq!(cfg.bases[1].worktree_order, site.worktree_order);
+        assert!(cfg.bases[0].worktree_colors.is_empty() && !cfg.bases[0].collapsed);
+        site.worktree_colors.clear();
+        site.collapsed = false;
+        site.worktree_order.clear();
+        Config::save_project_look(&path, &site).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("color") && !saved.contains("collapsed") && !saved.contains("order"),
+            "{saved}"
+        );
 
         // A file with no hosts or bases yet gets its first ones.
         std::fs::write(&path, "# empty\n").unwrap();
