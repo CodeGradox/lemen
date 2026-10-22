@@ -2,6 +2,7 @@
 //! (lemen's own, an SSH alias, or this Mac), then type or pick a path while
 //! the folders on that host are suggested.
 
+use super::spotlight;
 use crate::browse::{self, Folder};
 use crate::config::Host;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -326,11 +327,10 @@ fn folder_path(text: &str) -> String {
 impl Render for FolderPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, accent, accent_text, danger) = (
+        let (muted, accent, accent_text) = (
             theme.muted_foreground,
             theme.accent,
             theme.accent_foreground,
-            theme.danger,
         );
         let rows = self.rows(cx);
         let selected = self.selected.min(rows.len().saturating_sub(1));
@@ -381,33 +381,14 @@ impl Render for FolderPicker {
                     this.child(div().text_xs().text_color(muted).child(detail))
                 })
         });
-        v_flex()
+        spotlight::card(cx)
             .key_context(CONTEXT)
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::complete))
             .on_action(cx.listener(Self::dismiss))
-            .w(px(560.0))
-            .max_h(px(460.0))
-            .rounded_lg()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .text_color(theme.popover_foreground)
-            .shadow_lg()
-            .overflow_hidden()
             .when_some(host_line, |this, (icon, host)| {
-                this.child(
-                    h_flex()
-                        .px_3()
-                        .py_2()
-                        .gap_2()
-                        .text_sm()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(Icon::new(icon).small().text_color(muted))
-                        .child(host),
-                )
+                this.child(spotlight::title(icon, host, cx))
             })
             .child(
                 div()
@@ -426,17 +407,7 @@ impl Render for FolderPicker {
                     .children(items),
             )
             .when_some(self.error.clone().or(note), |this, line| {
-                let color = if self.error.is_some() { danger } else { muted };
-                this.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_xs()
-                        .text_color(color)
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .child(line),
-                )
+                this.child(spotlight::footer(line, self.error.is_some(), cx))
             })
     }
 }

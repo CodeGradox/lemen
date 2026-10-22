@@ -9,6 +9,7 @@ mod notes;
 mod notification;
 mod rows;
 mod settings;
+mod spotlight;
 mod terminal;
 mod terminal_view;
 
@@ -78,9 +79,12 @@ enum Done {
     },
 }
 
+/// A name being asked for, in the spotlight.
 struct Prompt {
     what: Ask,
     input: Entity<InputState>,
+    /// Why the name typed can't be used, and that name.
+    error: Option<(String, String)>,
     _events: Subscription,
 }
 
@@ -441,10 +445,75 @@ impl Lemen {
 
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
+        self.focus_terminal(window, cx);
+    }
+
+    fn close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt = None;
+        self.focus_terminal(window, cx);
+    }
+
+    /// Gives the keyboard back to the session on show, after a spotlight.
+    fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.active.as_ref().and_then(|k| self.terminals.get(k)) {
             view.read(cx).focus_handle(cx).focus(window, cx);
         }
         cx.notify();
+    }
+
+    /// The name field, in the spotlight: what it's for, the name, and a
+    /// hint or why the name can't be used.
+    fn prompt_card(&self, prompt: &Prompt, cx: &App) -> Div {
+        let (icon, what, verb) = match &prompt.what {
+            Ask::NewWorktree { base } => (
+                IconName::Folder,
+                format!("New worktree in {}", self.cfg.bases[*base].name()),
+                "start",
+            ),
+            Ask::NewThread {
+                worktree, shell, ..
+            } => (
+                if *shell {
+                    IconName::SquareTerminal
+                } else {
+                    IconName::Plus
+                },
+                format!(
+                    "New {} in {}",
+                    if *shell { "shell" } else { "Claude thread" },
+                    self.worktree_name(worktree)
+                ),
+                "start",
+            ),
+            Ask::Rename { session, .. } => (
+                IconName::CaseSensitive,
+                format!("Rename {}", actions::label(leaf(session))),
+                "rename",
+            ),
+        };
+        let footer = match &prompt.error {
+            Some((error, _)) => spotlight::footer(error.clone(), true, cx),
+            None => spotlight::footer(format!("⏎ {verb} · esc cancel"), false, cx),
+        };
+        spotlight::card(cx)
+            .child(spotlight::title(icon, what, cx))
+            .child(
+                div()
+                    .p_1()
+                    .child(Input::new(&prompt.input).appearance(false)),
+            )
+            .child(footer)
+    }
+
+    /// A worktree's name as the sidebar shows it.
+    fn worktree_name(&self, path: &str) -> String {
+        self.snap
+            .hosts
+            .iter()
+            .flat_map(|h| h.bases.iter().flat_map(|b| b.worktrees.iter()))
+            .find(|w| w.path == path)
+            .map(worktree_label)
+            .unwrap_or_else(|| leaf(path).to_string())
     }
 
     /// Adds a repository to the sidebar, and to the config file so it stays.
@@ -499,11 +568,25 @@ impl Lemen {
                 .placeholder("name")
                 .default_value(name)
         });
-        let events = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                this.submit(cx);
-            }
-        });
+        let events =
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, _, event: &InputEvent, _, cx| match event {
+                    InputEvent::PressEnter { .. } => this.submit(cx),
+                    // Enter also reports a change; only new text answers the error.
+                    InputEvent::Change => {
+                        if let Some(prompt) = &mut this.prompt {
+                            let text = prompt.input.read(cx).value();
+                            if prompt.error.as_ref().is_some_and(|(_, name)| *name != text) {
+                                prompt.error = None;
+                            }
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            );
         input.update(cx, |i, cx| {
             i.focus(window, cx);
             i.select_all(window, cx);
@@ -511,6 +594,7 @@ impl Lemen {
         self.prompt = Some(Prompt {
             what,
             input,
+            error: None,
             _events: events,
         });
         cx.notify();
@@ -537,10 +621,13 @@ impl Lemen {
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
-        let Some(prompt) = &self.prompt else { return };
-        let name = prompt.input.read(cx).value().trim().to_string();
+        let Some(prompt) = &mut self.prompt else {
+            return;
+        };
+        let text = prompt.input.read(cx).value().to_string();
+        let name = text.trim().to_string();
         if let Err(e) = actions::validate_name(&name) {
-            self.status = Some((format!("{e:#}"), true));
+            prompt.error = Some((format!("{e:#}"), text));
             cx.notify();
             return;
         }
@@ -1275,30 +1362,7 @@ impl Lemen {
                     .text_color(cx.theme().muted_foreground)
                     .child(title),
             );
-        if let Some(prompt) = &self.prompt {
-            let what = match &prompt.what {
-                Ask::NewWorktree { base } => {
-                    format!("New worktree in {}", self.cfg.bases[*base].name())
-                }
-                Ask::NewThread {
-                    worktree, shell, ..
-                } => {
-                    let what = if *shell { "shell" } else { "Claude thread" };
-                    format!("New {what} in {}", leaf(worktree))
-                }
-                Ask::Rename { session, .. } => format!("Rename {}", actions::label(session)),
-            };
-            bar = bar
-                .child(div().flex_1())
-                .child(div().text_sm().child(what))
-                .child(div().w_64().child(Input::new(&prompt.input).small()))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("⏎ start · esc cancel"),
-                );
-        } else if let Some((message, error)) = &self.status {
+        if let Some((message, error)) = &self.status {
             let color = if *error {
                 cx.theme().danger
             } else {
@@ -1352,24 +1416,20 @@ impl Render for Lemen {
                     "Loading sessions…"
                 }),
         };
+        let this = cx.entity().downgrade();
         let picker = self.picker.as_ref().map(|(picker, _)| {
-            div()
-                .absolute()
-                .inset_0()
-                .occlude()
-                .flex()
-                .justify_center()
-                .pt(px(72.0))
-                .bg(gpui_kit::black().opacity(0.2))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.close_picker(window, cx)),
-                )
-                .child(
-                    div()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(picker.clone()),
-                )
+            let this = this.clone();
+            spotlight::overlay(picker.clone(), move |window, cx| {
+                this.update(cx, |this, cx| this.close_picker(window, cx))
+                    .ok();
+            })
+        });
+        let prompt = self.prompt.as_ref().map(|prompt| {
+            let this = this.clone();
+            spotlight::overlay(self.prompt_card(prompt, cx), move |window, cx| {
+                this.update(cx, |this, cx| this.close_prompt(window, cx))
+                    .ok();
+            })
         });
         h_flex()
             .relative()
@@ -1377,10 +1437,10 @@ impl Render for Lemen {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
-            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
-                if e.keystroke.key == "escape" && this.prompt.take().is_some() {
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" && this.prompt.is_some() {
+                    this.close_prompt(window, cx);
                     cx.stop_propagation();
-                    cx.notify();
                 }
             }))
             .child(self.sidebar(cx))
@@ -1409,6 +1469,7 @@ impl Render for Lemen {
                     ),
             )
             .children(picker)
+            .children(prompt)
     }
 }
 
@@ -1525,7 +1586,7 @@ fn age(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{HostChoice, Key, Lemen, NotificationEvent};
+    use super::{Ask, HostChoice, Key, Lemen, NotificationEvent};
     use crate::config::{Base, Config};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
     use crate::test_support::{TmuxServer, wait_until};
@@ -1887,6 +1948,44 @@ mod tests {
         remove(true, cx);
         assert!(!wt.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Names are asked for in the spotlight: a bad one is explained there
+    /// rather than in the header, and Esc closes it.
+    #[gpui::test]
+    fn names_are_asked_for_in_the_spotlight(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
+        let rename = Ask::Rename {
+            host: "local".into(),
+            session: "api/claude--calm-heron".into(),
+        };
+        cx.update(|window, cx| app.update(cx, |app, cx| app.ask_name(rename, window, cx)));
+        cx.run_until_parked();
+        app.read_with(cx, |app, cx| {
+            let prompt = app.prompt.as_ref().expect("asking");
+            assert_eq!(prompt.input.read(cx).value(), "claude");
+        });
+
+        // The label starts selected, so typing replaces it.
+        cx.simulate_input("not ok!");
+        cx.simulate_keystrokes("enter");
+        app.read_with(cx, |app, cx| {
+            let prompt = app.prompt.as_ref().expect("still asking");
+            assert_eq!(prompt.input.read(cx).value(), "not ok!");
+            let error = prompt.error.as_ref().map(|(e, _)| e.as_str());
+            assert!(error.is_some_and(|e| e.contains("letters")), "{error:?}");
+            assert!(app.status.is_none(), "the header stays quiet");
+        });
+        cx.simulate_input("x");
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.prompt.as_ref().unwrap().error.is_none(),
+                "typing clears it"
+            )
+        });
+
+        cx.simulate_keystrokes("escape");
+        app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
     }
 
     #[gpui::test]
