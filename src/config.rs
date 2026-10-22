@@ -202,6 +202,26 @@ impl Config {
         })
     }
 
+    /// Takes a folder (a base) out of the config file at `path`; its host
+    /// stays.
+    pub fn remove_folder(path: &Path, base: &Base) -> Result<()> {
+        edit(path, |doc| {
+            if let Some(bases) = doc
+                .get_mut("bases")
+                .and_then(|b| b.as_array_of_tables_mut())
+            {
+                let field = |t: &toml_edit::Table, k: &str| {
+                    t.get(k).and_then(|v| v.as_str()).map(str::to_string)
+                };
+                bases.retain(|t| {
+                    field(t, "host").as_deref() != Some(&base.host)
+                        || field(t, "path").as_deref() != Some(&base.path)
+                });
+            }
+            Ok(())
+        })
+    }
+
     pub fn host(&self, name: &str) -> Option<&Host> {
         self.hosts.iter().find(|h| h.name == name)
     }
@@ -367,6 +387,15 @@ path = \"~/projects/api\"
             ]
         );
         assert_eq!(cfg.bases[2].worktree_dir, CLAUDE_WORKTREES);
+
+        // Removing one takes out only its entry.
+        Config::remove_folder(&path, &Base::new("agent", "~/projects/web")).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep me"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        let bases: Vec<&str> = cfg.bases.iter().map(|b| b.path.as_str()).collect();
+        assert_eq!(bases, ["~/projects/api", "/srv/site"]);
+        assert_eq!(cfg.hosts.len(), 2);
 
         // A file with no hosts or bases yet gets its first ones.
         std::fs::write(&path, "# empty\n").unwrap();

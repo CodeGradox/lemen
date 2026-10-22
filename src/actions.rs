@@ -191,6 +191,62 @@ pub fn set_order(cfg: &Config, host: &str, sessions: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Removes a linked worktree of `base`, folder and all; its branch stays.
+/// Git keeps one that is locked or has uncommitted changes unless `force`,
+/// which unlocks it and throws the changes away. Once it's gone, the
+/// threads that ran in it, `sessions`, are closed.
+pub fn remove_worktree(
+    cfg: &Config,
+    base: usize,
+    worktree: &str,
+    sessions: &[String],
+    force: bool,
+) -> Result<()> {
+    let b = &cfg.bases[base];
+    let r = Remote::new(cfg.host_or_err(&b.host)?);
+    let tmux = r.tmux();
+    let close: String = sessions
+        .iter()
+        .map(|s| format!("{tmux} kill-session -t {} 2>/dev/null || true\n", target(s)))
+        .collect();
+    let wt = quote(worktree);
+    let remove = if force {
+        format!("git worktree unlock {wt} 2>/dev/null || true\ngit worktree remove --force {wt}")
+    } else {
+        format!("git worktree remove {wt}")
+    };
+    r.run(&format!(
+        "set -e\ncd {}\n{remove}\n{close}",
+        sh_path(&b.path)
+    ))?;
+    Ok(())
+}
+
+/// Why git kept a worktree that removing with `force` removes anyway.
+#[derive(Debug, PartialEq)]
+pub enum Kept {
+    Changes,
+    /// Locked, with git's reason; Claude Code locks the worktree its
+    /// session runs in.
+    Locked(String),
+}
+
+/// What kept a worktree from being removed, if `force` would help.
+pub fn why_kept(e: &anyhow::Error) -> Option<Kept> {
+    let text = format!("{e:#}");
+    if text.contains("locked working tree") {
+        let reason = text
+            .split_once("lock reason: ")
+            .and_then(|(_, rest)| rest.lines().next())
+            .unwrap_or_default();
+        Some(Kept::Locked(reason.trim().to_string()))
+    } else if text.contains("use --force") {
+        Some(Kept::Changes)
+    } else {
+        None
+    }
+}
+
 pub fn kill_session(cfg: &Config, host: &str, session: &str) -> Result<()> {
     let r = Remote::new(cfg.host_or_err(host)?);
     r.run(&format!("{} kill-session -t {}", r.tmux(), target(session)))?;
@@ -311,6 +367,112 @@ pub fn resolve_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Removing a worktree deletes it and then closes its threads; one with
+    /// changes needs force, and nothing is closed until it's gone.
+    #[test]
+    fn removing_a_worktree_closes_its_threads() {
+        let server = crate::test_support::TmuxServer::new("rm-wt");
+        let dir = std::env::temp_dir().join(format!("lemen-rm-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = dir.canonicalize().unwrap().join("repo");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        std::fs::create_dir(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
+        git(&["worktree", "add", "-q", "-b", "b", "wt/b"]);
+        let (a, b) = (repo.join("wt/a"), repo.join("wt/b"));
+        server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "repo/a1",
+            "-c",
+            &a.to_string_lossy(),
+        ]);
+        server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "repo/b1",
+            "-c",
+            &b.to_string_lossy(),
+        ]);
+        let mut cfg = server.config();
+        cfg.bases
+            .push(crate::config::Base::new("local", &repo.to_string_lossy()));
+        let alive = |s: &str| {
+            server
+                .tmux(&["list-sessions", "-F", "#{session_name}"])
+                .lines()
+                .any(|l| l == s)
+        };
+
+        remove_worktree(&cfg, 0, &a.to_string_lossy(), &["repo/a1".into()], false).unwrap();
+        assert!(!a.exists());
+        assert!(!alive("repo/a1"));
+
+        std::fs::write(b.join("draft.txt"), "unsaved").unwrap();
+        let b_path = b.to_string_lossy().into_owned();
+        let err = remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], false).unwrap_err();
+        assert_eq!(why_kept(&err), Some(Kept::Changes), "{err:#}");
+        assert!(b.exists() && alive("repo/b1"));
+        // Locked, as Claude Code locks its worktree: force unlocks it too.
+        git(&[
+            "worktree",
+            "lock",
+            "--reason",
+            "claude session draft (pid 1)",
+            "wt/b",
+        ]);
+        let err = remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], false).unwrap_err();
+        assert_eq!(
+            why_kept(&err),
+            Some(Kept::Locked("claude session draft (pid 1)".into())),
+            "{err:#}"
+        );
+        assert!(b.exists() && alive("repo/b1"));
+        remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], true).unwrap();
+        assert!(!b.exists());
+        assert!(!alive("repo/b1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn why_a_worktree_was_kept() {
+        let kept = |text: &str| why_kept(&anyhow::anyhow!("{text}"));
+        assert_eq!(
+            kept(
+                "agent: fatal: cannot remove a locked working tree, lock reason: claude session testing-stuff (pid 1460666 start 8911022)\nuse 'remove -f -f' to override or unlock first"
+            ),
+            Some(Kept::Locked(
+                "claude session testing-stuff (pid 1460666 start 8911022)".into()
+            ))
+        );
+        assert_eq!(
+            kept(
+                "agent: fatal: cannot remove a locked working tree;\nuse 'remove -f -f' to override or unlock first"
+            ),
+            Some(Kept::Locked(String::new()))
+        );
+        assert_eq!(
+            kept(
+                "agent: fatal: '/w' contains modified or untracked files, use --force to delete it"
+            ),
+            Some(Kept::Changes)
+        );
+        assert_eq!(kept("agent: fatal: '/w' is not a working tree"), None);
+    }
 
     #[test]
     fn names_are_restricted() {

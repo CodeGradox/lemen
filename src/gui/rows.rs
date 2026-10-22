@@ -3,7 +3,7 @@
 //! look.
 
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::menu::{ContextMenuExt, PopupMenu};
+use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu};
 use gpui_kit::component::sidebar::{SidebarItem, SidebarMenuItem};
 use gpui_kit::component::{
     ActiveTheme, Collapsible, Icon, IconName, Sizable, StyledExt, h_flex, v_flex,
@@ -46,6 +46,8 @@ pub enum Entry {
     Worktree {
         label: SharedString,
         suffix: Suffix,
+        /// Its right-click menu, if it has one.
+        menu: Option<MenuBuilder>,
         threads: Threads,
     },
     /// Threads with no worktree row above them.
@@ -94,11 +96,97 @@ impl SidebarItem for Menu {
                     Entry::Worktree {
                         label,
                         suffix,
+                        menu,
                         threads,
-                    } => worktree(id, label, suffix, threads, window, cx),
+                    } => worktree(id, label, suffix, menu, threads, window, cx),
                     Entry::Threads(threads) => thread_list(threads, window, cx),
                 }
             }))
+    }
+}
+
+/// A project in the sidebar: its name over its rows, with a menu for it on
+/// hover (⋯) and on right-click. Stands in for gpui-component's
+/// SidebarGroup, which has neither.
+#[derive(Clone)]
+pub struct Group {
+    label: SharedString,
+    menu: Option<MenuBuilder>,
+    rows: Menu,
+}
+
+impl Group {
+    pub fn new(label: impl Into<SharedString>, rows: Menu) -> Self {
+        Group {
+            label: label.into(),
+            menu: None,
+            rows,
+        }
+    }
+
+    pub fn menu(mut self, menu: MenuBuilder) -> Self {
+        self.menu = Some(menu);
+        self
+    }
+}
+
+impl Collapsible for Group {
+    fn is_collapsed(&self) -> bool {
+        self.rows.is_collapsed()
+    }
+
+    fn collapsed(mut self, collapsed: bool) -> Self {
+        self.rows = self.rows.collapsed(collapsed);
+        self
+    }
+}
+
+impl SidebarItem for Group {
+    fn render(
+        self,
+        id: impl Into<ElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let id: SharedString = id.into().to_string().into();
+        let theme = cx.theme();
+        let hover_group = SharedString::from(format!("{id}-header"));
+        let header = h_flex()
+            .id("header")
+            .group(hover_group.clone())
+            .flex_shrink_0()
+            .px_2()
+            .h_8()
+            .justify_between()
+            .rounded(theme.radius)
+            .text_xs()
+            .text_color(theme.sidebar_foreground.opacity(0.7))
+            .child(self.label);
+        let header = match self.menu {
+            Some(menu) => {
+                let dropdown = menu.clone();
+                header
+                    .child(
+                        div()
+                            .invisible()
+                            .group_hover(hover_group, |style| style.visible())
+                            .child(
+                                Button::new("menu")
+                                    .icon(IconName::Ellipsis)
+                                    .ghost()
+                                    .xsmall()
+                                    .dropdown_menu(move |m, window, cx| dropdown(m, window, cx)),
+                            ),
+                    )
+                    .context_menu(move |m, window, cx| menu(m, window, cx))
+                    .into_any_element()
+            }
+            None => header.into_any_element(),
+        };
+        v_flex()
+            .id(id.clone())
+            .child(header)
+            .child(self.rows.render(format!("{id}-rows"), window, cx))
     }
 }
 
@@ -172,6 +260,7 @@ fn worktree(
     id: SharedString,
     label: SharedString,
     suffix: Suffix,
+    menu: Option<MenuBuilder>,
     threads: Threads,
     window: &mut Window,
     cx: &mut App,
@@ -206,6 +295,12 @@ fn worktree(
                 }),
         )
     });
+    let header = match menu {
+        Some(menu) => header
+            .context_menu(move |m, window, cx| menu(m, window, cx))
+            .into_any_element(),
+        None => header.into_any_element(),
+    };
     let border = cx.theme().sidebar_border;
     div()
         .id(id)

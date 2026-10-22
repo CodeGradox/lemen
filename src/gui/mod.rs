@@ -18,12 +18,11 @@ use crate::browse;
 use crate::config::{Base, Config, Host, ThemeChoice, home, leaf};
 use crate::snapshot::{self, Activity, Session, Snapshot, Worktree};
 use folder_picker::{FolderPicker, HostChoice, PickerEvent};
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::WindowExt;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
-use gpui_kit::component::sidebar::{
-    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenuItem,
-};
+use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -107,9 +106,9 @@ struct Lemen {
     window: AnyWindowHandle,
     /// Notification popups that are showing, one per session.
     popups: HashMap<Key, (WindowHandle<Notification>, Subscription)>,
-    /// Counts changes to the thread order; a snapshot fetched across one
-    /// has the old order and is dropped.
-    order_changes: u64,
+    /// Counts changes a snapshot fetched across one would undo (the thread
+    /// order, a removed project); such a snapshot is dropped.
+    changes: u64,
     /// The notes of the last worktree opened, beside the terminal.
     notes: Entity<NotesPanel>,
     notes_open: bool,
@@ -229,7 +228,7 @@ impl Lemen {
             restore,
             window: window.window_handle(),
             popups: HashMap::new(),
-            order_changes: 0,
+            changes: 0,
             notes,
             notes_open: false,
             picker: None,
@@ -242,7 +241,7 @@ impl Lemen {
     fn refresh(&self, cx: &mut Context<Self>) -> Task<()> {
         let cfg = self.cfg.clone();
         let window = self.window;
-        let order_changes = self.order_changes;
+        let changes = self.changes;
         cx.spawn(async move |this, cx| {
             let snap = cx
                 .background_spawn(async move { snapshot::fetch(&cfg) })
@@ -250,7 +249,7 @@ impl Lemen {
             window
                 .update(cx, |_, window, cx| {
                     this.update(cx, |this, cx| {
-                        if this.order_changes == order_changes {
+                        if this.changes == changes {
                             this.set_snapshot(snap, window, cx)
                         }
                     })
@@ -642,7 +641,7 @@ impl Lemen {
         let moved = sessions.remove(from);
         sessions.insert(to, moved);
         let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
-        self.order_changes += 1;
+        self.changes += 1;
         cx.notify();
         let cfg = self.cfg.clone();
         cx.spawn(async move |this, cx| {
@@ -652,7 +651,7 @@ impl Lemen {
                 .await;
             this.update(cx, |this, cx| {
                 // Refreshes that started before tmux had the order are stale too.
-                this.order_changes += 1;
+                this.changes += 1;
                 if let Err(e) = saved {
                     this.status = Some((format!("{e:#}"), true));
                 }
@@ -674,6 +673,229 @@ impl Lemen {
                 .find(|w| &w.path == path)
                 .map(|w| &mut w.sessions),
         }
+    }
+
+    /// Asks before removing a worktree: that deletes its folder on the host
+    /// and closes the threads in it.
+    fn confirm_remove_worktree(
+        &mut self,
+        base: usize,
+        worktree: String,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let host = self.cfg.bases[base].host.clone();
+        let sessions = self.sessions_in(&host, &worktree);
+        let threads = match sessions.len() {
+            0 => String::new(),
+            1 => " Its thread will be closed.".into(),
+            n => format!(" Its {n} threads will be closed."),
+        };
+        let description = format!("This deletes {worktree} on {host}. Its branch stays.{threads}");
+        let this = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let (this, worktree, label, sessions) = (
+                this.clone(),
+                worktree.clone(),
+                label.clone(),
+                sessions.clone(),
+            );
+            alert
+                .icon(Icon::new(IconName::TriangleAlert).text_color(cx.theme().warning))
+                .title(format!("Remove worktree {label}?"))
+                .description(description.clone())
+                .show_cancel(true)
+                .ok_text("Remove")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let (worktree, label, sessions) =
+                        (worktree.clone(), label.clone(), sessions.clone());
+                    this.update(cx, |this, cx| {
+                        this.remove_worktree(base, worktree, label, sessions, false, window, cx)
+                    })
+                    .ok();
+                    true
+                })
+        });
+    }
+
+    /// The sessions running in a worktree, by name.
+    fn sessions_in(&self, host: &str, worktree: &str) -> Vec<String> {
+        self.snap
+            .hosts
+            .iter()
+            .filter(|h| h.name == host)
+            .flat_map(|h| h.bases.iter().flat_map(|b| b.worktrees.iter()))
+            .filter(|w| w.path == worktree)
+            .flat_map(|w| w.sessions.iter().map(|s| s.name.clone()))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remove_worktree(
+        &mut self,
+        base: usize,
+        worktree: String,
+        label: String,
+        sessions: Vec<String>,
+        force: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cfg = self.cfg.clone();
+        self.status = Some((format!("removing {label}…"), false));
+        cx.notify();
+        let window_handle = self.window;
+        cx.spawn(async move |this, cx| {
+            let (w, s) = (worktree.clone(), sessions.clone());
+            let removed = cx
+                .background_spawn(
+                    async move { actions::remove_worktree(&cfg, base, &w, &s, force) },
+                )
+                .await;
+            window_handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.status = None;
+                        match removed {
+                            Ok(()) => {}
+                            // Git keeps a locked or changed worktree unless forced.
+                            Err(e) => match (force, actions::why_kept(&e)) {
+                                (false, Some(kept)) => this.confirm_force_remove(
+                                    base, worktree, label, sessions, kept, window, cx,
+                                ),
+                                _ => this.status = Some((format!("{e:#}"), true)),
+                            },
+                        }
+                        this.refresh(cx).detach();
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_force_remove(
+        &mut self,
+        base: usize,
+        worktree: String,
+        label: String,
+        sessions: Vec<String>,
+        kept: actions::Kept,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (title, description) = match kept {
+            actions::Kept::Changes => (
+                format!("{label} has uncommitted changes"),
+                format!("Removing it anyway deletes them for good, with {worktree}."),
+            ),
+            actions::Kept::Locked(reason) => {
+                let why = if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" by {reason}")
+                };
+                (
+                    format!("{label} is locked"),
+                    format!(
+                        "Git keeps it{why}. Removing it anyway unlocks and deletes {worktree}, with any uncommitted changes in it."
+                    ),
+                )
+            }
+        };
+        let this = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let (this, worktree, label, sessions) = (
+                this.clone(),
+                worktree.clone(),
+                label.clone(),
+                sessions.clone(),
+            );
+            alert
+                .icon(Icon::new(IconName::TriangleAlert).text_color(cx.theme().warning))
+                .title(title.clone())
+                .description(description.clone())
+                .show_cancel(true)
+                .ok_text("Remove anyway")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let (worktree, label, sessions) =
+                        (worktree.clone(), label.clone(), sessions.clone());
+                    this.update(cx, |this, cx| {
+                        this.remove_worktree(base, worktree, label, sessions, true, window, cx)
+                    })
+                    .ok();
+                    true
+                })
+        });
+    }
+
+    /// Asks before taking a project out of lemen; nothing on the host changes.
+    fn confirm_remove_project(
+        &mut self,
+        project: Base,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity().downgrade();
+        let description = format!(
+            "Only lemen forgets it. {} on {}, its worktrees and running threads stay as they are.",
+            project.path, project.host
+        );
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (this, project) = (this.clone(), project.clone());
+            alert
+                .title(format!("Remove {} from lemen?", project.name()))
+                .description(description.clone())
+                .show_cancel(true)
+                .ok_text("Remove")
+                .on_ok(move |_, _, cx| {
+                    this.update(cx, |this, cx| this.remove_project(&project, cx))
+                        .ok();
+                    true
+                })
+        });
+    }
+
+    /// Takes a project out of the sidebar and the config file.
+    fn remove_project(&mut self, project: &Base, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .cfg
+            .bases
+            .iter()
+            .position(|b| b.host == project.host && b.path == project.path)
+        else {
+            return;
+        };
+        if let Some(file) = Prefs::get(cx).config_file()
+            && let Err(e) = Config::remove_folder(file, project)
+        {
+            self.status = Some((format!("{e:#}"), true));
+            cx.notify();
+            return;
+        }
+        self.cfg.bases.remove(index);
+        // The snapshot points into the config's bases by index: drop the
+        // project's view, shift the later ones, and drop snapshots on their
+        // way that still use the old numbers.
+        for h in &mut self.snap.hosts {
+            h.bases.retain(|b| b.index != index);
+            for b in &mut h.bases {
+                if b.index > index {
+                    b.index -= 1;
+                }
+            }
+        }
+        self.changes += 1;
+        // A name field may be asking about it.
+        self.prompt = None;
+        self.refresh(cx).detach();
+        cx.notify();
     }
 
     /// First click arms, second click kills; the worktree stays.
@@ -703,18 +925,17 @@ impl Lemen {
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
-        let mut groups: Vec<SidebarGroup<rows::Menu>> = vec![];
+        let mut groups: Vec<rows::Group> = vec![];
         for h in &self.snap.hosts {
             if let Some(e) = &h.error {
-                groups.push(
-                    SidebarGroup::new(h.name.clone()).child(
-                        rows::Menu::default().child(rows::Entry::Item(Box::new(
-                            SidebarMenuItem::new(e.clone())
-                                .icon(IconName::TriangleAlert)
-                                .disable(true),
-                        ))),
-                    ),
-                );
+                groups.push(rows::Group::new(
+                    h.name.clone(),
+                    rows::Menu::default().child(rows::Entry::Item(Box::new(
+                        SidebarMenuItem::new(e.clone())
+                            .icon(IconName::TriangleAlert)
+                            .disable(true),
+                    ))),
+                ));
                 continue;
             }
             for b in &h.bases {
@@ -739,17 +960,35 @@ impl Lemen {
                     )));
                 }
                 let prefix = format!("{}/", base.name());
-                for w in &b.worktrees {
-                    menu = menu.child(self.worktree_item(&h.name, index, w, &prefix, cx));
+                for (position, w) in b.worktrees.iter().enumerate() {
+                    // The main checkout and a plain folder are the project itself.
+                    let removable = !b.plain && position > 0;
+                    menu =
+                        menu.child(self.worktree_item(&h.name, index, w, removable, &prefix, cx));
                 }
-                groups.push(SidebarGroup::new(format!("{} · {}", base.name(), h.name)).child(menu));
+                let project = base.clone();
+                let this = this.clone();
+                let remove: rows::MenuBuilder = Rc::new(move |menu, _, _| {
+                    let (this, project) = (this.clone(), project.clone());
+                    menu.item(PopupMenuItem::new("Remove project…").on_click(
+                        move |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.confirm_remove_project(project.clone(), window, cx)
+                            })
+                            .ok();
+                        },
+                    ))
+                });
+                groups.push(
+                    rows::Group::new(format!("{} · {}", base.name(), h.name), menu).menu(remove),
+                );
             }
             if !h.other.is_empty() {
                 let threads = self.threads(&h.name, None, &h.other, "", cx);
-                groups.push(
-                    SidebarGroup::new(format!("other · {}", h.name))
-                        .child(rows::Menu::default().child(rows::Entry::Threads(threads))),
-                );
+                groups.push(rows::Group::new(
+                    format!("other · {}", h.name),
+                    rows::Menu::default().child(rows::Entry::Threads(threads)),
+                ));
             }
         }
         let add = {
@@ -796,10 +1035,32 @@ impl Lemen {
         host: &str,
         base: usize,
         w: &Worktree,
+        removable: bool,
         prefix: &str,
         cx: &mut Context<Self>,
     ) -> rows::Entry {
         let label = worktree_label(w);
+        let menu: Option<rows::MenuBuilder> = removable.then(|| {
+            let this = cx.entity().downgrade();
+            let (worktree, label) = (w.path.clone(), label.clone());
+            Rc::new(move |menu: PopupMenu, _: &mut Window, _: &mut App| {
+                let (this, worktree, label) = (this.clone(), worktree.clone(), label.clone());
+                menu.item(
+                    PopupMenuItem::new("Remove worktree…").on_click(move |_, window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.confirm_remove_worktree(
+                                base,
+                                worktree.clone(),
+                                label.clone(),
+                                window,
+                                cx,
+                            )
+                        })
+                        .ok();
+                    }),
+                )
+            }) as rows::MenuBuilder
+        });
         let this = cx.entity().downgrade();
         let worktree = w.path.clone();
         let (host_name, notes_label) = (host.to_string(), label.clone());
@@ -847,6 +1108,7 @@ impl Lemen {
         rows::Entry::Worktree {
             label: label.into(),
             suffix: Rc::new(move |window, cx| add(window, cx).into_any_element()),
+            menu,
             threads: self.threads(host, Some(&w.path), &w.sessions, prefix, cx),
         }
     }
@@ -1264,10 +1526,11 @@ fn age(secs: u64) -> String {
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::{HostChoice, Key, Lemen, NotificationEvent};
-    use crate::config::Config;
+    use crate::config::{Base, Config};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
     use crate::test_support::{TmuxServer, wait_until};
     use gpui::VisualTestContext;
+    use gpui_kit::component::WindowExt;
     use gpui_kit::{AppContext, Entity, Modifiers, MouseButton, point, px, size};
     use std::time::Duration;
 
@@ -1528,6 +1791,102 @@ mod tests {
             let status = app.status.as_ref().map(|(s, _)| s.as_str());
             assert_eq!(status, Some("/srv/api is in the sidebar already"));
         });
+    }
+
+    /// Wraps the app in Root, as `gpui_kit::open_window` does; dialogs need it.
+    fn rooted(
+        cfg: Config,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Lemen>, &mut VisualTestContext) {
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let mut app = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| Lemen::new(cfg, None, window, cx));
+            app = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        (app.unwrap(), cx)
+    }
+
+    /// Removing a project asks first, then forgets it; the other projects'
+    /// views keep pointing at their own config entries, and a snapshot
+    /// fetched before the removal is dropped.
+    #[gpui::test]
+    fn removing_a_project_keeps_the_sidebar_consistent(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("rm-project");
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", "/srv/one"));
+        cfg.bases.push(Base::new("local", "/srv/two"));
+        let (app, cx) = rooted(cfg, cx);
+
+        let one = Base::new("local", "/srv/one");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.confirm_remove_project(one.clone(), window, cx)
+            })
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.update(|window, cx| window.close_dialog(cx));
+
+        // A refresh is on its way when the project goes.
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        app.update(cx, |app, cx| app.remove_project(&one, cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let paths: Vec<&str> = app.cfg.bases.iter().map(|b| b.path.as_str()).collect();
+            assert_eq!(paths, ["/srv/two"]);
+            let views = &app.snap.hosts[0].bases;
+            assert_eq!(views.len(), 1);
+            assert_eq!(views[0].index, 0);
+        });
+    }
+
+    /// A worktree with changes isn't removed without asking again.
+    #[gpui::test]
+    fn removing_a_changed_worktree_asks_again(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("rm-dirty");
+        let dir = std::env::temp_dir().join(format!("lemen-rm-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        let repo = dir.canonicalize().unwrap().join("repo");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", "-b", "draft", "wt"]);
+        let wt = repo.join("wt");
+        std::fs::write(wt.join("notes.txt"), "unsaved").unwrap();
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        let path = wt.to_string_lossy().into_owned();
+
+        let remove = |force: bool, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.remove_worktree(0, path.clone(), "draft".into(), vec![], force, window, cx)
+                })
+            });
+            cx.run_until_parked();
+        };
+        remove(false, cx);
+        assert!(wt.exists());
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.update(|window, cx| window.close_dialog(cx));
+
+        remove(true, cx);
+        assert!(!wt.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[gpui::test]
