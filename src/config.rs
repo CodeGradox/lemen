@@ -68,6 +68,9 @@ pub struct Terminal {
     pub font_family: String,
     /// In points.
     pub font_size: f64,
+    /// Colors over lemen's own for a dark app, then a light one.
+    pub dark: TerminalColors,
+    pub light: TerminalColors,
 }
 
 impl Default for Terminal {
@@ -75,8 +78,60 @@ impl Default for Terminal {
         Terminal {
             font_family: "Menlo".into(),
             font_size: 13.0,
+            dark: TerminalColors::default(),
+            light: TerminalColors::default(),
         }
     }
+}
+
+/// Terminal colors as WezTerm names them, each `#rrggbb`; what's left out
+/// is lemen's own.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TerminalColors {
+    pub foreground: Option<String>,
+    pub background: Option<String>,
+    pub cursor: Option<String>,
+    /// Black, red, green, yellow, blue, magenta, cyan, white.
+    pub ansi: Option<Vec<String>>,
+    /// The same eight, bright.
+    pub brights: Option<Vec<String>>,
+}
+
+impl TerminalColors {
+    pub fn is_empty(&self) -> bool {
+        *self == TerminalColors::default()
+    }
+
+    /// Why one of its colors can't be used, if one can't.
+    fn problem(&self) -> Option<String> {
+        let single = [&self.foreground, &self.background, &self.cursor];
+        let all = single
+            .into_iter()
+            .flatten()
+            .chain(self.ansi.iter().flatten())
+            .chain(self.brights.iter().flatten());
+        for hex in all {
+            if parse_hex(hex).is_none() {
+                return Some(format!("{hex} isn't a #rrggbb color"));
+            }
+        }
+        for (name, list) in [("ansi", &self.ansi), ("brights", &self.brights)] {
+            if list.as_ref().is_some_and(|l| l.len() != 8) {
+                return Some(format!("{name} needs 8 colors"));
+            }
+        }
+        None
+    }
+}
+
+/// `#rrggbb` as `0xrrggbb`.
+pub fn parse_hex(s: &str) -> Option<u32> {
+    let digits = s.strip_prefix('#')?;
+    if digits.len() != 6 {
+        return None;
+    }
+    u32::from_str_radix(digits, 16).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -196,6 +251,11 @@ impl Config {
                 }
             }
         }
+        for (name, colors) in [("dark", &cfg.terminal.dark), ("light", &cfg.terminal.light)] {
+            if let Some(problem) = colors.problem() {
+                bail!("[terminal.{name}]: {problem}");
+            }
+        }
         if !FONT_SIZES.contains(&cfg.terminal.font_size) {
             bail!(
                 "terminal font_size {} is outside {}-{}",
@@ -215,8 +275,8 @@ impl Config {
             let table = doc
                 .entry("terminal")
                 .or_insert_with(toml_edit::table)
-                .as_table_like_mut()
-                .context("terminal in the config is not a table")?;
+                .as_table_mut()
+                .context("terminal in the config is not a [terminal] table")?;
             table.insert("font_family", toml_edit::value(&terminal.font_family));
             // Whole sizes read best without the ".0".
             let size = terminal.font_size;
@@ -226,6 +286,30 @@ impl Config {
                 toml_edit::value(size)
             };
             table.insert("font_size", size);
+            for (name, colors) in [("dark", &terminal.dark), ("light", &terminal.light)] {
+                if colors.is_empty() {
+                    table.remove(name);
+                    continue;
+                }
+                let mut sub = toml_edit::Table::new();
+                let single = [
+                    ("foreground", &colors.foreground),
+                    ("background", &colors.background),
+                    ("cursor", &colors.cursor),
+                ];
+                for (key, hex) in single {
+                    if let Some(hex) = hex {
+                        sub.insert(key, toml_edit::value(hex));
+                    }
+                }
+                for (key, list) in [("ansi", &colors.ansi), ("brights", &colors.brights)] {
+                    if let Some(list) = list {
+                        let array: toml_edit::Array = list.iter().collect();
+                        sub.insert(key, toml_edit::value(array));
+                    }
+                }
+                table.insert(name, toml_edit::Item::Table(sub));
+            }
             Ok(())
         })
     }
@@ -386,6 +470,28 @@ mod tests {
     }
 
     #[test]
+    fn terminal_colors_are_checked() {
+        let colors = |toml: &str| toml::from_str::<Config>(toml).unwrap().terminal.dark;
+        assert_eq!(colors("").problem(), None);
+        let ok = colors(
+            "[terminal.dark]\nbackground = \"#282c34\"\nansi = [\"#000000\", \"#111111\", \"#222222\", \"#333333\", \"#444444\", \"#555555\", \"#666666\", \"#777777\"]",
+        );
+        assert_eq!(ok.problem(), None);
+        assert!(
+            colors("[terminal.dark]\nbackground = \"red\"")
+                .problem()
+                .is_some()
+        );
+        assert!(
+            colors("[terminal.dark]\nansi = [\"#000000\"]")
+                .problem()
+                .is_some()
+        );
+        assert_eq!(parse_hex("#dcdfe4"), Some(0xdcdfe4));
+        assert_eq!(parse_hex("dcdfe4"), None);
+    }
+
+    #[test]
     fn saving_settings_keeps_the_rest_of_the_file() {
         let path = std::env::temp_dir().join(format!("lemen-save-{}.toml", std::process::id()));
         let original = "\
@@ -402,6 +508,11 @@ path = \"~/projects/api\"
         let terminal = Terminal {
             font_family: "JetBrains Mono".into(),
             font_size: 14.0,
+            dark: TerminalColors {
+                background: Some("#000000".into()),
+                ..Default::default()
+            },
+            ..Default::default()
         };
         Config::save_settings(&path, ThemeChoice::Dark, &terminal).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
@@ -426,6 +537,8 @@ path = \"~/projects/api\"
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.theme, ThemeChoice::System);
         assert_eq!(cfg.terminal.font_size, 12.5);
+        assert_eq!(cfg.terminal.dark.background.as_deref(), Some("#000000"));
+        assert!(saved.contains("[terminal.dark]"), "{saved}");
         let _ = std::fs::remove_file(path);
     }
 

@@ -1,11 +1,15 @@
-//! Settings (lemen → Settings…, ⌘,): the theme and the terminal font.
-//! Changes apply at once in every window and are saved to the config file.
+//! Settings (lemen → Settings…, ⌘,): the theme, and the terminal's font
+//! and colors. Changes apply at once in every window and are saved to the
+//! config file.
 
+use super::terminal::{Palette, SLOTS, Slot, set_color};
 use crate::config::{Config, FONT_SIZES, Terminal, ThemeChoice};
+use alacritty_terminal::vte::ansi::Rgb;
+use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::setting::{
     NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
-use gpui_kit::component::{ActiveTheme, IconName, Theme, ThemeMode, v_flex};
+use gpui_kit::component::{ActiveTheme, IconName, Sizable, Theme, ThemeMode, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::path::PathBuf;
@@ -112,8 +116,18 @@ pub fn open(cx: &mut App) {
 struct SettingsView {
     /// Installed monospaced fonts, as dropdown options.
     fonts: Vec<(SharedString, SharedString)>,
+    /// A picker for each terminal color, dark then light.
+    pickers: Vec<Picker>,
     focus: FocusHandle,
     _prefs: Subscription,
+    _pickers: Vec<Subscription>,
+}
+
+struct Picker {
+    dark: bool,
+    slot: Slot,
+    label: &'static str,
+    state: Entity<ColorPickerState>,
 }
 
 impl SettingsView {
@@ -125,11 +139,81 @@ impl SettingsView {
             .into_iter()
             .map(|f| (f.clone(), f))
             .collect();
+        let terminal = Prefs::get(cx).terminal.clone();
+        let (mut pickers, mut subscriptions) = (vec![], vec![]);
+        for dark in [true, false] {
+            let palette = Palette::themed(dark, &terminal);
+            for (slot, label) in SLOTS {
+                let color = to_hsla(palette.get(slot));
+                let state = cx.new(|cx| ColorPickerState::new(window, cx).default_value(color));
+                subscriptions.push(cx.subscribe_in(
+                    &state,
+                    window,
+                    move |_, _, event: &ColorPickerEvent, _, cx| {
+                        let ColorPickerEvent::Change(color) = event;
+                        let color = color.map(to_rgb);
+                        Prefs::update(cx, |p| set_color(&mut p.terminal, dark, slot, color));
+                    },
+                ));
+                pickers.push(Picker {
+                    dark,
+                    slot,
+                    label,
+                    state,
+                });
+            }
+        }
         SettingsView {
             fonts,
+            pickers,
             focus,
-            _prefs: cx.observe_global::<Prefs>(|_, cx| cx.notify()),
+            _prefs: cx.observe_global_in::<Prefs>(window, |this, window, cx| {
+                this.sync_pickers(window, cx);
+                cx.notify();
+            }),
+            _pickers: subscriptions,
         }
+    }
+
+    /// Shows each terminal color as Settings have it, after a reset or a
+    /// change elsewhere.
+    fn sync_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let terminal = Prefs::get(cx).terminal.clone();
+        for p in &self.pickers {
+            let color = to_hsla(Palette::themed(p.dark, &terminal).get(p.slot));
+            if p.state.read(cx).value() != Some(color) {
+                p.state
+                    .update(cx, |state, cx| state.set_value(color, window, cx));
+            }
+        }
+    }
+
+    /// The colors for a dark or a light app, each with a reset to
+    /// lemen's own.
+    fn color_group(&self, dark: bool) -> SettingGroup {
+        let items = self.pickers.iter().filter(|p| p.dark == dark).map(|p| {
+            let (state, slot) = (p.state.clone(), p.slot);
+            let field = SettingField::render(move |_, _, _| ColorPicker::new(&state).small())
+                .on_reset(
+                    move |cx| {
+                        Palette::themed(dark, &Prefs::get(cx).terminal).get(slot)
+                            != Palette::default_for(dark).get(slot)
+                    },
+                    move |_, cx| {
+                        Prefs::update(cx, |p| set_color(&mut p.terminal, dark, slot, None))
+                    },
+                );
+            SettingItem::new(p.label, field)
+        });
+        let (title, description) = if dark {
+            ("Dark", "While lemen is dark. Starts as One Half Dark.")
+        } else {
+            ("Light", "While lemen is light. Starts as One Half Light.")
+        };
+        SettingGroup::new()
+            .title(title)
+            .description(description)
+            .items(items)
     }
 }
 
@@ -170,14 +254,12 @@ impl Render for SettingsView {
         )
         .default_value(defaults.font_size);
         let settings = Settings::new("settings").sidebar_width(px(200.0)).pages([
-            SettingPage::new("Appearance")
-                .icon(IconName::Palette)
-                .group(
-                    SettingGroup::new().item(
-                        SettingItem::new("Theme", theme)
-                            .description("System follows macOS's light or dark mode."),
-                    ),
+            SettingPage::new("Appearance").icon(IconName::Sun).group(
+                SettingGroup::new().item(
+                    SettingItem::new("Theme", theme)
+                        .description("System follows macOS's light or dark mode."),
                 ),
+            ),
             SettingPage::new("Terminal")
                 .icon(IconName::SquareTerminal)
                 .group(
@@ -188,6 +270,9 @@ impl Render for SettingsView {
                         )
                         .item(SettingItem::new("Font size", font_size).description("In points.")),
                 ),
+            SettingPage::new("Terminal colors")
+                .icon(IconName::Palette)
+                .groups([self.color_group(true), self.color_group(false)]),
         ]);
         let error = Prefs::get(cx).error.clone();
         let danger = cx.theme().danger;
@@ -209,6 +294,20 @@ impl Render for SettingsView {
                         .child(format!("Couldn't save: {error}")),
                 )
             })
+    }
+}
+
+fn to_hsla(c: Rgb) -> Hsla {
+    rgb(u32::from(c.r) << 16 | u32::from(c.g) << 8 | u32::from(c.b)).into()
+}
+
+fn to_rgb(c: Hsla) -> Rgb {
+    let c: Rgba = c.into();
+    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Rgb {
+        r: channel(c.r),
+        g: channel(c.g),
+        b: channel(c.b),
     }
 }
 
@@ -240,9 +339,45 @@ fn monospace_fonts(cx: &App) -> Vec<SharedString> {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Prefs, open};
+    use super::{Prefs, SettingsView, open, to_hsla};
     use crate::config::ThemeChoice;
+    use crate::gui::terminal::{DARK, Palette, Slot, set_color};
     use gpui_kit::component::ActiveTheme;
+    use gpui_kit::hsla;
+
+    /// A color picked in Settings becomes that slot's color and is kept;
+    /// a reset puts lemen's own back, in the picker too.
+    #[gpui::test]
+    fn picked_terminal_colors_are_kept(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(SettingsView::new);
+        let background = view.read_with(cx, |v, _| {
+            let p = &v.pickers[0];
+            assert!(p.dark && p.slot == Slot::Background);
+            p.state.clone()
+        });
+        let red = hsla(0.0, 1.0, 0.5, 1.0);
+        cx.update(|window, cx| background.update(cx, |s, cx| s.select_color(red, window, cx)));
+        cx.run_until_parked();
+        let terminal = cx.update(|_, cx| Prefs::get(cx).terminal.clone());
+        assert_eq!(terminal.dark.background.as_deref(), Some("#ff0000"));
+        assert_eq!(
+            Palette::themed(false, &terminal).background,
+            Palette::default_for(false).background
+        );
+
+        cx.update(|_, cx| {
+            Prefs::update(cx, |p| {
+                set_color(&mut p.terminal, true, Slot::Background, None)
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            background.read_with(cx, |s, _| s.value()),
+            Some(to_hsla(DARK.background))
+        );
+        assert!(cx.update(|_, cx| Prefs::get(cx).terminal.dark.is_empty()));
+    }
 
     #[gpui::test]
     fn the_theme_setting_switches_light_and_dark(cx: &mut gpui::TestAppContext) {

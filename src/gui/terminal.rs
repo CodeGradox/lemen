@@ -1,6 +1,7 @@
 //! A PTY running a command (`tmux attach`, usually over SSH) whose output is
 //! parsed by alacritty_terminal. Knows nothing about drawing.
 
+use crate::config::{Terminal, TerminalColors, parse_hex};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
@@ -121,6 +122,7 @@ impl Drop for Pty {
 
 /// Terminal colors for one appearance. Programs can override any entry
 /// with OSC 4/10/11.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Palette {
     ansi: [Rgb; 16],
     pub foreground: Rgb,
@@ -128,53 +130,108 @@ pub struct Palette {
     cursor: Rgb,
 }
 
+/// One color a palette sets.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Slot {
+    Foreground,
+    Background,
+    Cursor,
+    /// 0-7 normal, 8-15 bright: black, red, green, yellow, blue, magenta,
+    /// cyan, white.
+    Ansi(usize),
+}
+
+/// Every slot with its name, as Settings lists them.
+pub const SLOTS: [(Slot, &str); 19] = [
+    (Slot::Background, "Background"),
+    (Slot::Foreground, "Foreground"),
+    (Slot::Cursor, "Cursor"),
+    (Slot::Ansi(0), "Black"),
+    (Slot::Ansi(1), "Red"),
+    (Slot::Ansi(2), "Green"),
+    (Slot::Ansi(3), "Yellow"),
+    (Slot::Ansi(4), "Blue"),
+    (Slot::Ansi(5), "Magenta"),
+    (Slot::Ansi(6), "Cyan"),
+    (Slot::Ansi(7), "White"),
+    (Slot::Ansi(8), "Bright black"),
+    (Slot::Ansi(9), "Bright red"),
+    (Slot::Ansi(10), "Bright green"),
+    (Slot::Ansi(11), "Bright yellow"),
+    (Slot::Ansi(12), "Bright blue"),
+    (Slot::Ansi(13), "Bright magenta"),
+    (Slot::Ansi(14), "Bright cyan"),
+    (Slot::Ansi(15), "Bright white"),
+];
+
+/// One Half Dark, as the WezTerm scheme of that name.
 pub const DARK: Palette = Palette {
     ansi: [
         rgb(0x282c34),
-        rgb(0xe06c75),
+        rgb(0xe17079),
         rgb(0x98c379),
         rgb(0xe5c07b),
         rgb(0x61afef),
         rgb(0xc678dd),
         rgb(0x56b6c2),
-        rgb(0xabb2bf),
-        rgb(0x5c6370),
-        rgb(0xef7b85),
-        rgb(0xa5d68a),
-        rgb(0xf0cd8a),
-        rgb(0x74bdf7),
-        rgb(0xd38be8),
-        rgb(0x67c9d6),
-        rgb(0xe6e6e6),
+        rgb(0xdcdfe4),
+        rgb(0x8c939f),
+        rgb(0xe17079),
+        rgb(0x98c379),
+        rgb(0xe5c07b),
+        rgb(0x61afef),
+        rgb(0xc678dd),
+        rgb(0x56b6c2),
+        rgb(0xffffff),
     ],
-    foreground: rgb(0xd4d4d4),
-    background: rgb(0x1e1e1e),
-    cursor: rgb(0xd4d4d4),
+    foreground: rgb(0xdcdfe4),
+    background: rgb(0x282c34),
+    cursor: rgb(0x979db4),
 };
 
+/// One Half Light, as the WezTerm scheme of that name.
 pub const LIGHT: Palette = Palette {
     ansi: [
         rgb(0x383a42),
-        rgb(0xe45649),
-        rgb(0x50a14f),
-        rgb(0xc18401),
-        rgb(0x4078f2),
+        rgb(0xce4136),
+        rgb(0x318332),
+        rgb(0x986801),
+        rgb(0x356ce5),
         rgb(0xa626a4),
-        rgb(0x0184bc),
+        rgb(0x007ab2),
         rgb(0xa0a1a7),
         rgb(0x696c77),
-        rgb(0xca1243),
-        rgb(0x3d8f3c),
+        rgb(0xce4136),
+        rgb(0x318332),
         rgb(0x986801),
-        rgb(0x2a63d9),
-        rgb(0x8a1d8a),
-        rgb(0x0f7493),
-        rgb(0xd4d4d4),
+        rgb(0x356ce5),
+        rgb(0xa626a4),
+        rgb(0x007ab2),
+        rgb(0xfafafa),
     ],
     foreground: rgb(0x383a42),
     background: rgb(0xfafafa),
-    cursor: rgb(0x526fff),
+    cursor: rgb(0x4f525e),
 };
+
+/// Sets one color of the dark or light palette, or with `None` puts lemen's
+/// own back; the config keeps only what differs from lemen's own.
+pub fn set_color(terminal: &mut Terminal, dark: bool, slot: Slot, color: Option<Rgb>) {
+    let defaults = Palette::default_for(dark);
+    let mut palette = Palette::themed(dark, terminal);
+    palette.set(slot, color.unwrap_or(defaults.get(slot)));
+    let colors = palette.overrides(defaults);
+    if dark {
+        terminal.dark = colors;
+    } else {
+        terminal.light = colors;
+    }
+}
+
+/// `#rrggbb`.
+pub fn hex(c: Rgb) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
+}
 
 const fn rgb(hex: u32) -> Rgb {
     Rgb {
@@ -185,8 +242,78 @@ const fn rgb(hex: u32) -> Rgb {
 }
 
 impl Palette {
-    pub fn for_appearance(dark: bool) -> &'static Palette {
+    /// lemen's own colors for dark or light.
+    pub fn default_for(dark: bool) -> &'static Palette {
         if dark { &DARK } else { &LIGHT }
+    }
+
+    /// The colors for dark or light: Settings' over lemen's own.
+    pub fn themed(dark: bool, terminal: &Terminal) -> Palette {
+        let mut palette = *Palette::default_for(dark);
+        let colors = if dark {
+            &terminal.dark
+        } else {
+            &terminal.light
+        };
+        let parse = |hex: &Option<String>| hex.as_deref().and_then(parse_hex).map(rgb);
+        let slots = [
+            (Slot::Foreground, &colors.foreground),
+            (Slot::Background, &colors.background),
+            (Slot::Cursor, &colors.cursor),
+        ];
+        for (slot, hex) in slots {
+            if let Some(c) = parse(hex) {
+                palette.set(slot, c);
+            }
+        }
+        for (offset, list) in [(0, &colors.ansi), (8, &colors.brights)] {
+            for (i, hex) in list.iter().flatten().take(8).enumerate() {
+                if let Some(c) = parse_hex(hex).map(rgb) {
+                    palette.set(Slot::Ansi(offset + i), c);
+                }
+            }
+        }
+        palette
+    }
+
+    pub fn get(&self, slot: Slot) -> Rgb {
+        match slot {
+            Slot::Foreground => self.foreground,
+            Slot::Background => self.background,
+            Slot::Cursor => self.cursor,
+            Slot::Ansi(i) => self.ansi[i],
+        }
+    }
+
+    pub fn set(&mut self, slot: Slot, color: Rgb) {
+        match slot {
+            Slot::Foreground => self.foreground = color,
+            Slot::Background => self.background = color,
+            Slot::Cursor => self.cursor = color,
+            Slot::Ansi(i) => self.ansi[i] = color,
+        }
+    }
+
+    /// What differs from `defaults`, as the config writes it.
+    fn overrides(&self, defaults: &Palette) -> TerminalColors {
+        let differs = |slot| (self.get(slot) != defaults.get(slot)).then(|| hex(self.get(slot)));
+        let eight = |offset: usize| {
+            (offset..offset + 8)
+                .any(|i| self.ansi[i] != defaults.ansi[i])
+                .then(|| {
+                    self.ansi[offset..offset + 8]
+                        .iter()
+                        .map(|c| hex(*c))
+                        .collect()
+                })
+        };
+        TerminalColors {
+            foreground: differs(Slot::Foreground),
+            background: differs(Slot::Background),
+            cursor: differs(Slot::Cursor),
+            ansi: eight(0),
+            brights: eight(8),
+        }
     }
 
     /// Faint text: a third of the way toward the background, so it works on
@@ -299,12 +426,42 @@ mod tests {
     fn light_palette_and_dimming() {
         let colors = Colors::default();
         assert_eq!(
-            Palette::for_appearance(false).resolve(Color::Named(NamedColor::Background), &colors),
+            Palette::default_for(false).resolve(Color::Named(NamedColor::Background), &colors),
             LIGHT.background
         );
         // Dimming moves toward the background in both appearances.
         assert!(LIGHT.dim(rgb(0x000000)).r > 0);
         assert!(DARK.dim(rgb(0xffffff)).r < 255);
+    }
+
+    #[test]
+    fn settings_colors_go_over_lemens_own() {
+        let mut terminal = Terminal::default();
+        assert_eq!(Palette::themed(true, &terminal), DARK);
+        set_color(&mut terminal, true, Slot::Background, Some(rgb(0x000000)));
+        set_color(&mut terminal, true, Slot::Ansi(9), Some(rgb(0xff0000)));
+        let dark = Palette::themed(true, &terminal);
+        assert_eq!(dark.background, rgb(0x000000));
+        assert_eq!(dark.get(Slot::Ansi(9)), rgb(0xff0000));
+        assert_eq!(dark.get(Slot::Ansi(1)), DARK.get(Slot::Ansi(1)));
+        // Only what differs is kept, and light is left alone.
+        assert_eq!(terminal.dark.background.as_deref(), Some("#000000"));
+        assert_eq!(
+            (
+                terminal.dark.foreground.as_ref(),
+                terminal.dark.ansi.as_ref()
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            terminal.dark.brights.as_ref().map(|b| b[1].as_str()),
+            Some("#ff0000")
+        );
+        assert_eq!(Palette::themed(false, &terminal), LIGHT);
+        // Back to lemen's own empties it again.
+        set_color(&mut terminal, true, Slot::Background, None);
+        set_color(&mut terminal, true, Slot::Ansi(9), None);
+        assert_eq!(terminal.dark, TerminalColors::default());
     }
 
     fn screen_text(pty: &Pty) -> String {

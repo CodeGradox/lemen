@@ -26,6 +26,14 @@ Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `g
 # font_family = "Menlo"
 # font_size = 13                  # points, 6-72
 
+# [terminal.dark]                 # colors while lemen is dark, as WezTerm names them;
+# background = "#282c34"          # what's left out is lemen's own (One Half Dark)
+# foreground = "#dcdfe4"
+# cursor = "#979db4"
+# ansi = ["#282c34", "#e17079", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#dcdfe4"]
+# brights = ["#8c939f", "#e17079", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#ffffff"]
+# [terminal.light]                # the same while lemen is light (One Half Light)
+
 [[hosts]]
 name = "agent"
 ssh = "agent"                     # user@host or a ~/.ssh/config alias; "local" runs here
@@ -43,7 +51,7 @@ path = "~/projects/api"
 # worktree_colors = { "/path/to/worktree" = "blue" }  # red orange yellow green teal cyan blue purple pink gray
 ```
 
-Settings (`⌘,`) writes `theme` and `[terminal]` for you, and the sidebar writes a project's `collapsed`, `worktree_order` and `worktree_colors`; the rest of the file, comments included, stays as it is.
+Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, and the sidebar writes a project's `collapsed`, `worktree_order` and `worktree_colors`; the rest of the file, comments included, stays as it is.
 
 With the default `worktree_dir`, new worktree threads run `claude -w <name>` and Claude creates the worktree. Any other `worktree_dir` (relative to the repo, absolute, or `~/...`) makes lemen run `git worktree add -b worktree-<name>` there first.
 
@@ -63,7 +71,7 @@ Run `lemen`. The sidebar lists each base's worktrees and their sessions; it refr
 - Double-click a session, or right-click → **Rename…**, to change its label. Only the thread's tmux name changes (its random words stay); Claude keeps running and its worktree and branch keep their names.
 - Drag a thread onto another in the same worktree to move it to that place. The order is stored on the tmux sessions (`@lemen_order`), so it survives restarts and is the same from any Mac; new threads start at the bottom.
 - `⌘B` or the header button collapses the sidebar. `⌘Q` quits; sessions keep running.
-- `⌘,` (**lemen → Settings…**) opens Settings: the theme (System, Light or Dark) and the terminal's font and size. Changes apply at once and are saved to the config.
+- `⌘,` (**lemen → Settings…**) opens Settings: the theme (System, Light or Dark), the terminal's font and size, and its colors for a dark and a light lemen (One Half Dark and Light to start). Changes apply at once and are saved to the config.
 - A terminal whose connection dropped (laptop slept) says so; click it to reconnect.
 
 **Notes:** every worktree has a notepad. The button at the right of the header opens it beside the terminal, on the worktree of the thread you opened last; a worktree's notes icon opens that one's. It shows Markdown, and links (pasted bare URLs too) open with a click. **Edit** opens the Markdown for editing until Esc or **Done** shows it rendered again; clicking elsewhere or the emoji picker doesn't end it. Notes are saved as you type, on this Mac, in `~/.lemen/notes/<host>/<worktree path>.md`.

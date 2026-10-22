@@ -126,7 +126,7 @@ impl TerminalView {
                 cx.write_to_clipboard(ClipboardItem::new_string(text))
             }
             TermEvent::ColorRequest(index, format) => {
-                let palette = Palette::for_appearance(cx.theme().is_dark());
+                let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
                 let color = palette.indexed(index, pty.term.lock().colors());
                 pty.write(format(color).into_bytes());
             }
@@ -607,8 +607,8 @@ impl Render for TerminalView {
         let (w, h) = (metrics.cell_width, metrics.line_height);
         let focused = self.focus.is_focused(window);
         let view = cx.entity().downgrade();
-        let palette = Palette::for_appearance(cx.theme().is_dark());
-        let frame = self.pty.as_ref().map(|pty| snapshot(pty, palette));
+        let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
+        let frame = self.pty.as_ref().map(|pty| snapshot(pty, &palette));
         let grid = canvas(
             move |bounds, _, cx| {
                 let size = Size {
