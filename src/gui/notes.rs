@@ -10,6 +10,10 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::path::PathBuf;
 
+/// Shared by the rendered notes and the editor, so lines don't jump when
+/// switching between them.
+const LINE_HEIGHT: f32 = 20.0;
+
 pub struct NotesPanel {
     /// Where notes are saved; tests have none.
     root: Option<PathBuf>,
@@ -180,6 +184,7 @@ impl Render for NotesPanel {
                 .flex_1()
                 .min_h_0()
                 .px_1()
+                .line_height(px(LINE_HEIGHT))
                 .child(Textarea::new(&self.editor).h_full().bordered(false))
                 .into_any_element()
         } else {
@@ -200,7 +205,13 @@ impl Render for NotesPanel {
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .p_3()
+                // Text as the editor shows it: its size, line height, and
+                // where it starts (the 4 px margin plus the editor's 10 by
+                // 8 px padding).
+                .text_sm()
+                .line_height(px(LINE_HEIGHT))
+                .px(px(14.0))
+                .py_2()
                 .cursor_text()
                 .debug_selector(|| "notes-view".into())
                 .child(content)
