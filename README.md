@@ -71,6 +71,7 @@ Run `lemen`. The sidebar lists each base's worktrees and their sessions; it refr
 - Double-click a session, or right-click → **Rename…**, to change its label. Only the thread's tmux name changes (its random words stay); Claude keeps running and its worktree and branch keep their names.
 - Drag a thread onto another in the same worktree to move it to that place. The order is stored on the tmux sessions (`@lemen_order`), so it survives restarts and is the same from any Mac; new threads start at the bottom.
 - `⌘B` or the header button collapses the sidebar. `⌘Q` quits; sessions keep running.
+- The menu bar has them too: **File** → **Add Project…** (`⌘O`) and **Refresh** (`⌘R`); **View** → **Toggle Sidebar** (`⌘B`) and **Toggle Notes**.
 - `⌘,` (**lemen → Settings…**) opens Settings: the theme (System, Light or Dark), the terminal's font and size, and its colors for a dark and a light lemen (One Half Dark and Light to start). Changes apply at once and are saved to the config.
 - A terminal whose connection dropped (laptop slept) says so; click it to reconnect.
 

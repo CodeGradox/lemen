@@ -39,8 +39,36 @@ use terminal_view::TerminalView;
 
 actions!(
     lemen,
-    [Quit, ToggleSidebar, OpenSettings, Hide, HideOthers, ShowAll]
+    [
+        Quit,
+        ToggleSidebar,
+        ToggleNotes,
+        OpenSettings,
+        AddProject,
+        Refresh,
+        Hide,
+        HideOthers,
+        ShowAll
+    ]
 );
+
+/// lemen's keys; menus show them next to their items.
+fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("cmd-h", Hide, None),
+        KeyBinding::new("alt-cmd-h", HideOthers, None),
+        KeyBinding::new("cmd-o", AddProject, None),
+        KeyBinding::new("cmd-r", Refresh, None),
+        KeyBinding::new("cmd-b", ToggleSidebar, None),
+        KeyBinding::new("cmd-w", settings::CloseWindow, Some(settings::CONTEXT)),
+        // gpui-component's Root moves focus on Tab; in a terminal it belongs to the program.
+        KeyBinding::new("tab", NoAction, Some(terminal_view::CONTEXT)),
+        KeyBinding::new("shift-tab", NoAction, Some(terminal_view::CONTEXT)),
+    ]);
+    folder_picker::bind_keys(cx);
+}
 
 const REFRESH: Duration = Duration::from_secs(3);
 
@@ -119,6 +147,9 @@ struct Lemen {
     /// Adding a folder, over the window.
     picker: Option<(Entity<FolderPicker>, Subscription)>,
     _refresh: Task<()>,
+    /// Focused when no terminal is, so keys and menu actions reach the
+    /// window.
+    focus: FocusHandle,
     _appearance: Subscription,
 }
 
@@ -129,35 +160,37 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             gpui_kit::init(cx);
             cx.set_global(Prefs::new(&cfg, Config::path().ok()));
             settings::apply_theme(None, cx);
-            cx.bind_keys([
-                KeyBinding::new("cmd-q", Quit, None),
-                KeyBinding::new("cmd-,", OpenSettings, None),
-                KeyBinding::new("cmd-h", Hide, None),
-                KeyBinding::new("alt-cmd-h", HideOthers, None),
-                KeyBinding::new("cmd-b", ToggleSidebar, None),
-                KeyBinding::new("cmd-w", settings::CloseWindow, Some(settings::CONTEXT)),
-                // gpui-component's Root moves focus on Tab; in a terminal it belongs to the program.
-                KeyBinding::new("tab", NoAction, Some(terminal_view::CONTEXT)),
-                KeyBinding::new("shift-tab", NoAction, Some(terminal_view::CONTEXT)),
-            ]);
-            folder_picker::bind_keys(cx);
+            bind_keys(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
             cx.on_action(|_: &Hide, cx| cx.hide());
             cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
             cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-            // The app menu, as macOS apps have it; shortcuts come from the bindings above.
-            cx.set_menus([Menu::new("lemen").items([
-                MenuItem::action("Settings…", OpenSettings),
-                MenuItem::separator(),
-                MenuItem::os_submenu("Services", SystemMenuType::Services),
-                MenuItem::separator(),
-                MenuItem::action("Hide lemen", Hide),
-                MenuItem::action("Hide Others", HideOthers),
-                MenuItem::action("Show All", ShowAll),
-                MenuItem::separator(),
-                MenuItem::action("Quit lemen", Quit),
-            ])]);
+            // Menus as macOS apps have them; shortcuts come from bind_keys. The
+            // File and View items act on the main window, and are greyed out
+            // while another window, like Settings, is in front.
+            cx.set_menus([
+                Menu::new("lemen").items([
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    MenuItem::action("Hide lemen", Hide),
+                    MenuItem::action("Hide Others", HideOthers),
+                    MenuItem::action("Show All", ShowAll),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit lemen", Quit),
+                ]),
+                Menu::new("File").items([
+                    MenuItem::action("Add Project…", AddProject),
+                    MenuItem::separator(),
+                    MenuItem::action("Refresh", Refresh),
+                ]),
+                Menu::new("View").items([
+                    MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                    MenuItem::action("Toggle Notes", ToggleNotes),
+                ]),
+            ]);
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some("lemen".into()),
@@ -200,6 +233,8 @@ impl Lemen {
             .and_then(Path::parent)
             .map(|dir| dir.join("notes"));
         let notes = cx.new(|cx| NotesPanel::new(notes_dir, window, cx));
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
         let restore = state_file
             .as_deref()
             .and_then(|p| Active::load_from(p).ok())
@@ -237,6 +272,7 @@ impl Lemen {
             notes_open: false,
             picker: None,
             _refresh: refresh,
+            focus,
             _appearance: appearance,
         }
     }
@@ -455,8 +491,9 @@ impl Lemen {
 
     /// Gives the keyboard back to the session on show, after a spotlight.
     fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.active.as_ref().and_then(|k| self.terminals.get(k)) {
-            view.read(cx).focus_handle(cx).focus(window, cx);
+        match self.active.as_ref().and_then(|k| self.terminals.get(k)) {
+            Some(view) => view.read(cx).focus_handle(cx).focus(window, cx),
+            None => self.focus.focus(window, cx),
         }
         cx.notify();
     }
@@ -1481,6 +1518,11 @@ impl Lemen {
         cx.notify();
     }
 
+    fn toggle_notes(&mut self, cx: &mut Context<Self>) {
+        self.notes_open = !self.notes_open;
+        cx.notify();
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let toggle = Button::new("toggle-sidebar")
@@ -1537,11 +1579,7 @@ impl Lemen {
                 .small()
                 .tooltip("Notes")
                 .on_click(move |_, _, cx| {
-                    this.update(cx, |this, cx| {
-                        this.notes_open = !this.notes_open;
-                        cx.notify();
-                    })
-                    .ok();
+                    this.update(cx, |this, cx| this.toggle_notes(cx)).ok();
                 }),
         )
     }
@@ -1588,6 +1626,9 @@ impl Render for Lemen {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &ToggleNotes, _, cx| this.toggle_notes(cx)))
+            .on_action(cx.listener(|this, _: &AddProject, window, cx| this.open_picker(window, cx)))
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx).detach()))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 if e.keystroke.key == "escape" && this.prompt.is_some() {
                     this.close_prompt(window, cx);
@@ -1621,6 +1662,9 @@ impl Render for Lemen {
             )
             .children(picker)
             .children(prompt)
+            // Holds the window's focus with no terminal open. It takes no room
+            // and can't be clicked, so clicks elsewhere keep their focus.
+            .child(div().absolute().track_focus(&self.focus))
     }
 }
 
@@ -2264,6 +2308,27 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The menus' actions and keys reach the main window: ⌘O opens the
+    /// folder picker, Toggle Notes the notes, ⌘R refreshes.
+    #[gpui::test]
+    fn menu_actions_reach_the_main_window(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+
+        cx.simulate_keystrokes("cmd-o");
+        app.read_with(cx, |app, _| assert!(app.picker.is_some()));
+        cx.simulate_keystrokes("escape");
+        app.read_with(cx, |app, _| assert!(app.picker.is_none()));
+
+        cx.dispatch_action(super::ToggleNotes);
+        app.read_with(cx, |app, _| assert!(app.notes_open));
+
+        app.update(cx, |app, _| app.loaded = false);
+        cx.simulate_keystrokes("cmd-r");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert!(app.loaded, "a refresh came in"));
     }
 
     #[gpui::test]
