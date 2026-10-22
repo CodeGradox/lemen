@@ -17,6 +17,10 @@ Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `g
 ```toml
 # theme = "system"                # or "light" / "dark"; must come before the tables
 
+# [terminal]
+# font_family = "Menlo"
+# font_size = 13                  # points, 6-72
+
 [[hosts]]
 name = "agent"
 ssh = "agent"                     # user@host or a ~/.ssh/config alias; "local" runs here
@@ -31,6 +35,8 @@ path = "~/projects/api"
 # worktree_dir = ".claude/worktrees"
 ```
 
+Settings (`⌘,`) writes `theme` and `[terminal]` for you and leaves the rest of the file, comments included, as it is.
+
 With the default `worktree_dir`, new worktree threads run `claude -w <name>` and Claude creates the worktree. Any other `worktree_dir` (relative to the repo, absolute, or `~/...`) makes lemen run `git worktree add -b worktree-<name>` there first.
 
 ## Use
@@ -42,6 +48,7 @@ Run `lemen`. The sidebar lists each base's worktrees and their sessions; it refr
 - **×** on a session, clicked twice, kills it. The worktree stays.
 - Double-click a session, or right-click → **Rename…**, to change its label. Only the thread's tmux name changes (its random words stay); Claude keeps running and its worktree and branch keep their names.
 - `⌘B` or the header button collapses the sidebar. `⌘Q` quits; sessions keep running.
+- `⌘,` (**lemen → Settings…**) opens Settings: the theme (System, Light or Dark) and the terminal's font and size. Changes apply at once and are saved to the config.
 - A terminal whose connection dropped (laptop slept) says so; click it to reconnect.
 
 **Images:** drop files on the terminal, or `⌘V` with an image or copied files on the clipboard. lemen uploads them to the host's `upload_dir` and pastes the remote paths. Text pastes as text.

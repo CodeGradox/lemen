@@ -2,6 +2,7 @@
 //! Dropped or pasted images go to the host first; the session gets the path.
 
 use super::keys::{self, Key};
+use super::settings::Prefs;
 use super::terminal::{Palette, Pty, Size};
 use crate::actions;
 use crate::attach::attach_argv;
@@ -19,8 +20,6 @@ use std::path::PathBuf;
 
 /// Key context for terminal-only key bindings.
 pub const CONTEXT: &str = "Terminal";
-const FONT_FAMILY: &str = "Menlo";
-const FONT_SIZE: f32 = 13.0;
 
 pub struct TerminalView {
     pub host: Host,
@@ -30,12 +29,22 @@ pub struct TerminalView {
     /// Where the grid was last painted, for mapping mouse positions to cells.
     bounds: Bounds<Pixels>,
     cell: Size,
-    /// Cell width and line height of the terminal font, measured once.
-    metrics: Option<(Pixels, Pixels)>,
+    /// Measured on the next render after Settings change the font.
+    metrics: Option<Metrics>,
     mouse_cell: Option<(usize, usize)>,
     scroll_lines: f32,
     status: Option<String>,
     _reader: Option<Task<()>>,
+    _prefs: Subscription,
+}
+
+/// The terminal font and the size of one cell in it.
+#[derive(Clone)]
+struct Metrics {
+    font: Font,
+    size: Pixels,
+    cell_width: Pixels,
+    line_height: Pixels,
 }
 
 impl Focusable for TerminalView {
@@ -63,6 +72,10 @@ impl TerminalView {
             scroll_lines: 0.0,
             status: None,
             _reader: None,
+            _prefs: cx.observe_global::<Prefs>(|this, cx| {
+                this.metrics = None;
+                cx.notify();
+            }),
         };
         view.connect(cx);
         view
@@ -338,15 +351,23 @@ impl TerminalView {
         }
     }
 
-    /// Cell size for the terminal font.
-    fn measure(window: &mut Window) -> (Pixels, Pixels) {
+    /// The terminal font from Settings, and its cell size.
+    fn measure(window: &mut Window, cx: &App) -> Metrics {
+        let terminal = &Prefs::get(cx).terminal;
+        let font = font(terminal.font_family.clone());
+        let size = terminal.font_size as f32;
         let text = window.text_system();
-        let font_id = text.resolve_font(&font(FONT_FAMILY));
-        let width = text
-            .advance(font_id, px(FONT_SIZE), 'm')
+        let font_id = text.resolve_font(&font);
+        let cell_width = text
+            .advance(font_id, px(size), 'm')
             .map(|s| s.width)
             .unwrap_or(px(8.0));
-        (width, px((FONT_SIZE * 1.3).round()))
+        Metrics {
+            font,
+            size: px(size),
+            cell_width,
+            line_height: px((size * 1.3).round()),
+        }
     }
 }
 
@@ -393,8 +414,8 @@ impl Style {
         .union(Flags::ALL_UNDERLINES)
         .union(Flags::STRIKEOUT);
 
-    fn text_run(self, len: usize) -> TextRun {
-        let mut font = font(FONT_FAMILY);
+    fn text_run(self, len: usize, font: &Font) -> TextRun {
+        let mut font = font.clone();
         if self.flags.contains(Flags::BOLD) {
             font.weight = FontWeight::BOLD;
         }
@@ -518,12 +539,12 @@ fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
 fn paint(
     frame: Frame,
     bounds: Bounds<Pixels>,
-    cell: (Pixels, Pixels),
+    metrics: &Metrics,
     focused: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let (w, h) = cell;
+    let (w, h) = (metrics.cell_width, metrics.line_height);
     window.paint_quad(fill(bounds, frame.background));
     for (i, row) in frame.rows.iter().enumerate() {
         let y = bounds.origin.y + h * i as f32;
@@ -561,11 +582,11 @@ fn paint(
         let runs: Vec<TextRun> = row
             .runs
             .iter()
-            .map(|&(style, len)| style.text_run(len))
+            .map(|&(style, len)| style.text_run(len, &metrics.font))
             .collect();
         let line = window
             .text_system()
-            .shape_line(row.text.into(), px(FONT_SIZE), &runs, Some(w));
+            .shape_line(row.text.into(), metrics.size, &runs, Some(w));
         let _ = line.paint(
             point(bounds.origin.x, y),
             h,
@@ -579,7 +600,11 @@ fn paint(
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (w, h) = *self.metrics.get_or_insert_with(|| Self::measure(window));
+        let metrics = self
+            .metrics
+            .get_or_insert_with(|| Self::measure(window, cx))
+            .clone();
+        let (w, h) = (metrics.cell_width, metrics.line_height);
         let focused = self.focus.is_focused(window);
         let view = cx.entity().downgrade();
         let palette = Palette::for_appearance(cx.theme().is_dark());
@@ -603,7 +628,7 @@ impl Render for TerminalView {
             },
             move |bounds, (), window, cx| {
                 if let Some(frame) = frame {
-                    paint(frame, bounds, (w, h), focused, window, cx);
+                    paint(frame, bounds, &metrics, focused, window, cx);
                 }
             },
         )
@@ -647,6 +672,7 @@ impl Render for TerminalView {
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::TerminalView;
+    use crate::gui::settings::Prefs;
     use crate::test_support::{TmuxServer, wait_until};
     use gpui_kit::{px, size};
     use std::time::Duration;
@@ -681,6 +707,30 @@ mod tests {
             wait_until(Duration::from_secs(5), || client() == want),
             "tmux sees {}",
             client()
+        );
+    }
+
+    /// A font size from Settings reaches open terminals: a bigger font fits
+    /// fewer columns and lines in the same window.
+    #[gpui::test]
+    fn the_terminal_follows_the_font_size(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("font");
+        server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
+        let host = server.config().hosts.remove(0);
+        // The PTY reader is a real thread, so this test can't be deterministic.
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
+        cx.simulate_resize(size(px(800.0), px(600.0)));
+        cx.run_until_parked();
+        let small = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+
+        cx.update(|_, cx| Prefs::update(cx, |p| p.terminal.font_size = 26.0));
+        cx.run_until_parked();
+        let large = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        assert!(
+            large.cols < small.cols && large.lines < small.lines,
+            "{small:?} -> {large:?}"
         );
     }
 }

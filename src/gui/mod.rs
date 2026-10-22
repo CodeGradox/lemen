@@ -5,6 +5,7 @@
 
 mod keys;
 mod notification;
+mod settings;
 mod terminal;
 mod terminal_view;
 
@@ -19,17 +20,19 @@ use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, ThemeMode, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, h_flex, v_flex};
 use gpui_kit::*;
 use notification::{Notification, NotificationEvent};
+use settings::Prefs;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use terminal_view::TerminalView;
 
-actions!(lemen, [Quit, ToggleSidebar]);
+actions!(
+    lemen,
+    [Quit, ToggleSidebar, OpenSettings, Hide, HideOthers, ShowAll]
+);
 
 const REFRESH: Duration = Duration::from_secs(3);
 
@@ -94,7 +97,7 @@ struct Lemen {
     /// Notification popups that are showing, one per session.
     popups: HashMap<Key, (WindowHandle<Notification>, Subscription)>,
     _refresh: Task<()>,
-    _appearance: Option<Subscription>,
+    _appearance: Subscription,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -102,19 +105,36 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            match cfg.theme {
-                ThemeChoice::System => Theme::sync_system_appearance(None, cx),
-                ThemeChoice::Light => Theme::change(ThemeMode::Light, None, cx),
-                ThemeChoice::Dark => Theme::change(ThemeMode::Dark, None, cx),
-            }
+            cx.set_global(Prefs::new(&cfg, Config::path().ok()));
+            settings::apply_theme(None, cx);
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("cmd-,", OpenSettings, None),
+                KeyBinding::new("cmd-h", Hide, None),
+                KeyBinding::new("alt-cmd-h", HideOthers, None),
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
+                KeyBinding::new("cmd-w", settings::CloseWindow, Some(settings::CONTEXT)),
                 // gpui-component's Root moves focus on Tab; in a terminal it belongs to the program.
                 KeyBinding::new("tab", NoAction, Some(terminal_view::CONTEXT)),
                 KeyBinding::new("shift-tab", NoAction, Some(terminal_view::CONTEXT)),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
+            cx.on_action(|_: &Hide, cx| cx.hide());
+            cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+            cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+            // The app menu, as macOS apps have it; shortcuts come from the bindings above.
+            cx.set_menus([Menu::new("lemen").items([
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide lemen", Hide),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
+                MenuItem::action("Quit lemen", Quit),
+            ])]);
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some("lemen".into()),
@@ -162,10 +182,10 @@ impl Lemen {
             }
         });
         // Follow macOS when it switches between light and dark.
-        let appearance = (cfg.theme == ThemeChoice::System).then(|| {
-            cx.observe_window_appearance(window, |_, window, cx| {
+        let appearance = cx.observe_window_appearance(window, |_, window, cx| {
+            if Prefs::get(cx).theme == ThemeChoice::System {
                 Theme::sync_system_appearance(Some(window), cx);
-            })
+            }
         });
         Lemen {
             cfg,

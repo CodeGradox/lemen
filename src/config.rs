@@ -1,16 +1,22 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 /// Where `claude -w` puts worktrees; bases using it let Claude create them.
 pub const CLAUDE_WORKTREES: &str = ".claude/worktrees";
+
+/// Terminal font sizes lemen accepts, in points.
+pub const FONT_SIZES: RangeInclusive<f64> = 6.0..=72.0;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub theme: ThemeChoice,
+    #[serde(default)]
+    pub terminal: Terminal,
     #[serde(default)]
     pub hosts: Vec<Host>,
     #[serde(default)]
@@ -25,6 +31,36 @@ pub enum ThemeChoice {
     System,
     Light,
     Dark,
+}
+
+impl ThemeChoice {
+    pub const ALL: [ThemeChoice; 3] = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark];
+
+    /// The name the config file uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeChoice::System => "system",
+            ThemeChoice::Light => "light",
+            ThemeChoice::Dark => "dark",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Terminal {
+    pub font_family: String,
+    /// In points.
+    pub font_size: f64,
+}
+
+impl Default for Terminal {
+    fn default() -> Self {
+        Terminal {
+            font_family: "Menlo".into(),
+            font_size: 13.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,7 +134,41 @@ impl Config {
                 bail!("base {} refers to unknown host {}", b.path, b.host);
             }
         }
+        if !FONT_SIZES.contains(&cfg.terminal.font_size) {
+            bail!(
+                "terminal font_size {} is outside {}-{}",
+                cfg.terminal.font_size,
+                FONT_SIZES.start(),
+                FONT_SIZES.end()
+            );
+        }
         Ok(cfg)
+    }
+
+    /// Writes the settings the Settings window changes into the config file
+    /// at `path`, leaving everything else in it, comments included, as is.
+    pub fn save_settings(path: &Path, theme: ThemeChoice, terminal: &Terminal) -> Result<()> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .with_context(|| format!("parsing {}", path.display()))?;
+        doc["theme"] = toml_edit::value(theme.as_str());
+        let table = doc
+            .entry("terminal")
+            .or_insert_with(toml_edit::table)
+            .as_table_like_mut()
+            .context("terminal in the config is not a table")?;
+        table.insert("font_family", toml_edit::value(&terminal.font_family));
+        // Whole sizes read best without the ".0".
+        let size = terminal.font_size;
+        let size = if size.fract() == 0.0 {
+            toml_edit::value(size as i64)
+        } else {
+            toml_edit::value(size)
+        };
+        table.insert("font_size", size);
+        std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn host(&self, name: &str) -> Option<&Host> {
@@ -146,5 +216,58 @@ mod tests {
         let cfg: Config = toml::from_str("theme = \"light\"").unwrap();
         assert_eq!(cfg.theme, ThemeChoice::Light);
         assert!(toml::from_str::<Config>("theme = \"blue\"").is_err());
+    }
+
+    #[test]
+    fn terminal_font_defaults_and_whole_sizes() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.terminal, Terminal::default());
+        let cfg: Config = toml::from_str("[terminal]\nfont_size = 15").unwrap();
+        assert_eq!(cfg.terminal.font_size, 15.0);
+        assert_eq!(cfg.terminal.font_family, "Menlo");
+    }
+
+    #[test]
+    fn saving_settings_keeps_the_rest_of_the_file() {
+        let path = std::env::temp_dir().join(format!("lemen-save-{}.toml", std::process::id()));
+        let original = "\
+# my hosts
+[[hosts]]
+name = \"agent\"   # the box
+ssh = \"agent\"
+
+[[bases]]
+host = \"agent\"
+path = \"~/projects/api\"
+";
+        std::fs::write(&path, original).unwrap();
+        let terminal = Terminal {
+            font_family: "JetBrains Mono".into(),
+            font_size: 14.0,
+        };
+        Config::save_settings(&path, ThemeChoice::Dark, &terminal).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("# my hosts") && saved.contains("# the box"),
+            "{saved}"
+        );
+        assert!(saved.contains("font_size = 14\n"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg.theme, ThemeChoice::Dark);
+        assert_eq!(cfg.terminal, terminal);
+        assert_eq!(cfg.bases[0].path, "~/projects/api");
+
+        // Saving again updates the same keys rather than adding new ones.
+        let terminal = Terminal {
+            font_size: 12.5,
+            ..terminal
+        };
+        Config::save_settings(&path, ThemeChoice::System, &terminal).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(saved.matches("font_size").count(), 1, "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg.theme, ThemeChoice::System);
+        assert_eq!(cfg.terminal.font_size, 12.5);
+        let _ = std::fs::remove_file(path);
     }
 }
