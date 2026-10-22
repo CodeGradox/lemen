@@ -1,7 +1,7 @@
 name: Build lemur
 
-# Every push to main builds a signed, notarized disk image and replaces the
-# latest-main pre-release with it; a new v* tag publishes that version.
+# Every push to main only runs the tests; a new v* tag builds a signed,
+# notarized disk image and publishes that version.
 on:
   push:
     branches: [main]
@@ -11,16 +11,45 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    # Nothing on main is signed or published, and it gets no secrets.
+    if: github.ref == 'refs/heads/main'
+    name: Test
+    # A newer push to main supersedes a run still going for an older one.
+    concurrency:
+      group: test-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain and test
+        run: |
+          xcodebuild -version
+          # GPUI compiles its Metal shaders at build time; Xcode 26 ships the
+          # Metal toolchain as a separate download.
+          xcrun -sdk macosx metal --version >/dev/null 2>&1 ||
+              xcodebuild -downloadComponent MetalToolchain
+          rust="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$rust"
+          rustup toolchain install "$rust" --profile minimal
+          rustup default "$rust"
+          rustc --version
+          # The tests drive real tmux servers.
+          brew install tmux
+          cargo test --locked
+
   release:
     # Updating or deleting a tag must not rebuild a version. The release
-    # environment only admits main and v* tags.
-    if: github.ref == 'refs/heads/main' || (github.event.created == true && startsWith(github.ref, 'refs/tags/v'))
+    # environment only admits v* tags.
+    if: github.event.created == true && startsWith(github.ref, 'refs/tags/v')
     name: Sign and notarize arm64
     environment: release
-    # A newer push to main supersedes a build still running for an older one.
     concurrency:
       group: build-${{ github.ref }}
-      cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+      cancel-in-progress: false
     runs-on: macos-26
     timeout-minutes: 60
     env:
@@ -145,28 +174,6 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/signed-downloads"
           sha256sum lemur-macos-arm64.dmg | diff - SHA256SUMS.txt
-      - name: Replace the latest-main pre-release
-        if: github.ref == 'refs/heads/main'
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/signed-downloads"
-          # An older build that finishes late must not replace a newer one.
-          if [ "$(gh api "repos/$GH_REPO/commits/main" --jq .sha)" != "$RELEASE_COMMIT" ]; then
-            echo "main has moved on; its own build publishes."
-            exit 0
-          fi
-          tag=latest-main
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release delete "$tag" --cleanup-tag --yes
-          fi
-          # A tag left behind by an interrupted run would pin the old commit.
-          if gh api "repos/$GH_REPO/git/refs/tags/$tag" >/dev/null 2>&1; then
-            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag"
-          fi
-          gh release create "$tag" --target "$RELEASE_COMMIT" --prerelease \
-            --title "lemur main (${RELEASE_COMMIT:0:7})" \
-            --notes "The latest push to main ($RELEASE_COMMIT), replaced on every push. Requires Apple Silicon and macOS 11 or newer. Open the DMG, drag lemur into Applications, then eject it. Developer ID-signed and Apple-notarized." \
-            lemur-macos-arm64.dmg SHA256SUMS.txt
       - name: Publish the version from a draft
         if: github.ref_type == 'tag'
         run: |

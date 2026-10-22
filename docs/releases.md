@@ -43,21 +43,12 @@ image, and mounts the finished one to check the app's signature and the
 Applications shortcut. `sh scripts/test-dmg.sh` packages a small ad-hoc
 fixture app the same way, without credentials.
 
-## Builds from main
+## Tests on main
 
-Every push to `main` runs **Build lemur** (`.github/workflows/release.yml`):
-it checks the commit is on `main`, installs the Rust version from
-`mise.toml`, Xcode's Metal toolchain and tmux, and runs the tests, all before
-it touches any secret. Then `scripts/notarize-app.sh` imports the certificate
-into a temporary keychain, builds and signs the app and the disk image,
-submits the image to Apple's notary service, and staples the ticket. The
-result replaces the **latest-main** pre-release, so the newest build is
-always at
-
-https://github.com/CodeGradox/lemur/releases/download/latest-main/lemur-macos-arm64.dmg
-
-A newer push cancels a build still running for an older one, and a build
-that finishes after `main` has moved on doesn't publish.
+Every push to `main` runs **Build lemur** (`.github/workflows/release.yml`)
+for the tests only: it installs the Rust version from `mise.toml`, Xcode's
+Metal toolchain and tmux, and runs the tests. It gets no secrets and
+publishes nothing. A newer push cancels a run still going for an older one.
 
 ## Publish a release
 
@@ -69,11 +60,14 @@ GIT_EDITOR=true git tag -a v0.1.0 -m "lemur v0.1.0"
 git push origin refs/tags/v0.1.0
 ```
 
-Pushing a new `v*` tag runs the same build, which also checks that the tag
-matches `Cargo.toml` and that the commit is in `main`'s history. It publishes
-`lemur-macos-arm64.dmg` and `SHA256SUMS.txt` as the GitHub Release for the
-tag. Use a new version for each release; updating or deleting a tag doesn't
-rebuild it.
+Only a new `v*` tag builds and publishes. The build checks that the tag
+matches `Cargo.toml` and that the commit is in `main`'s history, installs the
+same toolchain and runs the tests, all before it touches any secret. Then
+`scripts/notarize-app.sh` imports the certificate into a temporary keychain,
+builds and signs the app and the disk image, submits the image to Apple's
+notary service, and staples the ticket. It publishes `lemur-macos-arm64.dmg`
+and `SHA256SUMS.txt` as the GitHub Release for the tag. Use a new version for
+each release; updating or deleting a tag doesn't rebuild it.
 
 ## Apple credentials
 
@@ -85,10 +79,10 @@ is needed.
 
 In the repository's settings:
 
-1. The environment named **release** admits only the `main` branch and `v*`
-   tags (**Selected branches and tags**). Protect `v*` tags against updates
-   and deletion, and protect `main` against force-pushes: whoever can push to
-   `main` can get code signed.
+1. The environment named **release** admits only `v*` tags (**Selected
+   branches and tags**). Protect `v*` tags against updates and deletion, and
+   protect `main` against force-pushes: whoever can push a `v*` tag on
+   `main`'s history can get code signed.
 2. Add these **environment secrets** (not repository secrets). They, and the
    signing variables of the scripts, keep the `LEMEN_` names from before
    the rename:
