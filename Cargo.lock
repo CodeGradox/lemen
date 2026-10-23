@@ -3641,6 +3641,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "gpui-pre",
+ "lsp-types",
  "png 0.18.1",
  "serde",
  "serde_json",

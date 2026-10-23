@@ -1,27 +1,23 @@
-//! The notes panel: one worktree's notes, shown as Markdown with clickable
-//! links. The Edit button edits them; every change is saved at once.
+//! The notes panel: one worktree's notes, always editable, saved as you
+//! type. Markdown is highlighted, and ⌘-click opens a URL in them.
 
+use super::links::url_at;
 use crate::notes;
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
-use gpui_kit::component::text::TextView;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
+use anyhow::Result;
+use gpui_kit::component::input::{DefinitionProvider, Editor, EditorState, InputEvent};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Rope, RopeExt, StyledExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use lsp_types::{LocationLink, Range};
 use std::path::PathBuf;
-
-/// Shared by the rendered notes and the editor, so lines don't jump when
-/// switching between them.
-const LINE_HEIGHT: f32 = 20.0;
+use std::rc::Rc;
 
 pub struct NotesPanel {
     /// Where notes are saved; tests have none.
     root: Option<PathBuf>,
     shown: Option<Shown>,
-    editor: Entity<TextareaState>,
-    editing: bool,
+    editor: Entity<EditorState>,
     error: Option<String>,
-    focus: FocusHandle,
     _events: Subscription,
 }
 
@@ -36,10 +32,18 @@ struct Shown {
 impl NotesPanel {
     pub fn new(root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder("Markdown; pasted links become clickable")
+            let mut editor = EditorState::new(window, cx)
+                .language("markdown")
+                .line_number(false)
+                .indent_guides(false)
+                .folding(false)
+                .soft_wrap(true)
+                // The editor breaks its placeholder at newlines only, so it
+                // comes in lines that fit the narrowest notes panel.
+                .placeholder("Write here.\nMarkdown works, and\n⌘-click opens a link.");
+            editor.lsp_mut().definition_provider = Some(Rc::new(Urls));
+            editor
         });
-        // Editing ends with Done or Esc only: focus also leaves for a click
-        // elsewhere or the emoji picker, and the editor should stay.
         let events = cx.subscribe_in(&editor, window, |this, _, event: &InputEvent, _, cx| {
             if let InputEvent::Change = event {
                 this.save(cx)
@@ -49,9 +53,7 @@ impl NotesPanel {
             root,
             shown: None,
             editor,
-            editing: false,
             error: None,
-            focus: cx.focus_handle(),
             _events: events,
         }
     }
@@ -87,7 +89,6 @@ impl NotesPanel {
         };
         self.editor
             .update(cx, |editor, cx| editor.set_value(text, window, cx));
-        self.editing = false;
         self.shown = Some(Shown {
             host: host.to_string(),
             worktree: worktree.to_string(),
@@ -105,24 +106,6 @@ impl NotesPanel {
     #[cfg(test)]
     pub fn worktree(&self) -> Option<&str> {
         self.shown.as_ref().map(|s| s.worktree.as_str())
-    }
-
-    #[cfg(test)]
-    pub fn editing(&self) -> bool {
-        self.editing
-    }
-
-    fn edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.editing = true;
-        self.editor
-            .update(cx, |editor, cx| editor.focus(window, cx));
-        cx.notify();
-    }
-
-    fn done(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.editing = false;
-        self.focus.focus(window, cx);
-        cx.notify();
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -143,29 +126,13 @@ impl Render for NotesPanel {
             Some(shown) => format!("Notes · {}", shown.label),
             None => "Notes".to_string(),
         };
-        let toggle = if self.editing {
-            Button::new("done")
-                .label("Done")
-                .ghost()
-                .xsmall()
-                .on_click(cx.listener(|this, _, window, cx| this.done(window, cx)))
-        } else {
-            Button::new("edit")
-                .label("Edit")
-                .ghost()
-                .xsmall()
-                .debug_selector(|| "notes-edit".into())
-                .on_click(cx.listener(|this, _, window, cx| this.edit(window, cx)))
-        };
         let header = h_flex()
             .h_10()
             .px_3()
             .gap_2()
             .items_center()
             .child(Icon::new(IconName::FileText).text_color(muted))
-            .child(div().flex_1().text_sm().font_semibold().child(title))
-            .when(self.shown.is_some(), |this| this.child(toggle));
-        let text = self.editor.read(cx).value();
+            .child(div().flex_1().text_sm().font_semibold().child(title));
         let body = if self.shown.is_none() {
             div()
                 .p_3()
@@ -173,56 +140,18 @@ impl Render for NotesPanel {
                 .text_color(muted)
                 .child("Open a thread, or a worktree's notes icon, to see its notes.")
                 .into_any_element()
-        } else if self.editing {
+        } else {
             div()
                 .flex_1()
                 .min_h_0()
                 .px_1()
-                .line_height(px(LINE_HEIGHT))
-                .child(Textarea::new(&self.editor).h_full().bordered(false))
-                .into_any_element()
-        } else {
-            let content = if text.trim().is_empty() {
-                div()
-                    .text_sm()
-                    .text_color(muted)
-                    .child("No notes yet. Click Edit to write; Markdown works, and pasted links become clickable.")
-                    .into_any_element()
-            } else {
-                // Opens links itself.
-                TextView::markdown("notes", text)
-                    .selectable(true)
-                    .into_any_element()
-            };
-            div()
-                .id("notes-view")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                // Text as the editor shows it: its size, line height, and
-                // where it starts (the 4 px margin plus the editor's 10 by
-                // 8 px padding).
-                .text_sm()
-                .line_height(px(LINE_HEIGHT))
-                .px(px(14.0))
-                .py_2()
-                .cursor_text()
-                .debug_selector(|| "notes-view".into())
-                .child(content)
+                .debug_selector(|| "notes-editor".into())
+                .child(Editor::new(&self.editor).h_full().bordered(false))
                 .into_any_element()
         };
-        v_flex()
-            .track_focus(&self.focus)
-            .size_full()
-            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
-                if this.editing && e.keystroke.key == "escape" {
-                    this.done(window, cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .child(header)
-            .child(body)
-            .when_some(self.error.clone(), |this, error| {
+        v_flex().size_full().child(header).child(body).when_some(
+            self.error.clone(),
+            |this, error| {
                 this.child(
                     div()
                         .px_3()
@@ -231,16 +160,57 @@ impl Render for NotesPanel {
                         .text_color(danger)
                         .child(error),
                 )
-            })
+            },
+        )
     }
+}
+
+/// The URL under the pointer, for the editor's ⌘-hover underline and
+/// ⌘-click, which opens web links only.
+struct Urls;
+
+impl DefinitionProvider for Urls {
+    fn definitions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Task<Result<Vec<LocationLink>>> {
+        Task::ready(Ok(url_link(text, offset).into_iter().collect()))
+    }
+}
+
+/// The URL written out in `text` at byte `offset`, as a link from its own
+/// range to itself.
+fn url_link(text: &Rope, offset: usize) -> Option<LocationLink> {
+    let row = text.offset_to_point(offset).row;
+    let start = text.line_start_offset(row);
+    let line = text.slice_line(row).to_string();
+    let at = line.get(..offset.checked_sub(start)?)?.chars().count();
+    let chars: Vec<char> = line.chars().collect();
+    let (first, end) = url_at(&chars, at)?;
+    let byte = |i: usize| start + chars[..i].iter().map(|c| c.len_utf8()).sum::<usize>();
+    let range = Range::new(
+        text.offset_to_position(byte(first)),
+        text.offset_to_position(byte(end)),
+    );
+    let url: String = chars[first..end].iter().collect();
+    Some(LocationLink {
+        origin_selection_range: Some(range),
+        target_uri: url.parse().ok()?,
+        target_range: range,
+        target_selection_range: range,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::NotesPanel;
+    use super::{NotesPanel, url_link};
     use crate::notes;
     use gpui::VisualTestContext;
+    use gpui_kit::component::Rope;
     use gpui_kit::{AppContext, Entity, Modifiers, point, px, size};
     use std::path::{Path, PathBuf};
 
@@ -272,34 +242,27 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// Typing goes straight into the notes and is saved; each worktree
+    /// keeps its own.
     #[gpui::test]
-    fn edits_are_saved_and_each_worktree_keeps_its_own(cx: &mut gpui::TestAppContext) {
+    fn typing_is_saved_and_each_worktree_keeps_its_own(cx: &mut gpui::TestAppContext) {
         let root = root("notes-edit");
         notes::save(&notes::file(&root, "agent", "/srv/b"), "b's notes").unwrap();
         let (panel, cx) = panel(&root, cx);
         show(&panel, "/srv/a", cx);
         assert_eq!(panel.read_with(cx, |p, cx| p.text(cx)), "");
 
-        cx.update(|window, cx| panel.update(cx, |p, cx| p.edit(window, cx)));
-        cx.run_until_parked();
+        let editor = cx.debug_bounds("notes-editor").expect("the editor");
+        cx.simulate_click(editor.center(), Modifiers::none());
         cx.simulate_input("See https://example.com");
         let saved = notes::load(&notes::file(&root, "agent", "/srv/a")).unwrap();
         assert_eq!(saved, "See https://example.com");
 
-        // Focus leaving (a click elsewhere, the emoji picker) keeps editing;
-        // Esc ends it.
-        // Focus events need an active window; the test platform starts it inactive.
-        cx.update(|window, _| window.activate_window());
-        cx.run_until_parked();
-        cx.update(|window, cx| panel.update(cx, |p, cx| p.focus.focus(window, cx)));
-        cx.run_until_parked();
-        assert!(panel.read_with(cx, |p, _| p.editing()));
-        cx.update(|window, cx| panel.update(cx, |p, cx| p.edit(window, cx)));
-        cx.simulate_keystrokes("escape");
-        assert!(!panel.read_with(cx, |p, _| p.editing()));
-
         show(&panel, "/srv/b", cx);
         assert_eq!(panel.read_with(cx, |p, cx| p.text(cx)), "b's notes");
+        // Showing them didn't write them anywhere else.
+        let a = notes::load(&notes::file(&root, "agent", "/srv/a")).unwrap();
+        assert_eq!(a, "See https://example.com");
         show(&panel, "/srv/a", cx);
         assert_eq!(
             panel.read_with(cx, |p, cx| p.text(cx)),
@@ -308,40 +271,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A click on a link opens it; other clicks on the text leave it to be
-    /// selected. Only the Edit button edits.
+    #[test]
+    fn a_url_in_the_notes_links_to_itself() {
+        let text = Rope::from("first line\nsee https://example.com/a?b=c, then");
+        let at = text.to_string().find("example").unwrap();
+        let link = url_link(&text, at).expect("on the URL");
+        assert_eq!(link.target_uri.as_str(), "https://example.com/a?b=c");
+        let range = link.origin_selection_range.unwrap();
+        assert_eq!((range.start.line, range.start.character), (1, 4));
+        assert_eq!((range.end.line, range.end.character), (1, 29));
+        assert!(url_link(&text, 2).is_none(), "on plain words");
+    }
+
+    /// Holding ⌘ over a URL and clicking opens it; a plain click puts the
+    /// cursor there.
     #[gpui::test]
-    fn links_open_and_only_the_edit_button_edits(cx: &mut gpui::TestAppContext) {
+    fn cmd_click_opens_a_url(cx: &mut gpui::TestAppContext) {
         let root = root("notes-links");
-        let text = "[docs](https://example.com/docs)\n\nplain words that are not a link";
+        let text = "https://example.com/docs and more words";
         notes::save(&notes::file(&root, "agent", "/srv/a"), text).unwrap();
         let (panel, cx) = panel(&root, cx);
         show(&panel, "/srv/a", cx);
-        let view = cx.debug_bounds("notes-view").expect("rendered notes");
+        let editor = cx.debug_bounds("notes-editor").expect("the editor");
+        // In the URL, which starts the first line.
+        let at = editor.origin + point(px(40.0), px(16.0));
 
-        // "docs" starts the first line, inside the 12 px padding.
-        cx.simulate_click(view.origin + point(px(20.0), px(20.0)), Modifiers::none());
+        cx.simulate_click(at, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url(), None);
+        cx.simulate_mouse_move(at, None, Modifiers::command());
+        cx.run_until_parked();
+        cx.simulate_click(at, Modifiers::command());
         cx.run_until_parked();
         assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/docs"));
-        assert!(
-            !panel.read_with(cx, |p, _| p.editing()),
-            "a link isn't a click to edit"
-        );
-
-        // On the plain words, and below the text.
-        for at in [point(px(40.0), px(60.0)), point(px(200.0), px(300.0))] {
-            cx.simulate_click(view.origin + at, Modifiers::none());
-            cx.run_until_parked();
-            assert!(
-                !panel.read_with(cx, |p, _| p.editing()),
-                "clicked at {at:?}"
-            );
-        }
-
-        let edit = cx.debug_bounds("notes-edit").expect("Edit button").center();
-        cx.simulate_click(edit, Modifiers::none());
-        cx.run_until_parked();
-        assert!(panel.read_with(cx, |p, _| p.editing()));
+        assert_eq!(panel.read_with(cx, |p, cx| p.text(cx)), text);
         let _ = std::fs::remove_dir_all(root);
     }
 }

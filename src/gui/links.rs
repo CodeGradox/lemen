@@ -103,7 +103,7 @@ fn is_web(uri: &str) -> bool {
 
 /// The URL written out in `text` over the character at `at`: its first
 /// character and the one after its last.
-fn url_at(text: &[char], at: usize) -> Option<(usize, usize)> {
+pub(super) fn url_at(text: &[char], at: usize) -> Option<(usize, usize)> {
     let mut from = 0;
     while let Some((start, scheme)) = next_scheme(text, from) {
         let mut end = start + scheme;
