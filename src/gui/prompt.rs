@@ -1,14 +1,34 @@
 //! Names asked for in the spotlight: for a new worktree, a new thread or
 //! a rename, and what happens once one is given.
 
+use super::sidebar::claude_icon;
 use super::{Ask, Key, Lemur, Prompt, sessions, spotlight, worktree_label};
 use crate::actions;
 use crate::config::leaf;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectState};
-use gpui_kit::component::{ActiveTheme, IconName, IndexPath, Sizable, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, IndexPath, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+
+actions!(new_thread, [OtherKind]);
+
+/// Key context of the spotlight for a new thread.
+const NEW_THREAD: &str = "NewThread";
+
+/// ↑↓ pick Claude or Shell for a new thread. The name field goes first
+/// and passes on the keys it has no use for.
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("up", OtherKind, Some(NEW_THREAD)),
+        KeyBinding::new("down", OtherKind, Some(NEW_THREAD)),
+    ]);
+}
+
+/// What a new thread is called until you name it.
+fn default_label(shell: bool) -> &'static str {
+    if shell { "shell" } else { "claude" }
+}
 
 /// A new worktree's branch, empty for none, and the branch it starts
 /// from, picked from the host's branches once they've loaded.
@@ -36,8 +56,7 @@ impl Lemur {
     pub(super) fn ask_name(&mut self, what: Ask, window: &mut Window, cx: &mut Context<Self>) {
         let name = match &what {
             Ask::NewWorktree { base } => actions::random_name(|n| self.worktree_taken(*base, n)),
-            Ask::NewThread { shell: true, .. } => "shell".to_string(),
-            Ask::NewThread { shell: false, .. } => "claude".to_string(),
+            Ask::NewThread { shell, .. } => default_label(*shell).to_string(),
             Ask::Rename { session, .. } => actions::label(leaf(session)).to_string(),
         };
         let input = cx.new(|cx| {
@@ -134,43 +153,50 @@ impl Lemur {
     }
 
     /// The name field, in the spotlight: what it's for, the name, and a
-    /// hint or why the name can't be used.
-    pub(super) fn prompt_card(&self, prompt: &Prompt, cx: &App) -> Div {
-        let (icon, what, verb) = match &prompt.what {
+    /// hint or why the name can't be used. A new thread is Claude or a
+    /// shell, picked above the name.
+    pub(super) fn prompt_card(&self, prompt: &Prompt, cx: &Context<Self>) -> Div {
+        let mut kind = None;
+        let (icon, what, hint) = match &prompt.what {
             Ask::NewWorktree { base } => (
                 IconName::Folder,
                 format!("New worktree in {}", self.cfg.bases[*base].name()),
-                "start",
+                "⏎ start · esc cancel",
             ),
             Ask::NewThread {
                 base,
                 worktree,
                 shell,
-            } => (
-                if *shell {
-                    IconName::SquareTerminal
-                } else {
-                    IconName::Plus
-                },
-                format!(
-                    "New {} in {}",
-                    if *shell { "shell" } else { "Claude thread" },
-                    self.worktree_name(&self.cfg.bases[*base].host, worktree)
-                ),
-                "start",
-            ),
+            } => {
+                kind = Some(*shell);
+                (
+                    IconName::Plus,
+                    format!(
+                        "New in {}",
+                        self.worktree_name(&self.cfg.bases[*base].host, worktree)
+                    ),
+                    "↑↓ Claude or shell · ⏎ start · esc cancel",
+                )
+            }
             Ask::Rename { session, .. } => (
                 IconName::CaseSensitive,
                 format!("Rename {}", actions::label(leaf(session))),
-                "rename",
+                "⏎ rename · esc cancel",
             ),
         };
         let footer = match &prompt.error {
             Some((error, _)) => spotlight::footer(error.clone(), true, cx),
-            None => spotlight::footer(format!("⏎ {verb} · esc cancel"), false, cx),
+            None => spotlight::footer(hint, false, cx),
         };
         spotlight::card(cx)
             .child(spotlight::title(icon, what, cx))
+            .when_some(kind, |card, shell| {
+                card.key_context(NEW_THREAD)
+                    .on_action(cx.listener(move |this, _: &OtherKind, window, cx| {
+                        this.pick_kind(!shell, window, cx)
+                    }))
+                    .child(kinds(shell, cx))
+            })
             .child(
                 div()
                     .p_1()
@@ -194,6 +220,62 @@ impl Lemur {
                 )
             })
             .child(footer)
+    }
+
+    /// Picks Claude or, with `shell`, a shell for the new thread asked for.
+    /// The name follows, unless you typed one.
+    fn pick_kind(&mut self, shell: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Prompt {
+            what: Ask::NewThread { shell: picked, .. },
+            input,
+            ..
+        }) = &mut self.prompt
+        else {
+            return;
+        };
+        if *picked != shell {
+            let typed = input.read(cx).value() != default_label(*picked);
+            *picked = shell;
+            if !typed {
+                input.update(cx, |i, cx| {
+                    i.set_value(default_label(shell), window, cx);
+                    i.select_all(window, cx);
+                });
+            }
+        }
+        // A click on a kind took the keyboard.
+        input.update(cx, |i, cx| i.focus(window, cx));
+        cx.notify();
+    }
+
+    /// ⌘J: asks for a new Claude thread or shell in the worktree of the one
+    /// on show.
+    pub(super) fn new_thread_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt.is_some() || self.picker.is_some() {
+            return;
+        }
+        let Some((host, session)) = self.active.clone() else {
+            return;
+        };
+        let Some((worktree, _)) = self.worktree_of(&host, &session) else {
+            return;
+        };
+        let base = self
+            .snap
+            .hosts
+            .iter()
+            .filter(|h| h.name == host)
+            .flat_map(|h| h.bases.iter())
+            .find(|b| b.worktrees.iter().any(|w| w.path == worktree))
+            .map(|b| b.index);
+        if let Some(base) = base {
+            let ask = Ask::NewThread {
+                base,
+                worktree,
+                shell: false,
+            };
+            self.ask_name(ask, window, cx);
+        }
     }
 
     pub(super) fn close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -295,6 +377,11 @@ impl Lemur {
             view.update(cx, |v, _| v.session = new.clone());
             self.terminals.insert(new_key.clone(), view);
         }
+        for key in &mut self.recent {
+            if *key == old_key {
+                *key = new_key.clone();
+            }
+        }
         if self.active.as_ref() == Some(&old_key) {
             self.active = Some(new_key);
             self.remember(host, new);
@@ -330,6 +417,36 @@ impl Lemur {
             sessions(&self.snap).any(|(h, s)| h == b.host && s.name == session)
         })
     }
+}
+
+/// Claude and Shell, to pick from for a new thread; with `shell` the
+/// shell is picked.
+fn kinds(shell: bool, cx: &Context<Lemur>) -> Div {
+    let theme = cx.theme();
+    let row = |label: &'static str, icon: Icon, is_shell: bool| {
+        h_flex()
+            .id(label)
+            .debug_selector(move || format!("kind {label}"))
+            .px_2()
+            .py_1()
+            .gap_2()
+            .rounded(theme.radius)
+            .text_sm()
+            .cursor_pointer()
+            .when(shell == is_shell, |row| {
+                row.bg(theme.accent).text_color(theme.accent_foreground)
+            })
+            .child(icon.small())
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| this.pick_kind(is_shell, window, cx)))
+    };
+    v_flex()
+        .p_1()
+        .gap_0p5()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(row("Claude", claude_icon(), false))
+        .child(row("Shell", Icon::new(IconName::SquareTerminal), true))
 }
 
 /// A line of the new worktree's fields: what it is, then the field.

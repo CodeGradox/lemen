@@ -6,7 +6,7 @@ use crate::actions;
 use crate::config::{Base, COLORS};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex};
@@ -152,7 +152,7 @@ impl Lemur {
             .icon(IconName::RefreshCw)
             .ghost()
             .xsmall()
-            .tooltip("Refresh (⌘R)")
+            .tooltip("Refresh")
             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx).detach()));
         // Collapsing hides the cached view whole (see render).
         Sidebar::new("sessions")
@@ -233,24 +233,17 @@ impl Lemur {
                     })
             };
             let (this, worktree) = (this.clone(), worktree.clone());
+            // The spotlight asks Claude or Shell, as ⌘J does.
             let add = Button::new("add")
                 .icon(IconName::Plus)
                 .ghost()
                 .xsmall()
-                .tooltip("New session here")
-                .dropdown_menu(move |menu, _, _| {
-                    let item = |label: &'static str, shell: bool| {
-                        let worktree = worktree.clone();
-                        PopupMenuItem::new(label).on_click(ask_on_click(&this, move || {
-                            Ask::NewThread {
-                                base,
-                                worktree: worktree.clone(),
-                                shell,
-                            }
-                        }))
-                    };
-                    menu.item(item("Claude", false)).item(item("Shell", true))
-                });
+                .tooltip("New Claude thread or shell here")
+                .on_click(ask_on_click(&this, move || Ask::NewThread {
+                    base,
+                    worktree: worktree.clone(),
+                    shell: false,
+                }));
             h_flex().gap_1().child(notes).child(add)
         };
         rows::Entry::Worktree {
@@ -371,9 +364,7 @@ impl Lemur {
                 .child(kill)
         };
         let icon = if s.runs_claude() {
-            Icon::empty()
-                .data(CLAUDE_ICON)
-                .text_color(rgb(CLAUDE_ORANGE))
+            claude_icon()
         } else {
             Icon::new(IconName::SquareTerminal)
         };
@@ -461,6 +452,13 @@ fn title_case(name: &str) -> String {
         .next()
         .map(|c| c.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+/// Claude's spark, in Claude's orange.
+pub(super) fn claude_icon() -> Icon {
+    Icon::empty()
+        .data(CLAUDE_ICON)
+        .text_color(rgb(CLAUDE_ORANGE))
 }
 
 /// A click handler that opens the name field for `ask()`.

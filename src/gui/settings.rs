@@ -6,10 +6,11 @@ use super::terminal::{Palette, SLOTS, Slot, set_color};
 use crate::config::{Config, FONT_SIZES, Terminal, ThemeChoice};
 use alacritty_terminal::vte::ansi::Rgb;
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::setting::{
     NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
-use gpui_kit::component::{ActiveTheme, IconName, Sizable, Theme, ThemeMode, v_flex};
+use gpui_kit::component::{ActiveTheme, IconName, Sizable, Theme, ThemeMode, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::path::PathBuf;
@@ -273,6 +274,23 @@ impl Render for SettingsView {
             SettingPage::new("Terminal colors")
                 .icon(IconName::Palette)
                 .groups([self.color_group(true), self.color_group(false)]),
+            SettingPage::new("Shortcuts")
+                // Not among gpui-component's own icons; the full set has it.
+                .icon(gpui_kit::assets::IconName::Keyboard)
+                .groups(SHORTCUTS.iter().map(|(title, shortcuts)| {
+                    SettingGroup::new()
+                        .title(*title)
+                        .items(shortcuts.iter().map(|s| {
+                            let item = SettingItem::new(
+                                s.what,
+                                SettingField::render(|_, _, _| s.how.render()),
+                            );
+                            match s.more {
+                                Some(more) => item.description(more),
+                                None => item,
+                            }
+                        }))
+                })),
         ]);
         let error = Prefs::get(cx).error.clone();
         let danger = cx.theme().danger;
@@ -296,6 +314,121 @@ impl Render for SettingsView {
             })
     }
 }
+
+/// A shortcut on the Shortcuts page.
+struct Shortcut {
+    what: &'static str,
+    how: Press,
+    more: Option<&'static str>,
+}
+
+/// How a shortcut goes: keys, one after another as alternatives, or a
+/// click with keys held.
+enum Press {
+    Keys(&'static [&'static str]),
+    Click(&'static str),
+}
+
+impl Press {
+    fn render(&self) -> AnyElement {
+        match self {
+            Press::Keys(keys) => h_flex()
+                .gap_1()
+                .children(
+                    keys.iter()
+                        .filter_map(|key| Keystroke::parse(key).ok())
+                        .map(Kbd::new),
+                )
+                .into_any_element(),
+            Press::Click(click) => div().text_sm().child(*click).into_any_element(),
+        }
+    }
+}
+
+const fn keys(what: &'static str, keys: &'static [&'static str]) -> Shortcut {
+    Shortcut {
+        what,
+        how: Press::Keys(keys),
+        more: None,
+    }
+}
+
+/// lemur's shortcuts, group by group: the keys `bind_keys` binds, and the
+/// ones the terminal, the notes and the spotlights take themselves.
+const SHORTCUTS: &[(&str, &[Shortcut])] = &[
+    (
+        "Window",
+        &[
+            keys("Toggle the sidebar", &["cmd-b"]),
+            keys("Toggle the notes", &["cmd-r"]),
+            keys("Add a project", &["cmd-o"]),
+            keys("Settings", &["cmd-,"]),
+            keys("Close Settings", &["cmd-w"]),
+            keys("Hide lemur", &["cmd-h"]),
+            keys("Hide the other apps", &["alt-cmd-h"]),
+            keys("Quit lemur", &["cmd-q"]),
+        ],
+    ),
+    (
+        "Threads",
+        &[
+            Shortcut {
+                what: "New Claude thread or shell",
+                how: Press::Keys(&["cmd-j"]),
+                more: Some("In the worktree of the thread on show."),
+            },
+            Shortcut {
+                what: "Next thread in the worktree",
+                how: Press::Keys(&["ctrl-tab"]),
+                more: Some(
+                    "The one opened before it; hold ⌃ and press Tab again to go further back.",
+                ),
+            },
+            keys("Previous thread in the worktree", &["ctrl-shift-tab"]),
+        ],
+    ),
+    (
+        "Terminal",
+        &[
+            Shortcut {
+                what: "Paste",
+                how: Press::Keys(&["cmd-v"]),
+                more: Some("An image or copied files go to the host, and their paths are pasted."),
+            },
+            Shortcut {
+                what: "Open a link",
+                how: Press::Click("⌘-click"),
+                more: Some("Holding ⌘ underlines it first."),
+            },
+        ],
+    ),
+    (
+        "Notes",
+        &[Shortcut {
+            what: "Open a link",
+            how: Press::Click("⌘-click"),
+            more: Some("Holding ⌘ underlines it first."),
+        }],
+    ),
+    (
+        "Naming in the spotlight",
+        &[
+            keys("Pick Claude or Shell, for a new thread", &["up", "down"]),
+            keys("Start or rename", &["enter"]),
+            keys("Next field", &["tab"]),
+            keys("Cancel", &["escape"]),
+        ],
+    ),
+    (
+        "Adding a project",
+        &[
+            keys("Choose a folder", &["up", "down"]),
+            keys("Go into the folder", &["tab"]),
+            keys("Add it", &["enter"]),
+            keys("Close", &["escape"]),
+        ],
+    ),
+];
 
 fn to_hsla(c: Rgb) -> Hsla {
     rgb(u32::from(c.r) << 16 | u32::from(c.g) << 8 | u32::from(c.b)).into()
@@ -339,11 +472,11 @@ fn monospace_fonts(cx: &App) -> Vec<SharedString> {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Prefs, SettingsView, open, to_hsla};
+    use super::{Prefs, Press, SHORTCUTS, SettingsView, open, to_hsla};
     use crate::config::ThemeChoice;
     use crate::gui::terminal::{DARK, Palette, Slot, set_color};
     use gpui_kit::component::ActiveTheme;
-    use gpui_kit::hsla;
+    use gpui_kit::{Keystroke, hsla};
 
     /// A color picked in Settings becomes that slot's color and is kept;
     /// a reset puts lemur's own back, in the picker too.
@@ -387,6 +520,34 @@ mod tests {
             assert!(cx.theme().is_dark());
             Prefs::update(cx, |p| p.theme = ThemeChoice::Light);
             assert!(!cx.theme().is_dark());
+        });
+    }
+
+    /// The Shortcuts page's keys parse, and the window's and the threads'
+    /// are the ones bound.
+    #[gpui::test]
+    fn the_shortcuts_page_shows_bound_keys(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::gui::bind_keys(cx);
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            for (group, shortcuts) in SHORTCUTS {
+                for shortcut in *shortcuts {
+                    let Press::Keys(keys) = shortcut.how else {
+                        continue;
+                    };
+                    for key in keys {
+                        let stroke = Keystroke::parse(key).unwrap();
+                        if ["Window", "Threads"].contains(group) {
+                            let bound = keymap.bindings().any(|b| {
+                                b.keystrokes().len() == 1
+                                    && b.keystrokes()[0].to_string() == stroke.to_string()
+                            });
+                            assert!(bound, "{key} isn't bound");
+                        }
+                    }
+                }
+            }
         });
     }
 

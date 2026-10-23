@@ -3,6 +3,7 @@
 //! Every session you open keeps its own terminal (`tmux attach` over SSH),
 //! so switching is instant and scrollback survives.
 
+mod cycle;
 mod folder_picker;
 mod keys;
 mod links;
@@ -48,7 +49,10 @@ actions!(
         Refresh,
         Hide,
         HideOthers,
-        ShowAll
+        ShowAll,
+        NextThread,
+        PreviousThread,
+        NewThreadHere
     ]
 );
 
@@ -60,14 +64,19 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-o", AddProject, None),
-        KeyBinding::new("cmd-r", Refresh, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
+        // As Zed's right dock; Refresh does without a key.
+        KeyBinding::new("cmd-r", ToggleNotes, None),
+        KeyBinding::new("ctrl-tab", NextThread, None),
+        KeyBinding::new("ctrl-shift-tab", PreviousThread, None),
+        KeyBinding::new("cmd-j", NewThreadHere, None),
         KeyBinding::new("cmd-w", settings::CloseWindow, Some(settings::CONTEXT)),
         // gpui-component's Root moves focus on Tab; in a terminal it belongs to the program.
         KeyBinding::new("tab", NoAction, Some(terminal_view::CONTEXT)),
         KeyBinding::new("shift-tab", NoAction, Some(terminal_view::CONTEXT)),
     ]);
     folder_picker::bind_keys(cx);
+    prompt::bind_keys(cx);
 }
 
 const REFRESH: Duration = Duration::from_secs(3);
@@ -141,6 +150,11 @@ struct Lemur {
     loaded: bool,
     terminals: HashMap<Key, Entity<TerminalView>>,
     active: Option<Key>,
+    /// Threads by when they were last opened, the latest first.
+    recent: Vec<Key>,
+    /// ⌃Tab going through a worktree's threads: in which order, and where
+    /// it's at. It ends when ⌃ comes up.
+    cycling: Option<(Vec<Key>, usize)>,
     collapsed: bool,
     /// The side panels' widths; the config keeps them once a drag ends.
     sidebar_width: Pixels,
@@ -207,12 +221,16 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 ]),
                 Menu::new("File").items([
                     MenuItem::action("Add Project…", AddProject),
+                    MenuItem::action("New Thread in Worktree…", NewThreadHere),
                     MenuItem::separator(),
                     MenuItem::action("Refresh", Refresh),
                 ]),
                 Menu::new("View").items([
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),
                     MenuItem::action("Toggle Notes", ToggleNotes),
+                    MenuItem::separator(),
+                    MenuItem::action("Next Thread in Worktree", NextThread),
+                    MenuItem::action("Previous Thread in Worktree", PreviousThread),
                 ]),
             ]);
             let options = WindowOptions {
@@ -302,6 +320,8 @@ impl Lemur {
             loaded: false,
             terminals: HashMap::new(),
             active: None,
+            recent: vec![],
+            cycling: None,
             collapsed: false,
             sidebar_width,
             notes_width,
@@ -497,6 +517,10 @@ impl Lemur {
         }
         self.done.remove(&key);
         self.close_popup(&key, cx);
+        // ⌃Tab keeps the order it started with until ⌃ comes up.
+        if self.cycling.is_none() {
+            self.touch(key.clone());
+        }
         self.active = Some(key);
         self.confirm_kill = None;
         if let Some((worktree, label)) = self.worktree_of(&host, &session) {
@@ -715,7 +739,7 @@ impl Lemur {
                 })
                 .ghost()
                 .small()
-                .tooltip("Notes")
+                .tooltip("Toggle notes (⌘R)")
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_notes(cx))),
         )
     }
@@ -765,6 +789,22 @@ impl Render for Lemur {
             .on_action(cx.listener(|this, _: &ToggleNotes, _, cx| this.toggle_notes(cx)))
             .on_action(cx.listener(|this, _: &AddProject, window, cx| this.open_picker(window, cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx).detach()))
+            .on_action(
+                cx.listener(|this, _: &NewThreadHere, window, cx| this.new_thread_here(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &NextThread, window, cx| {
+                    this.cycle_threads(false, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &PreviousThread, window, cx| {
+                this.cycle_threads(true, window, cx)
+            }))
+            .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, _, _| {
+                if !e.modifiers.control {
+                    this.end_cycle();
+                }
+            }))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 if e.keystroke.key == "escape" && this.prompt.is_some() {
                     this.close_prompt(window, cx);
@@ -1142,6 +1182,52 @@ mod tests {
         app.update(cx, |app, cx| app.refresh(cx).detach());
         cx.run_until_parked();
         assert_eq!(consistent(cx), ["/srv/three", "/srv/one", "/srv/two"]);
+    }
+
+    /// ⌃Tab goes through the threads, the one opened last first: holding ⌃
+    /// goes further, letting go settles there, and ⌃⇧Tab goes back. From
+    /// the menu, with no ⌃, it goes one and settles.
+    #[gpui::test]
+    fn ctrl_tab_goes_through_threads_by_when_they_were_opened(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("cycle");
+        for name in ["a", "b", "c"] {
+            server.tmux(&["new-session", "-d", "-s", name]);
+        }
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        for name in ["a", "b", "c"] {
+            open(&app, name, cx);
+        }
+        let shown = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| app.active.clone().map(|(_, s)| s))
+        };
+        // ⌃ goes down before Tab, as on a keyboard, and comes up after.
+        let hold = |modifiers: Modifiers, cx: &mut VisualTestContext| {
+            cx.simulate_modifiers_change(modifiers)
+        };
+        let let_go = |cx: &mut VisualTestContext| cx.simulate_modifiers_change(Modifiers::none());
+
+        hold(Modifiers::control(), cx);
+        cx.simulate_keystrokes("ctrl-tab");
+        assert_eq!(shown(cx).as_deref(), Some("b"));
+        cx.simulate_keystrokes("ctrl-tab");
+        assert_eq!(shown(cx).as_deref(), Some("a"));
+        let_go(cx);
+        // a is the latest now, then c, then b.
+        hold(Modifiers::control(), cx);
+        cx.simulate_keystrokes("ctrl-tab");
+        assert_eq!(shown(cx).as_deref(), Some("c"));
+        let_go(cx);
+        hold(Modifiers::control_shift(), cx);
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        assert_eq!(shown(cx).as_deref(), Some("b"));
+        let_go(cx);
+
+        cx.dispatch_action(super::NextThread);
+        assert_eq!(shown(cx).as_deref(), Some("c"));
+        app.read_with(cx, |app, _| assert!(app.cycling.is_none(), "settled"));
     }
 
     /// Opening a thread points the notes at its worktree without opening
@@ -1535,6 +1621,83 @@ mod tests {
         assert_eq!(current("loose"), "", "detached");
     }
 
+    /// ⌘J asks for a new thread in the worktree on show: Claude or Shell,
+    /// picked with ↑↓ or a click, and its name, which follows the pick until
+    /// you type one.
+    #[gpui::test]
+    fn cmd_j_asks_for_claude_or_a_shell_here(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("cmd-j");
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", "/srv/api"));
+        let (app, cx) = rooted(cfg, cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        let wt = "/srv/api/.claude/worktrees/auth";
+        let snap = Snapshot {
+            hosts: vec![HostView {
+                name: "local".into(),
+                error: None,
+                bases: vec![BaseView {
+                    index: 0,
+                    error: None,
+                    plain: false,
+                    worktrees: vec![Worktree {
+                        path: wt.into(),
+                        branch: Some("worktree-auth".into()),
+                        head: None,
+                        main: false,
+                        sessions: snapshot(&[("api/t", Activity::Idle)]).hosts.remove(0).other,
+                    }],
+                }],
+                other: vec![],
+            }],
+        };
+        cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
+        // Nothing on show, nowhere to start.
+        cx.simulate_keystrokes("cmd-j");
+        app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
+        open(&app, "api/t", cx);
+        cx.run_until_parked();
+        let asked = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, cx| {
+                let prompt = app.prompt.as_ref().expect("asking");
+                let Ask::NewThread {
+                    worktree, shell, ..
+                } = &prompt.what
+                else {
+                    panic!("not a new thread");
+                };
+                assert_eq!(worktree, wt);
+                (*shell, prompt.input.read(cx).value().to_string())
+            })
+        };
+
+        cx.simulate_keystrokes("cmd-j");
+        cx.run_until_parked();
+        assert_eq!(asked(cx), (false, "claude".into()));
+        cx.simulate_keystrokes("down");
+        assert_eq!(asked(cx), (true, "shell".into()));
+        cx.simulate_input("build");
+        cx.simulate_keystrokes("up");
+        assert_eq!(asked(cx), (false, "build".into()), "a typed name stays");
+        let shell = cx
+            .debug_bounds("kind Shell")
+            .expect("the Shell row")
+            .center();
+        cx.simulate_click(shell, Modifiers::none());
+        assert_eq!(asked(cx), (true, "build".into()));
+        cx.simulate_keystrokes("escape");
+        app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
+
+        // Let the terminal's attach attempt end before the server cleans up.
+        wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, cx| {
+                app.terminals.values().all(|t| t.read(cx).exited())
+            })
+        });
+    }
+
     /// Names are asked for in the spotlight: a bad one is explained there
     /// rather than in the header, and Esc closes it.
     #[gpui::test]
@@ -1659,7 +1822,7 @@ mod tests {
     }
 
     /// The menus' actions and keys reach the main window: ⌘O opens the
-    /// folder picker, Toggle Notes the notes, ⌘R refreshes.
+    /// folder picker, ⌘R toggles the notes, Refresh refreshes.
     #[gpui::test]
     fn menu_actions_reach_the_main_window(cx: &mut gpui::TestAppContext) {
         let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
@@ -1670,11 +1833,13 @@ mod tests {
         cx.simulate_keystrokes("escape");
         app.read_with(cx, |app, _| assert!(app.picker.is_none()));
 
-        cx.dispatch_action(super::ToggleNotes);
+        cx.simulate_keystrokes("cmd-r");
         app.read_with(cx, |app, _| assert!(app.notes_open));
+        cx.simulate_keystrokes("cmd-r");
+        app.read_with(cx, |app, _| assert!(!app.notes_open));
 
         app.update(cx, |app, _| app.loaded = false);
-        cx.simulate_keystrokes("cmd-r");
+        cx.dispatch_action(super::Refresh);
         cx.run_until_parked();
         app.read_with(cx, |app, _| assert!(app.loaded, "a refresh came in"));
     }
