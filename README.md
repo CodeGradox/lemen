@@ -2,6 +2,8 @@
 
 A macOS app for Claude Code sessions that live in tmux on a remote host: a sidebar of sessions next to a built-in terminal (`ssh -t host tmux attach`). Sessions keep running when your laptop sleeps.
 
+[![lemur in use: Claude threads by project and worktree, answering one that waits, ⌘J for a new shell, ⌃Tab between threads, a pasted screenshot, and notes](docs/demo.avif)](docs/demo.avif)
+
 ## Install
 
 Download `lemur-macos-arm64.dmg` from the [latest release](https://github.com/CodeGradox/lemur/releases/latest), open it and drag lemur into Applications. It's signed and notarized, and needs Apple Silicon and macOS 11 or newer.
