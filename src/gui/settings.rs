@@ -404,11 +404,24 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
     ),
     (
         "Notes",
-        &[Shortcut {
-            what: "Open a link",
-            how: Press::Click("⌘-click"),
-            more: Some("Holding ⌘ underlines it first."),
-        }],
+        &[
+            Shortcut {
+                what: "Open a link",
+                how: Press::Click("⌘-click"),
+                more: Some("Holding ⌘ underlines it first."),
+            },
+            Shortcut {
+                what: "Tick a box",
+                how: Press::Click("⌘-click"),
+                more: Some("The [ ] of a - [ ] item; again unticks it."),
+            },
+            keys("Tick the box on the cursor's line", &["cmd-enter"]),
+            Shortcut {
+                what: "Next item with a box",
+                how: Press::Keys(&["enter"]),
+                more: Some("At the end of a - [ ] item; on an empty one, it ends the list."),
+            },
+        ],
     ),
     (
         "Naming in the spotlight",
