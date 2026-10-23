@@ -57,6 +57,72 @@ impl Lemur {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let mut groups: Vec<rows::Group> = vec![];
+        // Projects first, in the config's order whatever their host; then
+        // each host's threads outside them, or why it couldn't be reached.
+        let mut projects: Vec<_> = self
+            .snap
+            .hosts
+            .iter()
+            .flat_map(|h| h.bases.iter().map(move |b| (h, b)))
+            .collect();
+        projects.sort_by_key(|(_, b)| b.index);
+        let move_project: rows::Reorder = {
+            let this = this.clone();
+            Rc::new(move |from, to, _, cx| {
+                this.update(cx, |this, cx| this.reorder_projects(from, to, cx))
+                    .ok();
+            })
+        };
+        for (h, b) in projects {
+            let base = &self.cfg.bases[b.index];
+            let index = b.index;
+            let reorder: rows::Reorder = {
+                let this = this.clone();
+                Rc::new(move |from, to, _, cx| {
+                    this.update(cx, |this, cx| this.reorder_worktrees(index, from, to, cx))
+                        .ok();
+                })
+            };
+            let mut menu = rows::Menu::default()
+                .reorder_worktrees(format!("project {}\n{}", base.host, base.path), reorder);
+            // A folder without git has no worktrees to add.
+            if !b.plain {
+                menu = menu.child(rows::Entry::Item(Box::new(
+                    SidebarMenuItem::new("New worktree")
+                        .icon(IconName::Plus)
+                        .on_click(ask_on_click(&this, move || Ask::NewWorktree {
+                            base: index,
+                        })),
+                )));
+            }
+            if let Some(e) = &b.error {
+                menu = menu.child(rows::Entry::Item(Box::new(
+                    SidebarMenuItem::new(e.clone())
+                        .icon(IconName::TriangleAlert)
+                        .disable(true),
+                )));
+            }
+            let prefix = format!("{}/", base.name());
+            for w in &b.worktrees {
+                // The main checkout and a plain folder are the project itself.
+                let removable = !w.main;
+                menu = menu.child(self.worktree_item(&h.name, index, w, removable, &prefix, cx));
+            }
+            let toggle: rows::Toggle = {
+                let this = this.clone();
+                Rc::new(move |_, cx| {
+                    this.update(cx, |this, cx| this.toggle_project(index, cx))
+                        .ok();
+                })
+            };
+            // Projects move by their place in the config.
+            groups.push(
+                rows::Group::new(format!("{} · {}", base.name(), h.name), menu)
+                    .foldable(base.collapsed, toggle)
+                    .draggable("projects", index, move_project.clone())
+                    .menu(self.project_menu(index, cx)),
+            );
+        }
         for h in &self.snap.hosts {
             if let Some(e) = &h.error {
                 groups.push(rows::Group::new(
@@ -67,58 +133,7 @@ impl Lemur {
                             .disable(true),
                     ))),
                 ));
-                continue;
-            }
-            for b in &h.bases {
-                let base = &self.cfg.bases[b.index];
-                let index = b.index;
-                let reorder: rows::Reorder = {
-                    let this = this.clone();
-                    Rc::new(move |from, to, _, cx| {
-                        this.update(cx, |this, cx| this.reorder_worktrees(index, from, to, cx))
-                            .ok();
-                    })
-                };
-                let mut menu = rows::Menu::default()
-                    .reorder_worktrees(format!("project {}\n{}", base.host, base.path), reorder);
-                // A folder without git has no worktrees to add.
-                if !b.plain {
-                    menu = menu.child(rows::Entry::Item(Box::new(
-                        SidebarMenuItem::new("New worktree")
-                            .icon(IconName::Plus)
-                            .on_click(ask_on_click(&this, move || Ask::NewWorktree {
-                                base: index,
-                            })),
-                    )));
-                }
-                if let Some(e) = &b.error {
-                    menu = menu.child(rows::Entry::Item(Box::new(
-                        SidebarMenuItem::new(e.clone())
-                            .icon(IconName::TriangleAlert)
-                            .disable(true),
-                    )));
-                }
-                let prefix = format!("{}/", base.name());
-                for w in &b.worktrees {
-                    // The main checkout and a plain folder are the project itself.
-                    let removable = !w.main;
-                    menu =
-                        menu.child(self.worktree_item(&h.name, index, w, removable, &prefix, cx));
-                }
-                let toggle: rows::Toggle = {
-                    let this = this.clone();
-                    Rc::new(move |_, cx| {
-                        this.update(cx, |this, cx| this.toggle_project(index, cx))
-                            .ok();
-                    })
-                };
-                groups.push(
-                    rows::Group::new(format!("{} · {}", base.name(), h.name), menu)
-                        .foldable(base.collapsed, toggle)
-                        .menu(self.project_menu(index, cx)),
-                );
-            }
-            if !h.other.is_empty() {
+            } else if !h.other.is_empty() {
                 let threads = self.threads(&h.name, None, &h.other, "", cx);
                 groups.push(rows::Group::new(
                     format!("other · {}", h.name),

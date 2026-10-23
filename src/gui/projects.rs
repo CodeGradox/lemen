@@ -3,7 +3,7 @@
 
 use super::folder_picker::{FolderPicker, HostChoice, PickerEvent};
 use super::settings::Prefs;
-use super::{Lemur, move_item};
+use super::{Lemur, move_item, moved_to};
 use crate::actions;
 use crate::browse;
 use crate::config::{Base, Config, Host, home};
@@ -129,6 +129,27 @@ impl Lemur {
         // A refresh already under way sorts by the old order.
         self.changes += 1;
         self.save_look(index, cx);
+    }
+
+    /// Moves the project at `from` in the config's bases to `to`: the
+    /// sidebar shows them in that order, and the config file's `[[bases]]`
+    /// keep it.
+    pub(super) fn reorder_projects(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if !move_item(&mut self.cfg.bases, from, to) {
+            return;
+        }
+        // The snapshot points into the config's bases by index: renumber
+        // its views, and drop snapshots on their way that use the old numbers.
+        for b in self.snap.hosts.iter_mut().flat_map(|h| h.bases.iter_mut()) {
+            b.index = moved_to(b.index, from, to);
+        }
+        self.changes += 1;
+        if let Some(file) = Prefs::get(cx).config_file()
+            && let Err(e) = Config::save_project_order(file, &self.cfg.bases)
+        {
+            self.fail(e, cx);
+        }
+        cx.notify();
     }
 
     /// Keeps a project's color, fold and worktree order in the config file.

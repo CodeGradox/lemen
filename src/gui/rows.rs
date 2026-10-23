@@ -1,5 +1,5 @@
-//! Sidebar rows lemur draws itself, so threads and worktrees can be
-//! dragged into a new order and projects folded:
+//! Sidebar rows lemur draws itself, so threads, worktrees and projects can
+//! be dragged into a new order and projects folded:
 //! gpui-component's SidebarMenuItem and SidebarGroup can't. They copy its
 //! look.
 
@@ -138,6 +138,8 @@ pub struct Group {
     menu: Option<MenuBuilder>,
     folded: bool,
     toggle: Option<Toggle>,
+    /// The list it can be dragged within, its place there, and the move.
+    drag: Option<(SharedString, usize, Reorder)>,
     rows: Menu,
 }
 
@@ -148,12 +150,25 @@ impl Group {
             menu: None,
             folded: false,
             toggle: None,
+            drag: None,
             rows,
         }
     }
 
     pub fn menu(mut self, menu: MenuBuilder) -> Self {
         self.menu = Some(menu);
+        self
+    }
+
+    /// Lets its name be dragged onto another group's in the list `key`,
+    /// where it's at `index`, to take that one's place.
+    pub fn draggable(
+        mut self,
+        key: impl Into<SharedString>,
+        index: usize,
+        reorder: Reorder,
+    ) -> Self {
+        self.drag = Some((key.into(), index, reorder));
         self
     }
 
@@ -188,6 +203,7 @@ impl SidebarItem for Group {
         let hover_group = SharedString::from(format!("{id}-header"));
         let muted = theme.sidebar_foreground.opacity(0.7);
         let label = self.label.clone();
+        let dragged_label = self.label.clone();
         let name = h_flex()
             .gap_1p5()
             .items_center()
@@ -216,6 +232,12 @@ impl SidebarItem for Group {
                 this.cursor_pointer()
                     .on_click(move |_, window, cx| toggle(window, cx))
             });
+        let header = match self.drag {
+            Some((key, index, reorder)) => {
+                draggable(header, key, index, dragged_label, reorder, cx)
+            }
+            None => header,
+        };
         let header = match self.menu {
             Some(menu) => {
                 let dropdown = menu.clone();

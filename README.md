@@ -55,13 +55,13 @@ path = "~/projects/api"
 # worktree_colors = { "/path/to/worktree" = "blue" }  # red orange yellow green teal cyan blue purple pink gray
 ```
 
-Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, and the sidebar writes a project's `collapsed`, `worktree_order` and `worktree_colors`; the rest of the file, comments included, stays as it is.
+Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, and the sidebar writes a project's `collapsed`, `worktree_order` and `worktree_colors`, and the order of the `[[bases]]`; the rest of the file, comments included, stays as it is.
 
 New worktrees go in `worktree_dir` (relative to the repo, absolute, or `~/...`): lemur runs `git worktree add` there, then starts Claude in it.
 
 ## Use
 
-Run `lemur`. The sidebar lists each base's worktrees and their sessions; it refreshes every 3 s. A worktree shows as its branch (`worktree-` dropped from the branches `claude -w` and older lemurs made), or its folder's name when detached.
+Run `lemur`. The sidebar lists each base's worktrees and their sessions, in the config's order whatever their host, then each host's sessions outside them (*other*); it refreshes every 3 s. A worktree shows as its branch (`worktree-` dropped from the branches `claude -w` and older lemurs made), or its folder's name when detached.
 
 - **+** at the top of the sidebar adds a folder, as in Zed: pick a host (yours from the config, an alias from `~/.ssh/config`, or This Mac; or type `user@host`), then type the path while its folders are suggested (↑↓ to choose, Tab to go into one, Enter to add). A git repository shows each of its worktrees; a folder without git is a single row, with no **New worktree**. A folder inside a repository adds the repository. It's saved to the config as a `[[bases]]` entry, with a `[[hosts]]` entry for a new host.
 - Click a session to show it. Each opened session keeps its own terminal, so switching is instant. lemur reopens the last session on launch.
@@ -71,6 +71,7 @@ Run `lemur`. The sidebar lists each base's worktrees and their sessions; it refr
 - Click a project's name to fold it away, or open it again.
 - Right-click a worktree → **Color** to give its folder icon one of ten colors.
 - Drag a worktree onto another in the same project to move it there.
+- Drag a project's name onto another's to move it there, whatever their hosts; the config's `[[bases]]` take the new order, each entry with its comments.
 - A project's **⋯** (on hover) or right-click → **Remove project…** takes it out of lemur and the config. Nothing on the host changes, and its running threads move to *other*.
 - Double-click a session, or right-click → **Rename…**, to change its label. Only the thread's tmux name changes (its random words stay); Claude keeps running and its worktree and branch keep their names.
 - Drag a thread onto another in the same worktree to move it to that place. The order is stored on the tmux sessions (`@lemur_order`), so it survives restarts and is the same from any Mac; new threads start at the bottom.

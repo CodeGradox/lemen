@@ -868,6 +868,20 @@ fn move_item<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
     true
 }
 
+/// Where the item that was at `index` is once `move_item` has moved the
+/// one at `from` to `to`.
+fn moved_to(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
 fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
     snap.hosts.iter().flat_map(|h| {
         let in_bases = h
@@ -906,9 +920,9 @@ mod tests {
     use super::folder_picker::HostChoice;
     use super::{
         Ask, Key, Lemur, MIN_NOTES, MIN_SIDEBAR, MIN_TERMINAL, NOTES_WIDTH, NotificationEvent,
-        SIDEBAR_WIDTH,
+        SIDEBAR_WIDTH, move_item, moved_to,
     };
-    use crate::config::{Base, Config};
+    use crate::config::{Base, Config, Host};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
     use crate::test_support::{TempDir, TmuxServer, git_in, wait_until};
     use gpui::VisualTestContext;
@@ -1063,6 +1077,70 @@ mod tests {
         across(edge(widths(cx).1), px(990.0), cx);
         assert_eq!(widths(cx).1, MIN_NOTES);
         assert_eq!(kept(cx), (None, Some(f32::from(MIN_NOTES))));
+    }
+
+    #[test]
+    fn moved_to_follows_move_item() {
+        for from in 0..4 {
+            for to in 0..4 {
+                let mut items: Vec<usize> = (0..4).collect();
+                move_item(&mut items, from, to);
+                for (place, &item) in items.iter().enumerate() {
+                    assert_eq!(moved_to(item, from, to), place, "{from} -> {to}");
+                }
+            }
+        }
+    }
+
+    /// Dropping a project's name on another's moves it to that place,
+    /// whatever its host: in the sidebar, the config and the snapshot's
+    /// views, before and after a refresh.
+    #[gpui::test]
+    fn dragging_a_project_reorders_the_sidebar(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("move-project");
+        let mut cfg = server.config();
+        let mut mac = Host::new("mac", "local");
+        mac.tmux_socket = cfg.hosts[0].tmux_socket.clone();
+        cfg.hosts.push(mac);
+        for (host, path) in [
+            ("local", "/srv/one"),
+            ("local", "/srv/two"),
+            ("mac", "/srv/three"),
+        ] {
+            cfg.bases.push(Base::new(host, path));
+        }
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let consistent = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                for h in &app.snap.hosts {
+                    assert_eq!(h.bases.len(), if h.name == "mac" { 1 } else { 2 });
+                    for b in &h.bases {
+                        assert_eq!(app.cfg.bases[b.index].host, h.name);
+                    }
+                }
+                app.cfg
+                    .bases
+                    .iter()
+                    .map(|b| b.path.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let top = |project: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(project).expect(project).top()
+        };
+        assert_eq!(consistent(cx), ["/srv/one", "/srv/two", "/srv/three"]);
+
+        drag("project three · mac", "project one · local", cx);
+        cx.run_until_parked();
+        assert_eq!(consistent(cx), ["/srv/three", "/srv/one", "/srv/two"]);
+        assert!(top("project three · mac", cx) < top("project one · local", cx));
+        assert!(top("project one · local", cx) < top("project two · local", cx));
+
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        assert_eq!(consistent(cx), ["/srv/three", "/srv/one", "/srv/two"]);
     }
 
     /// Opening a thread points the notes at its worktree without opening

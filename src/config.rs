@@ -380,6 +380,32 @@ impl Config {
         })
     }
 
+    /// Puts the config file's `[[bases]]` entries in the order of `bases`,
+    /// each with its comments. They swap places in the file, so what's
+    /// between them, like `[[hosts]]`, stays where it is.
+    pub fn save_project_order(path: &Path, bases: &[Base]) -> Result<()> {
+        edit(path, |doc| {
+            let Some(tables) = bases_mut(doc)? else {
+                return Ok(());
+            };
+            let mut entries: Vec<toml_edit::Table> = std::mem::take(tables).into_iter().collect();
+            let mut places: Vec<Option<isize>> = entries.iter().map(|t| t.position()).collect();
+            places.sort();
+            // One the sidebar doesn't know goes last.
+            entries.sort_by_key(|t| {
+                bases
+                    .iter()
+                    .position(|b| is_base(t, b))
+                    .unwrap_or(usize::MAX)
+            });
+            for (mut entry, place) in entries.into_iter().zip(places) {
+                entry.set_position(place);
+                tables.push(entry);
+            }
+            Ok(())
+        })
+    }
+
     /// Takes a folder (a base) out of the config file at `path`; its host
     /// stays.
     pub fn remove_folder(path: &Path, base: &Base) -> Result<()> {
@@ -598,6 +624,47 @@ path = \"~/projects/api\"
         assert!(!saved.contains("sidebar_width"), "{saved}");
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!((cfg.sidebar_width, cfg.notes_width), (None, Some(420.0)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_the_project_order_moves_entries_with_their_comments() {
+        let path = std::env::temp_dir().join(format!("lemur-order-{}.toml", std::process::id()));
+        let original = "\
+[[hosts]]
+name = \"agent\"
+ssh = \"agent\"
+
+# the api
+[[bases]]
+host = \"agent\"
+path = \"~/api\"
+
+[[hosts]]
+name = \"local\"
+ssh = \"local\"
+
+# this app
+[[bases]]
+host = \"local\"
+path = \"~/lemur\"
+collapsed = true
+";
+        std::fs::write(&path, original).unwrap();
+        let cfg: Config = toml::from_str(original).unwrap();
+        let reversed: Vec<Base> = cfg.bases.iter().rev().cloned().collect();
+        Config::save_project_order(&path, &reversed).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        let paths: Vec<&str> = cfg.bases.iter().map(|b| b.path.as_str()).collect();
+        assert_eq!(paths, ["~/lemur", "~/api"], "{saved}");
+        assert!(cfg.bases[0].collapsed);
+        let at = |text: &str| saved.find(text).expect(text);
+        // Each comment travels with its entry; the hosts stay where they were.
+        assert!(at("# this app") < at("~/lemur") && at("~/lemur") < at("# the api"));
+        assert!(at("name = \"agent\"") < at("# this app"), "{saved}");
+        assert!(at("# this app") < at("name = \"local\""), "{saved}");
+        assert!(at("name = \"local\"") < at("# the api"), "{saved}");
         let _ = std::fs::remove_file(path);
     }
 
