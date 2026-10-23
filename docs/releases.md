@@ -49,6 +49,9 @@ Every push to `main` runs **Build lemur** (`.github/workflows/release.yml`)
 for the tests only: it installs the Rust version from `mise.toml`, Xcode's
 Metal toolchain and tmux, and runs the tests. It gets no secrets and
 publishes nothing. A newer push cancels a run still going for an older one.
+These runs keep the compiled dependencies in GitHub's cache
+([rust-cache](https://github.com/Swatinem/rust-cache)) for the next one;
+the signed build of a release never uses it and compiles everything itself.
 
 ## Publish a release
 

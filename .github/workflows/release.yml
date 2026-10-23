@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install the pinned toolchain and test
+      - name: Install the pinned toolchain
         run: |
           xcodebuild -version
           # GPUI compiles its Metal shaders at build time; Xcode 26 ships the
@@ -39,7 +39,14 @@ jobs:
           rustc --version
           # The tests drive real tmux servers.
           brew install tmux
-          cargo test --locked
+      # Compiled dependencies from the last runs, keyed on the toolchain
+      # installed above. Only these test runs use it; the signed build
+      # always starts from scratch.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: false
+      - name: Test
+        run: cargo test --locked
 
   release:
     # Updating or deleting a tag must not rebuild a version. The release
