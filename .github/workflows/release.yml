@@ -36,6 +36,10 @@ jobs:
           test -n "$rust"
           rustup toolchain install "$rust" --profile minimal
           rustup default "$rust"
+          # Only ours: the cache key covers every installed toolchain, and the
+          # runner image's own changes from one machine to the next.
+          rustup toolchain list | awk '{print $1}' | grep -v "^$rust-" |
+              xargs -n1 rustup toolchain uninstall
           rustc --version
           # The tests drive real tmux servers.
           brew install tmux
