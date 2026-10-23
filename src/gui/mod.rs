@@ -5,6 +5,7 @@
 
 mod folder_picker;
 mod keys;
+mod links;
 mod notes;
 mod notification;
 mod projects;

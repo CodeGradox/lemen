@@ -2,6 +2,7 @@
 //! Dropped or pasted images go to the host first; the session gets the path.
 
 use super::keys::{self, Key};
+use super::links::{Link, link_at};
 use super::settings::Prefs;
 use super::terminal::{Palette, Pty, Size};
 use crate::actions;
@@ -32,6 +33,10 @@ pub struct TerminalView {
     /// Measured on the next render after Settings change the font.
     metrics: Option<Metrics>,
     mouse_cell: Option<(usize, usize)>,
+    /// Where the pointer is over the terminal, and the link under it while
+    /// ⌘ is held: underlined, and opened by a ⌘-click.
+    pointer: Option<Point<Pixels>>,
+    link: Option<Link>,
     scroll_lines: f32,
     status: Option<String>,
     _reader: Option<Task<()>>,
@@ -69,6 +74,8 @@ impl TerminalView {
             },
             metrics: None,
             mouse_cell: None,
+            pointer: None,
+            link: None,
             scroll_lines: 0.0,
             status: None,
             _reader: None,
@@ -119,7 +126,13 @@ impl TerminalView {
     fn on_term_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
         let Some(pty) = &self.pty else { return };
         match event {
-            TermEvent::Wakeup => cx.notify(),
+            TermEvent::Wakeup => {
+                // New output may have moved the link under the pointer.
+                if self.link.is_some() {
+                    self.link = self.pointer.and_then(|p| self.link_at(p));
+                }
+                cx.notify()
+            }
             TermEvent::PtyWrite(text) => pty.write(text.into_bytes()),
             // tmux copies selections with OSC 52.
             TermEvent::ClipboardStore(_, text) => {
@@ -265,6 +278,28 @@ impl TerminalView {
         )
     }
 
+    /// The link at `position`, if it's over the grid.
+    fn link_at(&self, position: Point<Pixels>) -> Option<Link> {
+        if !self.bounds.contains(&position) {
+            return None;
+        }
+        let (col, line) = self.cell_at(position);
+        link_at(&self.pty.as_ref()?.term.lock(), col, line)
+    }
+
+    /// Follows the pointer and ⌘ (`platform`): the link under the pointer
+    /// shows while ⌘ is held.
+    fn hover(&mut self, platform: bool, cx: &mut Context<Self>) {
+        let link = self
+            .pointer
+            .filter(|_| platform)
+            .and_then(|p| self.link_at(p));
+        if link != self.link {
+            self.link = link;
+            cx.notify();
+        }
+    }
+
     /// tmux in mouse mode wants SGR reports; otherwise clicks only focus.
     fn reports_mouse(mode: TermMode) -> bool {
         mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE)
@@ -274,6 +309,13 @@ impl TerminalView {
         window.focus(&self.focus, cx);
         if self.pty.is_none() {
             self.connect(cx);
+            return;
+        }
+        // ⌘-click opens a link; tmux never sees that click.
+        if event.modifiers.platform
+            && let Some(link) = self.link_at(event.position)
+        {
+            cx.open_url(&link.url);
             return;
         }
         if Self::reports_mouse(self.mode()) {
@@ -302,7 +344,9 @@ impl TerminalView {
         }
     }
 
-    fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.pointer = Some(event.position);
+        self.hover(event.modifiers.platform, cx);
         if event.pressed_button != Some(MouseButton::Left)
             || self.mouse_cell.is_none()
             || !Self::reports_mouse(self.mode())
@@ -561,6 +605,7 @@ fn paint(
     bounds: Bounds<Pixels>,
     metrics: &Metrics,
     focused: bool,
+    link: Option<(Link, Hsla)>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -616,6 +661,19 @@ fn paint(
             cx,
         );
     }
+    // The link under the pointer while ⌘ is held.
+    if let Some((link, color)) = link {
+        for (line, start, end) in link.spans {
+            let origin = point(
+                bounds.origin.x + w * start as f32,
+                bounds.origin.y + h * (line + 1) as f32 - px(2.0),
+            );
+            window.paint_quad(fill(
+                Bounds::new(origin, size(w * (end - start) as f32, px(1.0))),
+                color,
+            ));
+        }
+    }
 }
 
 impl Render for TerminalView {
@@ -629,6 +687,10 @@ impl Render for TerminalView {
         let view = cx.entity().downgrade();
         let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
         let frame = self.pty.as_ref().map(|pty| snapshot(pty, &palette));
+        let link = self
+            .link
+            .clone()
+            .map(|link| (link, hsla(palette.foreground)));
         let grid = canvas(
             move |bounds, _, cx| {
                 let size = Size {
@@ -648,7 +710,7 @@ impl Render for TerminalView {
             },
             move |bounds, (), window, cx| {
                 if let Some(frame) = frame {
-                    paint(frame, bounds, &metrics, focused, window, cx);
+                    paint(frame, bounds, &metrics, focused, link, window, cx);
                 }
             },
         )
@@ -665,6 +727,16 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, _, cx| {
+                this.hover(e.modifiers.platform, cx)
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered {
+                    this.pointer = None;
+                    this.hover(false, cx);
+                }
+            }))
+            .when(self.link.is_some(), |this| this.cursor_pointer())
             .on_scroll_wheel(cx.listener(Self::scroll))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.upload(paths.paths().to_vec(), None, cx)
@@ -695,8 +767,50 @@ mod tests {
     use crate::gui::settings::Prefs;
     use crate::gui::terminal::{DARK, Pty, Size};
     use crate::test_support::{TmuxServer, wait_until};
-    use gpui_kit::{px, size};
+    use gpui_kit::{Modifiers, point, px, size};
     use std::time::Duration;
+
+    /// Holding ⌘ over a URL shows it, and ⌘-clicking opens it; a plain
+    /// click doesn't.
+    #[gpui::test]
+    fn cmd_click_opens_a_link(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("links");
+        server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "t",
+            "printf 'see https://example.com/x ok'; sleep 600",
+        ]);
+        let host = server.config().hosts.remove(0);
+        // The PTY reader is a real thread, so this test can't be deterministic.
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
+        cx.simulate_resize(size(px(600.0), px(400.0)));
+        cx.run_until_parked();
+        // The middle of the URL's third character, on the first row.
+        let at = view.read_with(cx, |v, _| {
+            let (w, h) = (v.cell.cell_width as f32, v.cell.cell_height as f32);
+            point(
+                v.bounds.origin.x + px(w * 6.5),
+                v.bounds.origin.y + px(h * 0.5),
+            )
+        });
+        let shown = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| v.link_at(at)).is_some()
+        });
+        assert!(shown, "the URL never showed");
+
+        cx.simulate_click(at, Modifiers::none());
+        assert_eq!(cx.opened_url(), None);
+        cx.simulate_mouse_move(at, None, Modifiers::command());
+        let hovered = view.read_with(cx, |v, _| v.link.as_ref().map(|l| l.url.clone()));
+        assert_eq!(hovered.as_deref(), Some("https://example.com/x"));
+        cx.simulate_click(at, Modifiers::command());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/x"));
+    }
 
     /// Rows reach the painter without the blanks after their text.
     #[test]

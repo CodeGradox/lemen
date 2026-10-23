@@ -84,6 +84,14 @@ Run `lemur`. The sidebar lists each base's worktrees and their sessions, in the 
 
 **Images:** drop files on the terminal, or `⌘V` with an image or copied files on the clipboard. lemur uploads them to the host's `upload_dir` and pastes the remote paths. Text pastes as text.
 
+**Links:** hold `⌘` over a link in the terminal to underline it, and `⌘`-click to open it in your browser; plain clicks still go to tmux. That's an `http(s)://` URL written out in the text, or a link whose text hides its URL (OSC 8). tmux only passes those on to terminals it knows support them; to have it pass them to lemur, add this to `~/.tmux.conf` on the host (tmux 3.4 or newer):
+
+```
+set -as terminal-features ',xterm*:hyperlinks'
+```
+
+A URL runs on across rows the terminal wrapped, but not across lines Claude Code broke itself, which a long one in its replies may be.
+
 **Scrolling and selection** belong to tmux: `set -g mouse on` on the host lets you scroll with the wheel and select with the mouse. tmux sends copied text to the terminal (OSC 52), and lemur puts it on your Mac clipboard.
 
 CLI: `lemur ls`, `lemur new <base> <name> [--branch <branch>] [--from <branch>]` (a new worktree; detached without `--branch`) or `lemur new <base> <name> --worktree <path> [--shell]`, `lemur attach <host> <session>`, `lemur rename <host> <session> <name>`, `lemur upload <files>...`, `lemur paste` (clipboard image to the last session lemur showed).
