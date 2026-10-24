@@ -56,6 +56,9 @@ pub enum Entry {
     },
     /// Threads with no worktree row above them.
     Threads(Threads),
+    /// A project's hidden worktrees, under a Hidden row of their own;
+    /// folded until it's clicked.
+    Hidden(Vec<Entry>),
 }
 
 /// A sidebar menu of entries, standing in for gpui-component's SidebarMenu.
@@ -101,6 +104,9 @@ impl SidebarItem for Menu {
         let id: SharedString = id.into().to_string().into();
         let order = self.worktree_order;
         let mut worktrees = 0;
+        // Not by its place, which changes as worktrees come and go: it'd
+        // fold again.
+        let hidden_id = SharedString::from(format!("{id}-hidden"));
         v_flex()
             .gap_2()
             .children(self.entries.into_iter().enumerate().map(|(ix, entry)| {
@@ -124,6 +130,7 @@ impl SidebarItem for Menu {
                         worktree(id, label, suffix, menu, threads, look, window, cx)
                     }
                     Entry::Threads(threads) => thread_list(threads, window, cx),
+                    Entry::Hidden(entries) => hidden(hidden_id.clone(), entries, window, cx),
                 }
             }))
     }
@@ -448,6 +455,67 @@ fn worktree(
                     .pl_2p5()
                     .py_0p5()
                     .child(thread_list(threads, window, cx)),
+            )
+        })
+        .into_any_element()
+}
+
+/// The Hidden row at the bottom of a project, with how many it holds, and
+/// the hidden worktrees under it; folded until it's clicked.
+fn hidden(id: SharedString, entries: Vec<Entry>, window: &mut Window, cx: &mut App) -> AnyElement {
+    let open = window.use_keyed_state(id.clone(), cx, |_, _| false);
+    let is_open = *open.read(cx);
+    let fold = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+        cx.stop_propagation();
+        open.update(cx, |open, cx| {
+            *open = !*open;
+            cx.notify();
+        })
+    };
+    let count = div()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(entries.len().to_string());
+    let header = row(
+        "hidden",
+        Icon::new(IconName::EyeOff),
+        "Hidden".into(),
+        false,
+        count.into_any_element(),
+        cx,
+    )
+    .debug_selector(|| "hidden".into())
+    .cursor_pointer()
+    .on_click(fold.clone())
+    .child(
+        Button::new("caret")
+            .xsmall()
+            .ghost()
+            .icon(
+                Icon::new(IconName::ChevronRight)
+                    .size_4()
+                    .when(is_open, |this| this.rotate(percentage(90. / 360.))),
+            )
+            .on_click(fold),
+    );
+    let rows = Menu {
+        entries,
+        ..Default::default()
+    };
+    let border = cx.theme().sidebar_border;
+    div()
+        .id(id.clone())
+        .w_full()
+        .child(header)
+        .when(is_open, |this| {
+            this.child(
+                div()
+                    .border_l_1()
+                    .border_color(border)
+                    .ml_3p5()
+                    .pl_2p5()
+                    .py_0p5()
+                    .child(rows.render(format!("{id}-rows"), window, cx)),
             )
         })
         .into_any_element()

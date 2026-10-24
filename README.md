@@ -55,9 +55,10 @@ path = "~/projects/api"
 # collapsed = true                # folded in the sidebar
 # worktree_order = [...]          # worktree paths, in the order they were dragged into
 # worktree_colors = { "/path/to/worktree" = "blue" }  # red orange yellow green teal cyan blue purple pink gray
+# hidden_worktrees = [...]        # worktree paths in the project's Hidden section
 ```
 
-Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, and the sidebar writes a project's `collapsed`, `worktree_order` and `worktree_colors`, and the order of the `[[bases]]`; the rest of the file, comments included, stays as it is.
+Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, and the sidebar writes a project's `collapsed`, `worktree_order`, `worktree_colors` and `hidden_worktrees`, and the order of the `[[bases]]`; the rest of the file, comments included, stays as it is.
 
 New worktrees go in `worktree_dir` (relative to the repo, absolute, or `~/...`): lemur runs `git worktree add` there, then starts Claude in it.
 
@@ -72,6 +73,7 @@ Run `lemur`. The sidebar lists each base's worktrees and their sessions, in the 
 - Right-click a worktree → **Remove worktree…** to take it out of git; its branch stays. If threads are running in it, the dialog names them: **Close and remove** closes them first, and **Cancel** keeps them and the worktree. lemur checks the host too, so a thread the sidebar hasn't shown yet, or one whose terminal has `cd`'d into the worktree, is asked about the same way. Its folder stays on the host as plain files unless you tick **Also delete**, which deletes it, read-only parts included. One that's locked (Claude Code locks the worktree its session runs in) asks again before **Remove anyway**, which unlocks it; so does deleting one with uncommitted changes, which drops them. These asks all come before any thread closes, so cancelling one keeps the threads running. The main checkout and plain folders can't be removed this way.
 - Click a project's name to fold it away, or open it again.
 - Right-click a worktree → **Color** to give its folder icon one of ten colors.
+- Right-click a worktree → **Hide** to move it into its project's **Hidden** section, at the bottom; click **Hidden** to fold it open and shut. Right-click it there → **Unhide** to move it back to its place.
 - Drag a worktree onto another in the same project to move it there.
 - Drag a project's name onto another's to move it there, whatever their hosts; the config's `[[bases]]` take the new order, each entry with its comments.
 - A project's **⋯** (on hover) or right-click → **Remove project…** takes it out of lemur and the config. Nothing on the host changes, and its running threads move to *other*.

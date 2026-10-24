@@ -176,6 +176,9 @@ pub struct Base {
     /// Folder icon colors, one of `COLORS` by worktree path.
     #[serde(default)]
     pub worktree_colors: BTreeMap<String, String>,
+    /// The paths of its worktrees in the sidebar's Hidden section.
+    #[serde(default)]
+    pub hidden_worktrees: Vec<String>,
 }
 
 fn default_upload_dir() -> String {
@@ -214,6 +217,7 @@ impl Base {
             collapsed: false,
             worktree_order: vec![],
             worktree_colors: BTreeMap::new(),
+            hidden_worktrees: vec![],
         }
     }
 
@@ -332,8 +336,8 @@ impl Config {
     }
 
     /// Saves how a project shows in the sidebar (whether it's folded, its
-    /// worktrees' order and colors) to its entry in the config file at
-    /// `path`. Defaults are left out of the file.
+    /// worktrees' order and colors, and which are hidden) to its entry in
+    /// the config file at `path`. Defaults are left out of the file.
     pub fn save_project_look(path: &Path, base: &Base) -> Result<()> {
         edit(path, |doc| {
             let Some(table) = bases_mut(doc)?.and_then(|b| b.iter_mut().find(|t| is_base(t, base)))
@@ -359,6 +363,12 @@ impl Config {
                     colors.insert(path, color.as_str().into());
                 }
                 table.insert("worktree_colors", toml_edit::value(colors));
+            }
+            if base.hidden_worktrees.is_empty() {
+                table.remove("hidden_worktrees");
+            } else {
+                let hidden: toml_edit::Array = base.hidden_worktrees.iter().collect();
+                table.insert("hidden_worktrees", toml_edit::value(hidden));
             }
             Ok(())
         })
@@ -722,19 +732,26 @@ path = \"~/projects/api\"
         site.worktree_colors
             .insert("/srv/site/.worktrees/b".into(), "blue".into());
         site.worktree_order = vec!["/srv/site/.worktrees/b".into(), "/srv/site".into()];
+        site.hidden_worktrees = vec!["/srv/site/.worktrees/b".into()];
         Config::save_project_look(&path, &site).unwrap();
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.bases[1].worktree_colors, site.worktree_colors);
         assert!(cfg.bases[1].collapsed);
         assert_eq!(cfg.bases[1].worktree_order, site.worktree_order);
+        assert_eq!(cfg.bases[1].hidden_worktrees, site.hidden_worktrees);
         assert!(cfg.bases[0].worktree_colors.is_empty() && !cfg.bases[0].collapsed);
+        assert!(cfg.bases[0].hidden_worktrees.is_empty());
         site.worktree_colors.clear();
         site.collapsed = false;
         site.worktree_order.clear();
+        site.hidden_worktrees.clear();
         Config::save_project_look(&path, &site).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !saved.contains("color") && !saved.contains("collapsed") && !saved.contains("order"),
+            !saved.contains("color")
+                && !saved.contains("collapsed")
+                && !saved.contains("order")
+                && !saved.contains("hidden"),
             "{saved}"
         );
 

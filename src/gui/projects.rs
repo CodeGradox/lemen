@@ -1,5 +1,5 @@
-//! Projects and their worktrees: adding, folding, coloring, ordering and
-//! removing them.
+//! Projects and their worktrees: adding, folding, coloring, ordering,
+//! hiding and removing them.
 
 use super::folder_picker::{FolderPicker, HostChoice, PickerEvent};
 use super::settings::Prefs;
@@ -103,8 +103,28 @@ impl Lemur {
         self.save_look(index, cx);
     }
 
-    /// Moves a worktree within its project: the sidebar shows the new order
-    /// at once, and the config keeps it.
+    /// Moves a worktree to its project's Hidden section, or with `hidden`
+    /// false back out of it, to its place in the order.
+    pub(super) fn set_worktree_hidden(
+        &mut self,
+        index: usize,
+        worktree: &str,
+        hidden: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(base) = self.cfg.bases.get_mut(index) else {
+            return;
+        };
+        base.hidden_worktrees.retain(|p| p != worktree);
+        if hidden {
+            base.hidden_worktrees.push(worktree.to_string());
+        }
+        self.save_look(index, cx);
+    }
+
+    /// Moves a worktree within its project, `from` and `to` counting the
+    /// worktrees that aren't hidden: the sidebar shows the new order at
+    /// once, and the config keeps it.
     pub(super) fn reorder_worktrees(
         &mut self,
         index: usize,
@@ -119,6 +139,14 @@ impl Lemur {
             .flat_map(|h| h.bases.iter_mut())
             .find(|b| b.index == index)
         else {
+            return;
+        };
+        // Hidden ones keep their places among the rest.
+        let hidden = &self.cfg.bases[index].hidden_worktrees;
+        let shown: Vec<usize> = (0..view.worktrees.len())
+            .filter(|&i| !hidden.contains(&view.worktrees[i].path))
+            .collect();
+        let (Some(&from), Some(&to)) = (shown.get(from), shown.get(to)) else {
             return;
         };
         if !move_item(&mut view.worktrees, from, to) {
@@ -152,7 +180,8 @@ impl Lemur {
         cx.notify();
     }
 
-    /// Keeps a project's color, fold and worktree order in the config file.
+    /// Keeps a project's color, fold, worktree order and hidden worktrees in
+    /// the config file.
     fn save_look(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(file) = Prefs::get(cx).config_file()
             && let Err(e) = Config::save_project_look(file, &self.cfg.bases[index])
@@ -381,7 +410,8 @@ impl Lemur {
         .detach();
     }
 
-    /// Forgets a removed worktree's color and place in the order.
+    /// Forgets a removed worktree's color, place in the order, and that it
+    /// was hidden.
     fn forget_worktree(&mut self, index: usize, worktree: &str, cx: &mut Context<Self>) {
         let Some(base) = self.cfg.bases.get_mut(index) else {
             return;
@@ -389,7 +419,10 @@ impl Lemur {
         let had_color = base.worktree_colors.remove(worktree).is_some();
         let placed = base.worktree_order.len();
         base.worktree_order.retain(|p| p != worktree);
-        if had_color || base.worktree_order.len() != placed {
+        let hidden = base.hidden_worktrees.len();
+        base.hidden_worktrees.retain(|p| p != worktree);
+        if had_color || base.worktree_order.len() != placed || base.hidden_worktrees.len() != hidden
+        {
             self.save_look(index, cx);
         }
     }

@@ -103,10 +103,20 @@ impl Lemur {
                 )));
             }
             let prefix = format!("{}/", base.name());
+            let mut hidden = vec![];
             for w in &b.worktrees {
                 // The main checkout and a plain folder are the project itself.
                 let removable = !w.main;
-                menu = menu.child(self.worktree_item(&h.name, index, w, removable, &prefix, cx));
+                let item = self.worktree_item(&h.name, index, w, removable, &prefix, cx);
+                if base.hidden_worktrees.contains(&w.path) {
+                    hidden.push(item);
+                } else {
+                    menu = menu.child(item);
+                }
+            }
+            // Under the rest, in their order.
+            if !hidden.is_empty() {
+                menu = menu.child(rows::Entry::Hidden(hidden));
             }
             let toggle: rows::Toggle = {
                 let this = this.clone();
@@ -185,7 +195,8 @@ impl Lemur {
         cx: &mut Context<Self>,
     ) -> rows::Entry {
         let label = worktree_label(w);
-        // Color for every worktree; removing only for linked ones.
+        let hidden = self.cfg.bases[base].hidden_worktrees.contains(&w.path);
+        // Color and hiding for every worktree; removing only for linked ones.
         let menu: rows::MenuBuilder = {
             let this = cx.entity().downgrade();
             let colors = Rc::new(self.color_menu(base, &w.path, cx));
@@ -194,6 +205,18 @@ impl Lemur {
                 move |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
                     let colors = colors.clone();
                     let menu = menu.submenu("Color", window, cx, move |m, w, cx| colors(m, w, cx));
+                    let hide = {
+                        let (this, worktree) = (this.clone(), worktree.clone());
+                        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| {
+                                this.set_worktree_hidden(base, &worktree, !hidden, cx)
+                            })
+                            .ok();
+                        }
+                    };
+                    let menu = menu.item(
+                        PopupMenuItem::new(if hidden { "Unhide" } else { "Hide" }).on_click(hide),
+                    );
                     if !removable {
                         return menu;
                     }

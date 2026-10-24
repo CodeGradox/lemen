@@ -1970,6 +1970,72 @@ mod tests {
         );
     }
 
+    /// Hiding a worktree moves it to its project's Hidden row, folded until
+    /// clicked; the others still drag past it, and unhiding moves it back
+    /// to its place.
+    #[gpui::test]
+    fn hidden_worktrees_wait_under_their_project(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("hide-wt");
+        let dir = TempDir::new("hide-wt");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
+        git(&["worktree", "add", "-q", "-b", "b", "wt/b"]);
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let names = |cx: &mut VisualTestContext| -> Vec<String> {
+            app.read_with(cx, |app, _| {
+                app.snap.hosts[0].bases[0]
+                    .worktrees
+                    .iter()
+                    .map(super::worktree_label)
+                    .collect()
+            })
+        };
+        let a = app.read_with(cx, |app, _| {
+            app.snap.hosts[0].bases[0].worktrees[1].path.clone()
+        });
+        let hide = |hidden: bool, cx: &mut VisualTestContext| {
+            app.update(cx, |app, cx| app.set_worktree_hidden(0, &a, hidden, cx));
+            cx.run_until_parked();
+        };
+        assert!(cx.debug_bounds("hidden").is_none());
+
+        hide(true, cx);
+        assert!(cx.debug_bounds("buttons a").is_none(), "folded away");
+        assert!(
+            cx.debug_bounds("buttons main").is_some() && cx.debug_bounds("buttons b").is_some()
+        );
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.cfg.bases[0].hidden_worktrees, [a.as_str()])
+        });
+
+        // b and main are the rows that drag; a keeps its place behind them.
+        drag("worktree-1", "worktree-0", cx);
+        assert_eq!(names(cx), ["b", "main", "a"]);
+
+        let row = cx.debug_bounds("hidden").expect("the Hidden row").center();
+        cx.simulate_click(row, Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("buttons a").is_some(), "opened");
+
+        hide(false, cx);
+        assert!(cx.debug_bounds("hidden").is_none());
+        assert!(cx.debug_bounds("buttons a").is_some());
+        app.read_with(cx, |app, _| {
+            assert!(app.cfg.bases[0].hidden_worktrees.is_empty())
+        });
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        assert_eq!(names(cx), ["b", "main", "a"]);
+    }
+
     /// The menus' actions and keys reach the main window: ⌘O opens the
     /// folder picker, ⌘R toggles the notes, Refresh refreshes.
     #[gpui::test]
