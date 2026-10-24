@@ -53,12 +53,19 @@ pub enum Entry {
         /// Its folder icon's color.
         color: Option<Hsla>,
         threads: Threads,
+        /// Its threads are folded away; clicking it calls `toggle`.
+        folded: bool,
+        toggle: Toggle,
     },
     /// Threads with no worktree row above them.
     Threads(Threads),
-    /// A project's hidden worktrees, under a Hidden row of their own;
-    /// folded until it's clicked.
-    Hidden(Vec<Entry>),
+    /// A project's hidden worktrees, under a Hidden row of their own, shown
+    /// while it's `open`; clicking it calls `toggle`.
+    Hidden {
+        entries: Vec<Entry>,
+        open: bool,
+        toggle: Toggle,
+    },
 }
 
 /// A sidebar menu of entries, standing in for gpui-component's SidebarMenu.
@@ -104,9 +111,6 @@ impl SidebarItem for Menu {
         let id: SharedString = id.into().to_string().into();
         let order = self.worktree_order;
         let mut worktrees = 0;
-        // Not by its place, which changes as worktrees come and go: it'd
-        // fold again.
-        let hidden_id = SharedString::from(format!("{id}-hidden"));
         v_flex()
             .gap_2()
             .children(self.entries.into_iter().enumerate().map(|(ix, entry)| {
@@ -119,9 +123,13 @@ impl SidebarItem for Menu {
                         menu,
                         color,
                         threads,
+                        folded,
+                        toggle,
                     } => {
                         let look = WorktreeLook {
                             color,
+                            folded,
+                            toggle,
                             drag: order
                                 .clone()
                                 .map(|(key, reorder)| (key, worktrees, reorder)),
@@ -130,7 +138,11 @@ impl SidebarItem for Menu {
                         worktree(id, label, suffix, menu, threads, look, window, cx)
                     }
                     Entry::Threads(threads) => thread_list(threads, window, cx),
-                    Entry::Hidden(entries) => hidden(hidden_id.clone(), entries, window, cx),
+                    Entry::Hidden {
+                        entries,
+                        open,
+                        toggle,
+                    } => hidden(id, entries, open, toggle, window, cx),
                 }
             }))
     }
@@ -374,15 +386,17 @@ fn row(
         )
 }
 
-/// How a worktree row shows: its folder's color, and, when it can be
-/// dragged, the list's key, its place and what moves it.
+/// How a worktree row shows: its folder's color, whether its threads are
+/// folded and what folds them, and, when it can be dragged, the list's
+/// key, its place and what moves it.
 struct WorktreeLook {
     color: Option<Hsla>,
+    folded: bool,
+    toggle: Toggle,
     drag: Option<(SharedString, usize, Reorder)>,
 }
 
-/// A worktree row, open by default; clicking it or its caret folds the
-/// threads away.
+/// A worktree row; clicking it or its caret folds the threads away.
 #[allow(clippy::too_many_arguments)]
 fn worktree(
     id: SharedString,
@@ -395,14 +409,11 @@ fn worktree(
     cx: &mut App,
 ) -> AnyElement {
     let has_threads = !threads.rows.is_empty();
-    let open = window.use_keyed_state(id.clone(), cx, |_, _| true);
-    let is_open = has_threads && *open.read(cx);
-    let fold = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+    let is_open = has_threads && !look.folded;
+    let toggle = look.toggle;
+    let fold = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
         cx.stop_propagation();
-        open.update(cx, |open, cx| {
-            *open = !*open;
-            cx.notify();
-        })
+        toggle(window, cx);
     };
     let icon = Icon::new(IconName::Folder).when_some(look.color, |i, c| i.text_color(c));
     // Its buttons do what they say without folding it.
@@ -461,16 +472,19 @@ fn worktree(
 }
 
 /// The Hidden row at the bottom of a project, with how many it holds, and
-/// the hidden worktrees under it; folded until it's clicked.
-fn hidden(id: SharedString, entries: Vec<Entry>, window: &mut Window, cx: &mut App) -> AnyElement {
-    let open = window.use_keyed_state(id.clone(), cx, |_, _| false);
-    let is_open = *open.read(cx);
-    let fold = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+/// while `is_open` the hidden worktrees under it; clicking it calls
+/// `toggle`.
+fn hidden(
+    id: SharedString,
+    entries: Vec<Entry>,
+    is_open: bool,
+    toggle: Toggle,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let fold = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
         cx.stop_propagation();
-        open.update(cx, |open, cx| {
-            *open = !*open;
-            cx.notify();
-        })
+        toggle(window, cx);
     };
     let count = div()
         .text_xs()

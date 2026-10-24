@@ -1923,6 +1923,59 @@ mod tests {
         assert!(shown(cx));
     }
 
+    /// A folded worktree stays folded, and an open Hidden row open, while
+    /// their project is folded away and back, and in the next lemur.
+    #[gpui::test]
+    fn folds_outlast_their_project_folding(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("fold-keep");
+        let dir = TempDir::new("fold-keep");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
+        let path = repo.to_string_lossy().into_owned();
+        server.tmux(&["new-session", "-d", "-s", "api/t", "-c", &path, "sleep 600"]);
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &path));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let a = app.read_with(cx, |app, _| {
+            app.snap.hosts[0].bases[0].worktrees[1].path.clone()
+        });
+        app.update(cx, |app, cx| app.set_worktree_hidden(0, &a, true, cx));
+        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let at = cx.debug_bounds(selector).expect(selector).center();
+            cx.simulate_click(at, Modifiers::none());
+            cx.run_until_parked();
+        };
+        let threads = |cx: &mut VisualTestContext| cx.debug_bounds("thread-0").is_some();
+        let hidden = |cx: &mut VisualTestContext| cx.debug_bounds("buttons a").is_some();
+
+        click("hidden", cx);
+        click("worktree-0", cx);
+        assert!(hidden(cx) && !threads(cx));
+
+        click("project api · local", cx);
+        assert!(!hidden(cx) && cx.debug_bounds("worktree-0").is_none());
+        click("project api · local", cx);
+        assert!(!threads(cx), "the worktree stays folded");
+        assert!(hidden(cx), "Hidden stays open");
+
+        let cfg = app.read_with(cx, |app, _| app.cfg.clone());
+        assert_eq!(cfg.bases[0].collapsed_worktrees, [path.as_str()]);
+        assert!(cfg.bases[0].hidden_open);
+        let (_, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-0").is_some());
+        assert!(!threads(cx), "the next lemur keeps the worktree folded");
+        assert!(hidden(cx), "and Hidden open");
+    }
+
     /// Dropping a worktree on another moves it there, and the next refresh
     /// keeps that order; the main checkout stays known wherever it is.
     #[gpui::test]

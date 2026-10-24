@@ -179,6 +179,12 @@ pub struct Base {
     /// The paths of its worktrees in the sidebar's Hidden section.
     #[serde(default)]
     pub hidden_worktrees: Vec<String>,
+    /// The paths of its worktrees whose threads are folded away.
+    #[serde(default)]
+    pub collapsed_worktrees: Vec<String>,
+    /// Its Hidden section is open; it's folded otherwise.
+    #[serde(default)]
+    pub hidden_open: bool,
 }
 
 fn default_upload_dir() -> String {
@@ -218,6 +224,8 @@ impl Base {
             worktree_order: vec![],
             worktree_colors: BTreeMap::new(),
             hidden_worktrees: vec![],
+            collapsed_worktrees: vec![],
+            hidden_open: false,
         }
     }
 
@@ -336,8 +344,9 @@ impl Config {
     }
 
     /// Saves how a project shows in the sidebar (whether it's folded, its
-    /// worktrees' order and colors, and which are hidden) to its entry in
-    /// the config file at `path`. Defaults are left out of the file.
+    /// worktrees' order and colors, which are hidden and which folded, and
+    /// whether its Hidden section is open) to its entry in the config file
+    /// at `path`. Defaults are left out of the file.
     pub fn save_project_look(path: &Path, base: &Base) -> Result<()> {
         edit(path, |doc| {
             let Some(table) = bases_mut(doc)?.and_then(|b| b.iter_mut().find(|t| is_base(t, base)))
@@ -369,6 +378,17 @@ impl Config {
             } else {
                 let hidden: toml_edit::Array = base.hidden_worktrees.iter().collect();
                 table.insert("hidden_worktrees", toml_edit::value(hidden));
+            }
+            if base.collapsed_worktrees.is_empty() {
+                table.remove("collapsed_worktrees");
+            } else {
+                let folded: toml_edit::Array = base.collapsed_worktrees.iter().collect();
+                table.insert("collapsed_worktrees", toml_edit::value(folded));
+            }
+            if base.hidden_open {
+                table.insert("hidden_open", toml_edit::value(true));
+            } else {
+                table.remove("hidden_open");
             }
             Ok(())
         })
@@ -733,18 +753,24 @@ path = \"~/projects/api\"
             .insert("/srv/site/.worktrees/b".into(), "blue".into());
         site.worktree_order = vec!["/srv/site/.worktrees/b".into(), "/srv/site".into()];
         site.hidden_worktrees = vec!["/srv/site/.worktrees/b".into()];
+        site.collapsed_worktrees = vec!["/srv/site".into()];
+        site.hidden_open = true;
         Config::save_project_look(&path, &site).unwrap();
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.bases[1].worktree_colors, site.worktree_colors);
         assert!(cfg.bases[1].collapsed);
         assert_eq!(cfg.bases[1].worktree_order, site.worktree_order);
         assert_eq!(cfg.bases[1].hidden_worktrees, site.hidden_worktrees);
+        assert_eq!(cfg.bases[1].collapsed_worktrees, site.collapsed_worktrees);
+        assert!(cfg.bases[1].hidden_open);
         assert!(cfg.bases[0].worktree_colors.is_empty() && !cfg.bases[0].collapsed);
         assert!(cfg.bases[0].hidden_worktrees.is_empty());
         site.worktree_colors.clear();
         site.collapsed = false;
         site.worktree_order.clear();
         site.hidden_worktrees.clear();
+        site.collapsed_worktrees.clear();
+        site.hidden_open = false;
         Config::save_project_look(&path, &site).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(

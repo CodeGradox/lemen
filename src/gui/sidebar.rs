@@ -116,7 +116,19 @@ impl Lemur {
             }
             // Under the rest, in their order.
             if !hidden.is_empty() {
-                menu = menu.child(rows::Entry::Hidden(hidden));
+                let open = base.hidden_open;
+                let toggle: rows::Toggle = {
+                    let this = this.clone();
+                    Rc::new(move |_, cx| {
+                        this.update(cx, |this, cx| this.toggle_hidden(index, cx))
+                            .ok();
+                    })
+                };
+                menu = menu.child(rows::Entry::Hidden {
+                    entries: hidden,
+                    open,
+                    toggle,
+                });
             }
             let toggle: rows::Toggle = {
                 let this = this.clone();
@@ -237,6 +249,14 @@ impl Lemur {
         };
         let color = worktree_color(&self.cfg.bases[base], &w.path);
         let this = cx.entity().downgrade();
+        let folded = self.cfg.bases[base].collapsed_worktrees.contains(&w.path);
+        let toggle: rows::Toggle = {
+            let (this, worktree) = (this.clone(), w.path.clone());
+            Rc::new(move |_, cx| {
+                this.update(cx, |this, cx| this.toggle_worktree(base, &worktree, cx))
+                    .ok();
+            })
+        };
         let worktree = w.path.clone();
         let (host_name, notes_label) = (host.to_string(), label.clone());
         let add = move |_: &mut Window, _: &mut App| {
@@ -279,6 +299,8 @@ impl Lemur {
             menu,
             color,
             threads: self.threads(host, Some(&w.path), &w.sessions, prefix, cx),
+            folded,
+            toggle,
         }
     }
 

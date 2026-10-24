@@ -83,6 +83,28 @@ impl Lemur {
         self.save_look(index, cx);
     }
 
+    /// Folds a worktree's threads away in the sidebar, or opens them again.
+    pub(super) fn toggle_worktree(&mut self, index: usize, worktree: &str, cx: &mut Context<Self>) {
+        let Some(base) = self.cfg.bases.get_mut(index) else {
+            return;
+        };
+        let folded = base.collapsed_worktrees.len();
+        base.collapsed_worktrees.retain(|p| p != worktree);
+        if base.collapsed_worktrees.len() == folded {
+            base.collapsed_worktrees.push(worktree.to_string());
+        }
+        self.save_look(index, cx);
+    }
+
+    /// Opens a project's Hidden row, or folds it again.
+    pub(super) fn toggle_hidden(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(base) = self.cfg.bases.get_mut(index) else {
+            return;
+        };
+        base.hidden_open = !base.hidden_open;
+        self.save_look(index, cx);
+    }
+
     /// Colors a worktree's folder icon, or with `None` takes its color off.
     pub(super) fn set_worktree_color(
         &mut self,
@@ -180,8 +202,8 @@ impl Lemur {
         cx.notify();
     }
 
-    /// Keeps a project's color, fold, worktree order and hidden worktrees in
-    /// the config file.
+    /// Keeps how a project shows in the sidebar in the config file: its
+    /// fold, and its worktrees' order, colors, folds and which are hidden.
     fn save_look(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(file) = Prefs::get(cx).config_file()
             && let Err(e) = Config::save_project_look(file, &self.cfg.bases[index])
@@ -410,19 +432,24 @@ impl Lemur {
         .detach();
     }
 
-    /// Forgets a removed worktree's color, place in the order, and that it
-    /// was hidden.
+    /// Forgets a removed worktree's color, place in the order, that it was
+    /// hidden, and its fold, so a new one in its folder starts open.
     fn forget_worktree(&mut self, index: usize, worktree: &str, cx: &mut Context<Self>) {
         let Some(base) = self.cfg.bases.get_mut(index) else {
             return;
         };
-        let had_color = base.worktree_colors.remove(worktree).is_some();
-        let placed = base.worktree_order.len();
-        base.worktree_order.retain(|p| p != worktree);
-        let hidden = base.hidden_worktrees.len();
-        base.hidden_worktrees.retain(|p| p != worktree);
-        if had_color || base.worktree_order.len() != placed || base.hidden_worktrees.len() != hidden
-        {
+        let mut changed = base.worktree_colors.remove(worktree).is_some();
+        let lists = [
+            &mut base.worktree_order,
+            &mut base.hidden_worktrees,
+            &mut base.collapsed_worktrees,
+        ];
+        for list in lists {
+            let had = list.len();
+            list.retain(|p| p != worktree);
+            changed |= list.len() != had;
+        }
+        if changed {
             self.save_look(index, cx);
         }
     }
