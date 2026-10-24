@@ -1882,6 +1882,47 @@ mod tests {
         });
     }
 
+    /// Clicking a worktree folds its threads away and back; clicking one of
+    /// its buttons does what the button says and leaves it open.
+    #[gpui::test]
+    fn clicking_a_worktree_folds_its_threads(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("fold-wt");
+        let dir = TempDir::new("fold-wt");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let path = repo.to_string_lossy().into_owned();
+        server.tmux(&["new-session", "-d", "-s", "api/t", "-c", &path, "sleep 600"]);
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &path));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let shown = |cx: &mut VisualTestContext| cx.debug_bounds("thread-0").is_some();
+        assert!(shown(cx));
+
+        let row = cx
+            .debug_bounds("worktree-0")
+            .expect("the worktree")
+            .center();
+        cx.simulate_click(row, Modifiers::none());
+        cx.run_until_parked();
+        assert!(!shown(cx));
+        cx.simulate_click(row, Modifiers::none());
+        cx.run_until_parked();
+        assert!(shown(cx));
+
+        // + is the last of its buttons.
+        let buttons = cx.debug_bounds("buttons main").expect("its buttons");
+        let add = point(buttons.right() - px(4.0), buttons.center().y);
+        cx.simulate_click(add, Modifiers::none());
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert!(app.prompt.is_some()));
+        assert!(shown(cx));
+    }
+
     /// Dropping a worktree on another moves it there, and the next refresh
     /// keeps that order; the main checkout stays known wherever it is.
     #[gpui::test]

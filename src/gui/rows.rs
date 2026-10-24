@@ -129,12 +129,15 @@ impl SidebarItem for Menu {
     }
 }
 
-/// A project in the sidebar: its name over its rows, with a menu for it on
-/// hover (⋯) and on right-click; clicking the name folds the rows away.
-/// Stands in for gpui-component's SidebarGroup, which does neither.
+/// A project in the sidebar: its name on a tinted band over its rows, with
+/// a menu for it on hover (⋯) and on right-click; clicking the band folds
+/// the rows away. Stands in for gpui-component's SidebarGroup, which does
+/// neither.
 #[derive(Clone)]
 pub struct Group {
     label: SharedString,
+    /// The host it's on, after the name and quieter.
+    host: Option<SharedString>,
     menu: Option<MenuBuilder>,
     folded: bool,
     toggle: Option<Toggle>,
@@ -147,12 +150,18 @@ impl Group {
     pub fn new(label: impl Into<SharedString>, rows: Menu) -> Self {
         Group {
             label: label.into(),
+            host: None,
             menu: None,
             folded: false,
             toggle: None,
             drag: None,
             rows,
         }
+    }
+
+    pub fn host(mut self, host: impl Into<SharedString>) -> Self {
+        self.host = Some(host.into());
+        self
     }
 
     pub fn menu(mut self, menu: MenuBuilder) -> Self {
@@ -201,21 +210,37 @@ impl SidebarItem for Group {
         let id: SharedString = id.into().to_string().into();
         let theme = cx.theme();
         let hover_group = SharedString::from(format!("{id}-header"));
-        let muted = theme.sidebar_foreground.opacity(0.7);
-        let label = self.label.clone();
-        let dragged_label = self.label.clone();
+        let text = theme.sidebar_foreground;
+        let label: SharedString = match &self.host {
+            Some(host) => format!("{} · {host}", self.label).into(),
+            None => self.label.clone(),
+        };
+        let dragged_label = label.clone();
         let name = h_flex()
+            .flex_1()
             .gap_1p5()
             .items_center()
-            .when(self.toggle.is_some(), |this| {
+            .child(div().text_sm().font_semibold().child(self.label))
+            .when_some(self.host, |this, host| {
                 this.child(
+                    div()
+                        .text_xs()
+                        .text_color(text.opacity(0.8))
+                        .child(format!("· {host}")),
+                )
+            });
+        // On the right, as a worktree's caret is; a click on it reaches the
+        // header, which folds.
+        let (foldable, folded) = (self.toggle.is_some(), self.folded);
+        let chevron = move || {
+            foldable.then(|| {
+                Button::new("fold").xsmall().ghost().icon(
                     Icon::new(IconName::ChevronRight)
-                        .size_3()
-                        .text_color(muted)
-                        .when(!self.folded, |this| this.rotate(percentage(90. / 360.))),
+                        .size_4()
+                        .when(!folded, |this| this.rotate(percentage(90. / 360.))),
                 )
             })
-            .child(self.label);
+        };
         let header = h_flex()
             .id("header")
             .debug_selector(move || format!("project {label}"))
@@ -223,10 +248,13 @@ impl SidebarItem for Group {
             .flex_shrink_0()
             .px_2()
             .h_8()
-            .justify_between()
+            .gap_1()
             .rounded(theme.radius)
-            .text_xs()
-            .text_color(muted)
+            .border_1()
+            .border_color(theme.sidebar_border)
+            // Lighter than a selected thread's row, so the two don't look alike.
+            .bg(theme.sidebar_accent.opacity(0.5))
+            .text_color(text)
             .child(name)
             .when_some(self.toggle, |this, toggle| {
                 this.cursor_pointer()
@@ -257,13 +285,15 @@ impl SidebarItem for Group {
                                     .dropdown_menu(move |m, window, cx| dropdown(m, window, cx)),
                             ),
                     )
+                    .children(chevron())
                     .context_menu(move |m, window, cx| menu(m, window, cx))
                     .into_any_element()
             }
-            None => header.into_any_element(),
+            None => header.children(chevron()).into_any_element(),
         };
         v_flex()
             .id(id.clone())
+            .gap_1p5()
             .child(header)
             .when(!self.folded, |this| {
                 this.child(self.rows.render(format!("{id}-rows"), window, cx))
@@ -344,7 +374,8 @@ struct WorktreeLook {
     drag: Option<(SharedString, usize, Reorder)>,
 }
 
-/// A worktree row, open by default; its caret folds the threads away.
+/// A worktree row, open by default; clicking it or its caret folds the
+/// threads away.
 #[allow(clippy::too_many_arguments)]
 fn worktree(
     id: SharedString,
@@ -359,17 +390,31 @@ fn worktree(
     let has_threads = !threads.rows.is_empty();
     let open = window.use_keyed_state(id.clone(), cx, |_, _| true);
     let is_open = has_threads && *open.read(cx);
+    let fold = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+        cx.stop_propagation();
+        open.update(cx, |open, cx| {
+            *open = !*open;
+            cx.notify();
+        })
+    };
     let icon = Icon::new(IconName::Folder).when_some(look.color, |i, c| i.text_color(c));
+    // Its buttons do what they say without folding it.
+    let buttons = format!("buttons {label}");
+    let suffix = h_flex()
+        .id("suffix")
+        .debug_selector(move || buttons)
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .child(suffix(window, cx));
     let header = row(
         "worktree",
         icon,
         label.clone(),
         false,
-        suffix(window, cx),
+        suffix.into_any_element(),
         cx,
     )
     .when(has_threads, |this| {
-        this.child(
+        this.cursor_pointer().on_click(fold.clone()).child(
             Button::new("caret")
                 .xsmall()
                 .ghost()
@@ -378,13 +423,7 @@ fn worktree(
                         .size_4()
                         .when(is_open, |this| this.rotate(percentage(90. / 360.))),
                 )
-                .on_click(move |_, _, cx| {
-                    cx.stop_propagation();
-                    open.update(cx, |open, cx| {
-                        *open = !*open;
-                        cx.notify();
-                    })
-                }),
+                .on_click(fold),
         )
     });
     let header = match look.drag {

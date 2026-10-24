@@ -117,7 +117,8 @@ impl Lemur {
             };
             // Projects move by their place in the config.
             groups.push(
-                rows::Group::new(format!("{} · {}", base.name(), h.name), menu)
+                rows::Group::new(base.name(), menu)
+                    .host(h.name.clone())
                     .foldable(base.collapsed, toggle)
                     .draggable("projects", index, move_project.clone())
                     .menu(self.project_menu(index, cx)),
@@ -135,10 +136,13 @@ impl Lemur {
                 ));
             } else if !h.other.is_empty() {
                 let threads = self.threads(&h.name, None, &h.other, "", cx);
-                groups.push(rows::Group::new(
-                    format!("other · {}", h.name),
-                    rows::Menu::default().child(rows::Entry::Threads(threads)),
-                ));
+                groups.push(
+                    rows::Group::new(
+                        "other",
+                        rows::Menu::default().child(rows::Entry::Threads(threads)),
+                    )
+                    .host(h.name.clone()),
+                );
             }
         }
         // Named as in the File menu.
