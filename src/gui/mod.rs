@@ -1427,7 +1427,8 @@ mod tests {
         });
     }
 
-    /// A worktree with changes isn't removed without asking again.
+    /// A worktree with changes isn't removed without asking again, and its
+    /// thread keeps running until it is.
     #[gpui::test]
     fn removing_a_changed_worktree_asks_again(cx: &mut gpui::TestAppContext) {
         let server = TmuxServer::new("rm-dirty");
@@ -1440,10 +1441,27 @@ mod tests {
         git(&["worktree", "add", "-q", "-b", "draft", "wt"]);
         let wt = repo.join("wt");
         std::fs::write(wt.join("notes.txt"), "unsaved").unwrap();
+        let path = wt.to_string_lossy().into_owned();
+        server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "repo/t",
+            "-c",
+            &path,
+            "sleep 600",
+        ]);
+        // Keeps the tmux server up once repo/t is closed.
+        server.tmux(&["new-session", "-d", "-s", "other"]);
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
         let (app, cx) = rooted(cfg, cx);
-        let path = wt.to_string_lossy().into_owned();
+        let alive = || {
+            server
+                .tmux(&["list-sessions", "-F", "#{session_name}"])
+                .lines()
+                .any(|l| l == "repo/t")
+        };
 
         let remove = |force: bool, cx: &mut VisualTestContext| {
             app.update(cx, |app, cx| {
@@ -1454,17 +1472,24 @@ mod tests {
             });
             cx.run_until_parked();
         };
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .removal(0, path.clone(), "draft".into())
+                .sessions),
+            ["repo/t"]
+        );
         remove(false, cx);
-        assert!(wt.exists());
+        assert!(wt.exists() && alive());
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
         cx.update(|window, cx| window.close_dialog(cx));
+        assert!(alive());
 
         // Its folder color goes with it.
         app.update(cx, |app, cx| {
             app.set_worktree_color(0, &path, Some("red"), cx)
         });
         remove(true, cx);
-        assert!(!wt.exists());
+        assert!(!wt.exists() && !alive());
         app.read_with(cx, |app, _| {
             assert!(app.cfg.bases[0].worktree_colors.is_empty())
         });
@@ -1522,6 +1547,88 @@ mod tests {
         cx.run_until_parked();
         assert!(wait_until(Duration::from_secs(5), || !gone.exists()));
         assert!(!listed().contains("wt/gone"));
+    }
+
+    /// The remove dialog names the threads running in a worktree. Cancelling
+    /// keeps them and it; agreeing closes them, then removes it. One the
+    /// sidebar didn't know of yet keeps it until the host's ask is agreed to.
+    #[gpui::test]
+    fn removing_a_worktree_closes_its_threads_first(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("rm-threads");
+        let dir = TempDir::new("rm-threads");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", "-b", "busy", "wt/busy"]);
+        git(&["worktree", "add", "-q", "-b", "late", "wt/late"]);
+        let (busy, late) = (repo.join("wt/busy"), repo.join("wt/late"));
+        let start = |name: &str, dir: &std::path::Path| {
+            let dir = dir.to_string_lossy();
+            server.tmux(&["new-session", "-d", "-s", name, "-c", &dir, "sleep 600"]);
+        };
+        start("repo/claude--calm-heron", &busy);
+        // Keeps the tmux server up once the others are closed.
+        server.tmux(&["new-session", "-d", "-s", "other"]);
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let alive = |name: &str| {
+            server
+                .tmux(&["list-sessions", "-F", "#{session_name}"])
+                .lines()
+                .any(|l| l == name)
+        };
+        let listed = || {
+            let out = std::process::Command::new("git")
+                .args(["worktree", "list"])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // Opens the remove dialog; returns the threads it names.
+        let confirm = |worktree: &std::path::Path, cx: &mut VisualTestContext| {
+            let path = worktree.to_string_lossy().into_owned();
+            let named = cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    let removal = app.removal(0, path, "x".into());
+                    let named = removal.sessions.clone();
+                    app.confirm_remove_worktree(removal, None, window, cx);
+                    named
+                })
+            });
+            cx.run_until_parked();
+            assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+            named
+        };
+
+        assert_eq!(confirm(&busy, cx), ["repo/claude--calm-heron"]);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(alive("repo/claude--calm-heron") && listed().contains("wt/busy"));
+
+        confirm(&busy, cx);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(wait_until(Duration::from_secs(5), || !listed().contains("wt/busy")));
+        assert!(!alive("repo/claude--calm-heron"));
+
+        // Started after the sidebar last looked: the host asks about it.
+        start("repo/review--bold-otter", &late);
+        assert!(confirm(&late, cx).is_empty());
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(alive("repo/review--bold-otter") && listed().contains("wt/late"));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(wait_until(Duration::from_secs(5), || !listed().contains("wt/late")));
+        assert!(!alive("repo/review--bold-otter"));
     }
 
     /// A new worktree's prompt offers the host's branches to start from,

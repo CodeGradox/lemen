@@ -288,12 +288,13 @@ pub fn set_order(cfg: &Config, host: &str, sessions: &[String]) -> Result<()> {
 }
 
 /// Takes a linked worktree of `base` out of git; its branch stays, and its
-/// folder stays as plain files unless `delete`. Git keeps a locked one, and
-/// when deleting, one with uncommitted changes, unless `force`, which
-/// unlocks it and throws the changes away. Once git has let go of it, the
-/// threads that ran in it, `sessions`, are closed. Then whatever is left of
-/// a deleted folder goes too: git can't delete read-only folders, and a
-/// thread may have written more.
+/// folder stays as plain files unless `delete`. The threads running in it
+/// close first: those started or filed there, and those with a pane in it.
+/// Nothing closes or changes until all that would keep it is ruled out: a
+/// thread that isn't one of `sessions` (the error names them all, see
+/// `why_kept`), and as git refuses, a lock, and when deleting, uncommitted
+/// changes. `force` unlocks it and throws the changes away. Whatever is
+/// left of a deleted folder goes too: git can't delete read-only folders.
 pub fn remove_worktree(
     cfg: &Config,
     base: usize,
@@ -305,67 +306,112 @@ pub fn remove_worktree(
     let b = &cfg.bases[base];
     let r = Remote::new(cfg.host_or_err(&b.host)?);
     let tmux = r.tmux();
-    let close: String = sessions
-        .iter()
-        .map(|s| format!("{tmux} kill-session -t {} 2>/dev/null || true\n", target(s)))
-        .collect();
+    let unasked = if sessions.is_empty() {
+        "true".to_string()
+    } else {
+        let names: String = sessions
+            .iter()
+            .map(|s| format!(" -e {}", quote(s)))
+            .collect();
+        format!("printf '%s\\n' \"$found\" | grep -vxqF{names}")
+    };
+    let threads = format!(
+        r#"found=$({{ {tmux} list-sessions -F {}; {tmux} list-panes -a -F {}; }} 2>/dev/null | awk -F '[|]::[|]' -v wt="$wt" '{{ for (i = 2; i <= NF; i++) if ($i == wt || index($i, wt "/") == 1) {{ if (!seen[$1]++) print $1; next }} }}')
+if [ -n "$found" ] && {unasked}; then
+    printf '%s\n%s\n' {} "$found" >&2
+    exit 1
+fi
+"#,
+        quote(IN_SESSION),
+        quote(IN_PANE),
+        quote(STILL_RUNNING),
+    );
     let unlock = if force {
         "git worktree unlock \"$wt\" 2>/dev/null || true\n"
     } else {
         ""
     };
-    // In English, as `why_kept` reads git's refusals.
-    let script = if delete {
+    // Git's refusals, checked before any thread closes, in git's words, as
+    // `why_kept` reads them. A lock keeps it either way.
+    let locked = r#"lock=$(git worktree list --porcelain | awk -v wt="$wt" '/^worktree / { here = (substr($0, 10) == wt) } here && /^locked/ { print "x" substr($0, 8); exit }')
+if [ -n "$lock" ]; then
+    echo "cannot remove a locked working tree, lock reason: ${lock#x}" >&2
+    exit 1
+fi
+"#;
+    // Changes keep it only from deleting, which would lose them; git
+    // checks what `status` lists, untracked files included.
+    let changes = if delete && !force {
+        r#"if [ -d "$wt" ] && [ -n "$(git -C "$wt" status --porcelain --ignore-submodules=none)" ]; then
+    echo "$wt contains modified or untracked files, use --force to delete it" >&2
+    exit 1
+fi
+"#
+    } else {
+        ""
+    };
+    let close = format!(
+        r#"if [ -n "$found" ]; then
+    printf '%s\n' "$found" | while IFS= read -r s; do {tmux} kill-session -t "=$s"; done
+fi
+"#
+    );
+    let remove = if delete {
         let remove = if force { "remove --force" } else { "remove" };
         format!(
-            r#"{unlock}if ! out=$(LC_ALL=C git worktree {remove} "$wt" 2>&1); then
+            r#"if ! out=$(LC_ALL=C git worktree {remove} "$wt" 2>&1); then
     # Git refused, unless it let go and just couldn't delete all of the folder.
     if git worktree list --porcelain | grep -qxF "worktree $wt"; then
         printf '%s\n' "$out" >&2
         exit 1
     fi
 fi
-{close}if [ -e "$wt" ]; then
+if [ -e "$wt" ]; then
     chmod -R u+w "$wt"
     rm -rf "$wt"
 fi
 "#
         )
     } else {
-        // Without its .git file, git prunes it and leaves the rest. A
-        // lock would keep it, so it's refused the way git refuses.
-        format!(
-            r#"{unlock}lock=$(git worktree list --porcelain | awk -v wt="$wt" '/^worktree / {{ here = (substr($0, 10) == wt) }} here && /^locked/ {{ print "x" substr($0, 8); exit }}')
-if [ -n "$lock" ]; then
-    echo "cannot remove a locked working tree, lock reason: ${{lock#x}}" >&2
-    exit 1
-fi
-rm -f "$wt/.git"
-git worktree prune
-{close}"#
-        )
+        // Without its .git file, git prunes it and leaves the rest.
+        "rm -f \"$wt/.git\"\ngit worktree prune\n".to_string()
     };
     r.run(&format!(
-        "set -e\ncd {}\nwt={}\n{script}",
+        "set -e\ncd {}\nwt={}\n{threads}{unlock}{locked}{changes}{close}{remove}",
         sh_path(&b.path),
         quote(worktree)
     ))?;
     Ok(())
 }
 
-/// Why git kept a worktree that removing with `force` removes anyway.
+/// Where a session is: where it started, and the worktree lemur filed it
+/// under, by its tags from before the renames too.
+const IN_SESSION: &str = "#{session_name}|::|#{session_path}|::|#{@lemur_worktree}|::|#{@lemen_worktree}|::|#{@muxbox_worktree}";
+/// Where a pane's shell or program is now.
+const IN_PANE: &str = "#{session_name}|::|#{pane_current_path}";
+/// Starts the refusal that names the threads running in a worktree.
+const STILL_RUNNING: &str = "threads still run in the worktree:";
+
+/// Why a worktree was kept, and what removing it anyway takes: closing its
+/// threads, or `force`.
 #[derive(Debug, PartialEq)]
 pub enum Kept {
+    /// Threads run in it that weren't to be closed: all of them, by name.
+    Threads(Vec<String>),
     Changes,
     /// Locked, with git's reason; Claude Code locks the worktree its
     /// session runs in.
     Locked(String),
 }
 
-/// What kept a worktree from being removed, if `force` would help.
+/// What kept a worktree from being removed, if closing its threads or
+/// `force` would help.
 pub fn why_kept(e: &anyhow::Error) -> Option<Kept> {
     let text = format!("{e:#}");
-    if text.contains("locked working tree") {
+    if let Some((_, names)) = text.split_once(STILL_RUNNING) {
+        let names = names.lines().filter(|l| !l.is_empty());
+        Some(Kept::Threads(names.map(str::to_string).collect()))
+    } else if text.contains("locked working tree") {
         let reason = text
             .split_once("lock reason: ")
             .and_then(|(_, rest)| rest.lines().next())
@@ -505,12 +551,14 @@ pub fn resolve_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TempDir, TmuxServer, git_in};
+    use crate::test_support::{TempDir, TmuxServer, git_in, wait_until};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::time::Duration;
 
-    /// Removing a worktree deletes it and then closes its threads; one with
-    /// changes needs force, and nothing is closed until it's gone.
+    /// Removing a worktree closes its threads and then deletes it. A thread
+    /// it wasn't asked to close, even one that only has a pane in it, keeps
+    /// it and everything in it; so do changes or a lock, until forced.
     #[test]
     fn removing_a_worktree_closes_its_threads() {
         let server = TmuxServer::new("rm-wt");
@@ -549,23 +597,48 @@ mod tests {
                 .any(|l| l == s)
         };
 
-        remove_worktree(
-            &cfg,
-            0,
-            &a.to_string_lossy(),
-            &["repo/a1".into()],
-            false,
-            true,
-        )
-        .unwrap();
+        let a_path = a.to_string_lossy().into_owned();
+        let err = remove_worktree(&cfg, 0, &a_path, &[], false, true).unwrap_err();
+        assert_eq!(
+            why_kept(&err),
+            Some(Kept::Threads(vec!["repo/a1".into()])),
+            "{err:#}"
+        );
+        assert!(a.exists() && alive("repo/a1"));
+        remove_worktree(&cfg, 0, &a_path, &["repo/a1".into()], false, true).unwrap();
         assert!(!a.exists());
         assert!(!alive("repo/a1"));
 
-        std::fs::write(b.join("draft.txt"), "unsaved").unwrap();
+        // Started in the main checkout, its shell has moved into b.
+        let visit = format!("cd {} && exec sleep 600", quote(&b.to_string_lossy()));
+        server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "visitor",
+            "-c",
+            &repo.to_string_lossy(),
+            &visit,
+        ]);
         let b_path = b.to_string_lossy().into_owned();
+        let moved = wait_until(Duration::from_secs(5), || {
+            server.tmux(&["display", "-p", "-t", "=visitor:", "#{pane_current_path}"]) == b_path
+        });
+        assert!(moved, "the visitor's pane never got to {b_path}");
         let err = remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], false, true).unwrap_err();
+        assert_eq!(
+            why_kept(&err),
+            Some(Kept::Threads(vec!["repo/b1".into(), "visitor".into()])),
+            "{err:#}"
+        );
+        assert!(b.exists() && alive("repo/b1") && alive("visitor"));
+
+        // What git would refuse is asked about before any thread closes.
+        std::fs::write(b.join("draft.txt"), "unsaved").unwrap();
+        let both = ["repo/b1".to_string(), "visitor".to_string()];
+        let err = remove_worktree(&cfg, 0, &b_path, &both, false, true).unwrap_err();
         assert_eq!(why_kept(&err), Some(Kept::Changes), "{err:#}");
-        assert!(b.exists() && alive("repo/b1"));
+        assert!(b.exists() && alive("repo/b1") && alive("visitor"));
         // Locked, as Claude Code locks its worktree: force unlocks it too.
         git(&[
             "worktree",
@@ -574,16 +647,16 @@ mod tests {
             "claude session draft (pid 1)",
             "wt/b",
         ]);
-        let err = remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], false, true).unwrap_err();
+        let err = remove_worktree(&cfg, 0, &b_path, &both, false, true).unwrap_err();
         assert_eq!(
             why_kept(&err),
             Some(Kept::Locked("claude session draft (pid 1)".into())),
             "{err:#}"
         );
-        assert!(b.exists() && alive("repo/b1"));
-        remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], true, true).unwrap();
+        assert!(b.exists() && alive("repo/b1") && alive("visitor"));
+        remove_worktree(&cfg, 0, &b_path, &both, true, true).unwrap();
         assert!(!b.exists());
-        assert!(!alive("repo/b1"));
+        assert!(!alive("repo/b1") && !alive("visitor"));
     }
 
     /// The worktrees git lists, by path.
@@ -634,6 +707,8 @@ mod tests {
         let err = remove_worktree(&cfg, 0, &a_path, &["repo/a1".into()], false, false).unwrap_err();
         assert_eq!(why_kept(&err), Some(Kept::Locked(String::new())), "{err:#}");
         assert!(listed(&repo).contains(&a_path.to_string()));
+        let sessions = server.tmux(&["list-sessions", "-F", "#{session_name}"]);
+        assert!(sessions.lines().any(|l| l == "repo/a1"), "{sessions}");
         remove_worktree(&cfg, 0, &a_path, &["repo/a1".into()], true, false).unwrap();
         assert!(!listed(&repo).contains(&a_path.to_string()));
         assert_eq!(

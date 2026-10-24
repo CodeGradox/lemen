@@ -6,7 +6,7 @@ use super::settings::Prefs;
 use super::{Lemur, move_item, moved_to};
 use crate::actions;
 use crate::browse;
-use crate::config::{Base, Config, Host, home};
+use crate::config::{Base, Config, Host, home, leaf};
 use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, WindowExt, v_flex};
@@ -14,13 +14,13 @@ use gpui_kit::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
-/// A worktree to remove, and the threads that close with it.
+/// A worktree to remove, and the threads to close first.
 #[derive(Clone)]
 pub(super) struct Removal {
     base: usize,
     worktree: String,
     label: String,
-    sessions: Vec<String>,
+    pub(super) sessions: Vec<String>,
     /// Its folder goes too; otherwise its files stay, out of git.
     pub(super) delete: bool,
 }
@@ -242,9 +242,11 @@ impl Lemur {
         }
     }
 
-    /// Asks before removing a worktree: git forgets it and the threads in
-    /// it close; deleting its folder on the host is up to you. With `kept`,
-    /// git refused, and this asks whether to force it.
+    /// Asks before removing a worktree: git forgets it, and deleting its
+    /// folder on the host is up to you. Threads running in it are named,
+    /// and close first. With `kept`, the host refused: it found threads in
+    /// it, and this asks to close them, or git kept it, and this asks
+    /// whether to force it.
     pub(super) fn confirm_remove_worktree(
         &mut self,
         removal: Removal,
@@ -259,23 +261,23 @@ impl Lemur {
             sessions,
             delete,
         } = &removal;
-        let force = kept.is_some();
+        let force = matches!(
+            kept,
+            Some(actions::Kept::Changes | actions::Kept::Locked(_))
+        );
         // The first time asks whether to delete the folder too.
         let mut ask_delete = None;
+        let mut close = sessions.clone();
         let (title, description, ok) = match kept {
             None => {
                 let host = &self.cfg.bases[*base].host;
-                let threads = match sessions.len() {
-                    0 => String::new(),
-                    1 => " Its thread will be closed.".into(),
-                    n => format!(" Its {n} threads will be closed."),
-                };
                 ask_delete = Some(format!("Also delete {worktree} on {host}"));
-                (
-                    format!("Remove worktree {label}?"),
-                    format!("Git forgets it, and its branch stays.{threads}"),
-                    "Remove",
-                )
+                removing(label, sessions)
+            }
+            Some(actions::Kept::Threads(found)) => {
+                let asked = removing(label, &found);
+                close = found;
+                asked
             }
             Some(actions::Kept::Changes) => (
                 format!("{label} has uncommitted changes"),
@@ -303,7 +305,8 @@ impl Lemur {
         let delete = Rc::new(Cell::new(*delete));
         let this = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (this, removal, delete) = (this.clone(), removal.clone(), delete.clone());
+            let (this, removal, delete, close) =
+                (this.clone(), removal.clone(), delete.clone(), close.clone());
             let mut text = v_flex().gap_3().child(description.clone());
             if let Some(label) = &ask_delete {
                 let delete = delete.clone();
@@ -328,6 +331,7 @@ impl Lemur {
                 .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
                     let removal = Removal {
+                        sessions: close.clone(),
                         delete: delete.get(),
                         ..removal.clone()
                     };
@@ -361,9 +365,10 @@ impl Lemur {
                 this.status = None;
                 match removed {
                     Ok(()) => this.forget_worktree(removal.base, &removal.worktree, cx),
-                    // Git keeps a locked or changed worktree unless forced.
+                    // Threads it wasn't to close keep it until you say; git
+                    // keeps a locked or changed worktree unless forced.
                     Err(e) => match (force, actions::why_kept(&e)) {
-                        (false, Some(kept)) => {
+                        (_, Some(kept @ actions::Kept::Threads(_))) | (false, Some(kept)) => {
                             this.confirm_remove_worktree(removal, Some(kept), window, cx)
                         }
                         _ => this.fail(e, cx),
@@ -388,6 +393,31 @@ impl Lemur {
             self.save_look(index, cx);
         }
     }
+}
+
+/// What removing worktree `label` asks: its title, its description and its
+/// button. Threads running in it, `close`, are named; they close first.
+fn removing(label: &str, close: &[String]) -> (String, String, &'static str) {
+    let names: Vec<&str> = close.iter().map(|s| actions::label(leaf(s))).collect();
+    let title = match names.len() {
+        0 => {
+            return (
+                format!("Remove worktree {label}?"),
+                "Git forgets it, and its branch stays.".into(),
+                "Remove",
+            );
+        }
+        1 => format!("A thread is running in {label}"),
+        n => format!("{n} threads are running in {label}"),
+    };
+    (
+        title,
+        format!(
+            "Lemur closes {} first; then git forgets the worktree, and its branch stays.",
+            names.join(", ")
+        ),
+        "Close and remove",
+    )
 }
 
 /// The hosts a folder can be added from: lemur's own, then the SSH config's
