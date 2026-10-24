@@ -7,8 +7,8 @@ use crate::notes;
 use anyhow::Result;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{
-    DefinitionProvider, Editor, EditorState, Enter, InputEvent, TextDecoration,
-    TextDecorationCollection,
+    DefinitionProvider, Editor, EditorState, Enter, Indent, IndentInline, InputEvent, Paste,
+    TextDecoration, TextDecorationCollection,
 };
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Rope, RopeExt, Sizable, StyledExt, h_flex, v_flex,
@@ -18,6 +18,26 @@ use gpui_kit::*;
 use lsp_types::{LocationLink, Range};
 use std::path::PathBuf;
 use std::rc::Rc;
+
+actions!(
+    notes,
+    [Link, Checklist, TickBox, MoveLinesUp, MoveLinesDown]
+);
+
+/// The key context of the notes' editor, for their own keys.
+pub const CONTEXT: &str = "Notes";
+
+/// The notes' keys besides the editor's: Apple Notes' for a checklist, its
+/// boxes and moving items, and ⌘K for a link.
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-k", Link, Some(CONTEXT)),
+        KeyBinding::new("shift-cmd-l", Checklist, Some(CONTEXT)),
+        KeyBinding::new("shift-cmd-u", TickBox, Some(CONTEXT)),
+        KeyBinding::new("ctrl-cmd-up", MoveLinesUp, Some(CONTEXT)),
+        KeyBinding::new("ctrl-cmd-down", MoveLinesDown, Some(CONTEXT)),
+    ]);
+}
 
 pub struct NotesPanel {
     /// Where notes are saved; tests have none.
@@ -195,18 +215,96 @@ impl NotesPanel {
     }
 
     /// Bullets the lines the selection touches, or gives them boxes with
-    /// `boxed` (see [`bulleted`]), and gives the keyboard back to the notes.
+    /// `boxed`; see [`bulleted`].
     fn bullet(&mut self, boxed: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor.update(cx, |editor, cx| {
+        self.edit(
+            |text, selected| Some(bulleted(text, selected, boxed)),
+            window,
+            cx,
+        );
+    }
+
+    /// Makes the edit `edit` gives for the notes' text and selection, if
+    /// any, as one undo step, and gives the keyboard back to the notes.
+    /// False when there was none.
+    fn edit(
+        &mut self,
+        edit: impl FnOnce(&str, std::ops::Range<usize>) -> Option<Edit>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let done = self.editor.update(cx, |editor, cx| {
             let text = editor.value();
-            let (lines, block, selected) = bulleted(&text, editor.selected_range(), boxed);
-            if text[lines.clone()] != block {
-                editor.set_selected_range(lines, cx);
-                editor.replace(block, window, cx);
+            let Some((range, new, selected)) = edit(&text, editor.selected_range()) else {
+                return false;
+            };
+            if text[range.clone()] != new {
+                editor.set_selected_range(range, cx);
+                editor.replace(new, window, cx);
             }
             editor.set_selected_range(selected, cx);
+            true
         });
         self.editor.focus_handle(cx).focus(window, cx);
+        done
+    }
+
+    /// ⌘K; see [`link`].
+    fn link(&mut self, _: &Link, window: &mut Window, cx: &mut Context<Self>) {
+        let url = clipboard_url(cx);
+        self.edit(
+            |text, selected| link(text, selected, url.as_deref()),
+            window,
+            cx,
+        );
+    }
+
+    /// Pasting a URL over text on one line makes the text a link to it;
+    /// any other paste is the editor's own.
+    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        let Some(url) = clipboard_url(cx) else {
+            return;
+        };
+        if self.edit(
+            |text, selected| pasted_link(text, selected, &url),
+            window,
+            cx,
+        ) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Tab on a list item indents the whole item, as ⌘] does, wherever the
+    /// cursor is in it; anywhere else, Tab is the editor's own.
+    fn indent(&mut self, _: &IndentInline, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        let editor = self.editor.read(cx);
+        let text = editor.text();
+        let row = text.offset_to_point(editor.cursor()).row;
+        if editor.selected_range().is_empty()
+            && list_item(&text.slice_line(row).to_string()).is_some()
+        {
+            window.dispatch_action(Box::new(Indent), cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// ⇧⌘U, as ⌘-Enter.
+    fn tick_box(&mut self, _: &TickBox, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            let cursor = editor.cursor();
+            tick(editor, cursor, window, cx);
+        });
+    }
+
+    /// ⌃⌘↑ and ⌃⌘↓; see [`moved`].
+    fn move_lines(&mut self, up: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit(|text, selected| moved(text, selected, up), window, cx);
     }
 }
 
@@ -259,7 +357,21 @@ impl Render for NotesPanel {
                 .min_h_0()
                 .px_1()
                 .debug_selector(|| "notes-editor".into())
+                .key_context(CONTEXT)
                 .capture_action(cx.listener(Self::enter))
+                .capture_action(cx.listener(Self::paste))
+                .capture_action(cx.listener(Self::indent))
+                .on_action(cx.listener(Self::link))
+                .on_action(
+                    cx.listener(|this, _: &Checklist, window, cx| this.bullet(true, window, cx)),
+                )
+                .on_action(cx.listener(Self::tick_box))
+                .on_action(cx.listener(|this, _: &MoveLinesUp, window, cx| {
+                    this.move_lines(true, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &MoveLinesDown, window, cx| {
+                    this.move_lines(false, window, cx)
+                }))
                 .child(Editor::new(&self.editor).h_full().bordered(false))
                 .into_any_element()
         };
@@ -381,11 +493,7 @@ fn ticked(text: &str) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
 /// when they all are that already. Blank lines among several stay as they
 /// are. Gives the lines' range, what replaces them, and where the
 /// selection goes.
-fn bulleted(
-    text: &str,
-    selected: std::ops::Range<usize>,
-    boxed: bool,
-) -> (std::ops::Range<usize>, String, std::ops::Range<usize>) {
+fn bulleted(text: &str, selected: std::ops::Range<usize>, boxed: bool) -> Edit {
     // A selection that ends where a line starts stops at the line before.
     let last = match selected.end {
         end if end > selected.start && text[..end].ends_with('\n') => end - 1,
@@ -444,6 +552,139 @@ fn bulleted(
     let after = selected.is_empty();
     let selected = moved(selected.start, after)..moved(selected.end, true);
     (start..end, block, selected)
+}
+
+/// An edit to the notes: the bytes it replaces, what with, and where the
+/// selection goes then.
+type Edit = (std::ops::Range<usize>, String, std::ops::Range<usize>);
+
+/// Moves the lines `selected` touches in `text` up past the line above,
+/// or down past the one below. A list item takes the items nested under
+/// it along, and passes a neighbor with its nested items in one go. None
+/// at the top or the bottom.
+fn moved(text: &str, selected: std::ops::Range<usize>, up: bool) -> Option<Edit> {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    // A last newline ends the last line rather than starting another.
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+    let row = |at: usize| text[..at].matches('\n').count();
+    // A selection that ends where a line starts stops at the line before.
+    let end = match selected.end {
+        end if end > selected.start && text[..end].ends_with('\n') => end - 1,
+        end => end,
+    };
+    let (first, mut last) = (row(selected.start), row(end));
+    if last >= lines.len() {
+        return None;
+    }
+    let indent = |line: &str| line.len() - line.trim_start_matches([' ', '\t']).len();
+    let nested = |i: usize, under: usize| !lines[i].trim().is_empty() && indent(lines[i]) > under;
+    let base = indent(lines[first]);
+    while last + 1 < lines.len() && nested(last + 1, base) {
+        last += 1;
+    }
+    let (from, to, order) = if up {
+        let mut above = first.checked_sub(1)?;
+        while above > 0 && nested(above, base) {
+            above -= 1;
+        }
+        (above, last, [first..last + 1, above..first])
+    } else {
+        let below = last + 1;
+        if below == lines.len() {
+            return None;
+        }
+        let mut end = below;
+        let under = indent(lines[below]);
+        while !lines[below].trim().is_empty() && end + 1 < lines.len() && nested(end + 1, under) {
+            end += 1;
+        }
+        (first, end, [below..end + 1, first..last + 1])
+    };
+    let start_of = |i: usize| lines[..i].iter().map(|line| line.len() + 1).sum::<usize>();
+    let range = start_of(from)..start_of(to) + lines[to].len();
+    let block = start_of(first)..start_of(last) + lines[last].len();
+    let lines: Vec<&str> = order.into_iter().flat_map(|r| lines[r].to_vec()).collect();
+    let moved_to = if up {
+        range.start
+    } else {
+        range.end - block.len()
+    };
+    let at = |offset: usize| offset - block.start + moved_to;
+    Some((
+        range,
+        lines.join("\n"),
+        at(selected.start)..at(selected.end),
+    ))
+}
+
+/// Pasting `url` over `selected` in `text`, when that's text on one line
+/// and not a URL itself: `[text](url)`, with the cursor after it.
+fn pasted_link(text: &str, selected: std::ops::Range<usize>, url: &str) -> Option<Edit> {
+    let words = &text[selected.clone()];
+    if words.is_empty() || words.contains('\n') || is_url(words) {
+        return None;
+    }
+    let link = format!("[{words}]({url})");
+    let end = selected.start + link.len();
+    Some((selected, link, end..end))
+}
+
+/// What ⌘K does at `selected` in `text`, given the clipboard's URL if it
+/// holds one. Inside a `[text](url)` link it selects the URL, to edit it.
+/// Over text on one line it links that, and with nothing selected it
+/// starts a link with the cursor in its text. The clipboard's URL comes
+/// selected, so typing replaces it; without one, the cursor waits where
+/// the URL goes.
+fn link(text: &str, selected: std::ops::Range<usize>, url: Option<&str>) -> Option<Edit> {
+    let words = &text[selected.clone()];
+    if words.contains('\n') {
+        return None;
+    }
+    let start = text[..selected.start].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+    if let Some(url) = link_url_at(&text[start..end], selected.start - start) {
+        let url = start + url.start..start + url.end;
+        return Some((selected, words.to_string(), url));
+    }
+    let url = url.unwrap_or("");
+    let link = format!("[{words}]({url})");
+    let after = match words.len() {
+        0 => selected.start + 1..selected.start + 1,
+        n if url.is_empty() => selected.start + n + 3..selected.start + n + 3,
+        n => selected.start + n + 3..selected.start + n + 3 + url.len(),
+    };
+    Some((selected, link, after))
+}
+
+/// The URL of the `[text](url)` link in `line` around byte `at`.
+fn link_url_at(line: &str, at: usize) -> Option<std::ops::Range<usize>> {
+    let mut from = 0;
+    while let Some(mid) = line[from..].find("](").map(|i| from + i) {
+        let open = line[..mid].rfind('[');
+        let close = line[mid + 2..].find(')').map(|i| mid + 2 + i);
+        if let (Some(open), Some(close)) = (open, close)
+            && (open + 1..=close).contains(&at)
+        {
+            return Some(mid + 2..close);
+        }
+        from = mid + 2;
+    }
+    None
+}
+
+/// Whether `text` is one web URL and nothing else.
+fn is_url(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    !chars.is_empty() && url_at(&chars, 0) == Some((0, chars.len()))
+}
+
+/// The URL on the clipboard, when that's all it holds.
+fn clipboard_url(cx: &App) -> Option<String> {
+    let text = cx.read_from_clipboard()?.text()?;
+    let url = text.trim();
+    is_url(url).then(|| url.to_string())
 }
 
 /// Ticks the box on the line at `offset`, or unticks it; false when the
@@ -528,11 +769,14 @@ fn url_link(text: &Rope, offset: usize) -> Option<LocationLink> {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{NotesPanel, bulleted, checkbox, list_item, next_marker, ticked, url_link};
+    use super::{
+        NotesPanel, bulleted, checkbox, link, list_item, moved, next_marker, pasted_link, ticked,
+        url_link,
+    };
     use crate::notes;
     use gpui::VisualTestContext;
     use gpui_kit::component::Rope;
-    use gpui_kit::{AppContext, Entity, Modifiers, point, px, size};
+    use gpui_kit::{AppContext, ClipboardItem, Entity, Modifiers, point, px, size};
     use std::path::{Path, PathBuf};
 
     fn root(name: &str) -> PathBuf {
@@ -693,6 +937,65 @@ mod tests {
     }
 
     #[test]
+    fn a_url_pasted_over_text_links_it() {
+        let url = "https://x.io";
+        assert_eq!(
+            pasted_link("see docs", 4..8, url),
+            Some((4..8, "[docs](https://x.io)".into(), 24..24))
+        );
+        // Not with nothing selected, over a URL, or across lines.
+        assert_eq!(pasted_link("see docs", 8..8, url), None);
+        assert_eq!(pasted_link("https://a.io", 0..12, url), None);
+        assert_eq!(pasted_link("a\nb", 0..3, url), None);
+    }
+
+    #[test]
+    fn cmd_k_links_the_selection_or_selects_a_links_url() {
+        let url = Some("https://x.io");
+        // The clipboard's URL comes selected, to type over.
+        assert_eq!(
+            link("see docs", 4..8, url),
+            Some((4..8, "[docs](https://x.io)".into(), 11..23))
+        );
+        // Without one, the cursor waits where the URL goes.
+        assert_eq!(
+            link("see docs", 4..8, None),
+            Some((4..8, "[docs]()".into(), 11..11))
+        );
+        // With nothing selected, the cursor goes where the text goes.
+        assert_eq!(
+            link("see ", 4..4, url),
+            Some((4..4, "[](https://x.io)".into(), 5..5))
+        );
+        // In a link, its URL is selected.
+        let text = "a [docs](https://x.io) b";
+        assert_eq!(link(text, 4..4, None), Some((4..4, "".into(), 9..21)));
+        assert_eq!(link("a\nb", 0..3, url), None);
+    }
+
+    #[test]
+    fn moving_an_item_takes_its_nested_items_along() {
+        // b and b1 go up past a and a1, and back down again.
+        let text = "- a\n  - a1\n- b\n  - b1\nend";
+        let up = "- b\n  - b1\n- a\n  - a1";
+        assert_eq!(moved(text, 13..13, true), Some((0..21, up.into(), 2..2)));
+        let text = format!("{up}\nend");
+        let down = "- a\n  - a1\n- b\n  - b1";
+        assert_eq!(
+            moved(&text, 2..2, false),
+            Some((0..21, down.into(), 13..13))
+        );
+        // Plain lines go one at a time, and not past the top or the end.
+        assert_eq!(
+            moved("a\nb\n", 2..2, true),
+            Some((0..3, "b\na".into(), 0..0))
+        );
+        assert_eq!(moved("a\nb\n", 0..0, true), None);
+        assert_eq!(moved("a\nb\n", 2..2, false), None);
+        assert_eq!(moved("a\nb\n", 4..4, false), None);
+    }
+
+    #[test]
     fn ticked_items_fade_and_their_words_are_struck_through() {
         let text = "- [x] milk  \n- [ ] eggs\n  - [X] bread";
         assert_eq!(ticked(text), vec![(0..10, 6..10), (24..37, 32..37)]);
@@ -785,6 +1088,47 @@ mod tests {
         assert_eq!(panel.read_with(cx, |p, cx| p.text(cx)), text);
         let saved = notes::load(&notes::file(&root, "agent", "/srv/a")).unwrap();
         assert_eq!(saved, text);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The notes' own keys, as typed: pasting a URL over text links it,
+    /// ⇧⌘U ticks, ⇧⌘L makes a checklist, ⌃⌘↑ moves an item, Tab indents
+    /// one from inside it, and ⌘K in a link selects its URL.
+    #[gpui::test]
+    fn the_notes_keys(cx: &mut gpui::TestAppContext) {
+        let root = root("notes-keys");
+        let (panel, cx) = panel(&root, cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        show(&panel, "/srv/a", cx);
+        let editor = cx.debug_bounds("notes-editor").expect("the editor");
+        cx.simulate_click(editor.center(), Modifiers::none());
+        let text = |cx: &mut VisualTestContext| panel.read_with(cx, |p, cx| p.text(cx));
+
+        cx.simulate_input("see docs");
+        cx.simulate_keystrokes("shift-left shift-left shift-left shift-left");
+        cx.write_to_clipboard(ClipboardItem::new_string("https://x.io\n".into()));
+        cx.simulate_keystrokes("cmd-v");
+        assert_eq!(text(cx), "see [docs](https://x.io)");
+
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("- [ ] tea");
+        cx.simulate_keystrokes("shift-cmd-u enter enter");
+        cx.simulate_input("milk");
+        cx.simulate_keystrokes("shift-cmd-l ctrl-cmd-up");
+        assert_eq!(text(cx), "see [docs](https://x.io)\n- [ ] milk\n- [x] tea");
+
+        cx.simulate_keystrokes("left tab");
+        assert_eq!(
+            text(cx),
+            "see [docs](https://x.io)\n  - [ ] milk\n- [x] tea"
+        );
+
+        cx.simulate_keystrokes("cmd-up right right right right right cmd-k");
+        cx.simulate_input("https://y.io");
+        let edited = "see [docs](https://y.io)\n  - [ ] milk\n- [x] tea";
+        assert_eq!(text(cx), edited);
+        let saved = notes::load(&notes::file(&root, "agent", "/srv/a")).unwrap();
+        assert_eq!(saved, edited);
         let _ = std::fs::remove_dir_all(root);
     }
 }

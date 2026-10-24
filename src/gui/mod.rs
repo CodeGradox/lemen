@@ -76,6 +76,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-tab", NoAction, Some(terminal_view::CONTEXT)),
     ]);
     folder_picker::bind_keys(cx);
+    notes::bind_keys(cx);
     prompt::bind_keys(cx);
 }
 

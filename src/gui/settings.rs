@@ -411,15 +411,38 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
                 more: Some("Holding ⌘ underlines it first."),
             },
             Shortcut {
+                what: "Make a link",
+                how: Press::Keys(&["cmd-k"]),
+                more: Some(
+                    "Of the selected text, to the URL on the clipboard; in a link, it selects the URL.",
+                ),
+            },
+            Shortcut {
+                what: "Link the selected text",
+                how: Press::Keys(&["cmd-v"]),
+                more: Some("Pasting a URL over text on one line."),
+            },
+            Shortcut {
                 what: "Tick a box",
                 how: Press::Click("⌘-click"),
                 more: Some("The [ ] of a - [ ] item; again unticks it."),
             },
-            keys("Tick the box on the cursor's line", &["cmd-enter"]),
+            keys(
+                "Tick the box on the cursor's line",
+                &["cmd-enter", "shift-cmd-u"],
+            ),
+            keys("Make the lines a checklist", &["shift-cmd-l"]),
             Shortcut {
-                what: "Next item with a box",
+                what: "Next list item",
                 how: Press::Keys(&["enter"]),
-                more: Some("At the end of a - [ ] item; on an empty one, it ends the list."),
+                more: Some("At the end of a list item; on an empty one, it ends the list."),
+            },
+            keys("Indent a list item", &["tab", "cmd-]"]),
+            keys("Outdent a list item", &["shift-tab", "cmd-["]),
+            Shortcut {
+                what: "Move the lines up or down",
+                how: Press::Keys(&["ctrl-cmd-up", "ctrl-cmd-down"]),
+                more: Some("A list item takes its nested items along."),
             },
         ],
     ),
