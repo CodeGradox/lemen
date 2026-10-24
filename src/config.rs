@@ -44,6 +44,10 @@ pub struct Config {
     pub hosts: Vec<Host>,
     #[serde(default)]
     pub bases: Vec<Base>,
+    /// The threads Claude runs in, so they can be resumed once their tmux
+    /// session is gone, as after the host restarts. lemur keeps them.
+    #[serde(default)]
+    pub threads: Vec<ClaudeThread>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
@@ -185,6 +189,19 @@ pub struct Base {
     /// Its Hidden section is open; it's folded otherwise.
     #[serde(default)]
     pub hidden_open: bool,
+}
+
+/// A thread Claude runs in, as lemur keeps it to resume it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeThread {
+    pub host: String,
+    /// Its tmux session.
+    pub session: String,
+    /// The folder Claude runs in, where it resumes.
+    pub path: String,
+    /// Claude Code's session ID, as `claude --resume` takes it.
+    pub claude_session: String,
 }
 
 fn default_upload_dir() -> String {
@@ -436,6 +453,41 @@ impl Config {
         })
     }
 
+    /// Keeps `thread` in the config file at `path`, in place of its
+    /// session's entry if it has one.
+    pub fn save_thread(path: &Path, thread: &ClaudeThread) -> Result<()> {
+        edit(path, |doc| {
+            if let Some(tables) = tables_mut(doc, "threads")? {
+                tables.retain(|t| !is_thread(t, &thread.host, &thread.session));
+            }
+            push_table(
+                doc,
+                "threads",
+                &[
+                    ("host", &thread.host),
+                    ("session", &thread.session),
+                    ("path", &thread.path),
+                    ("claude_session", &thread.claude_session),
+                ],
+            )
+        })
+    }
+
+    /// Takes the entries of `sessions` on `host` out of the config file at
+    /// `path`.
+    pub fn remove_threads(path: &Path, host: &str, sessions: &[String]) -> Result<()> {
+        edit(path, |doc| {
+            let Some(tables) = tables_mut(doc, "threads")? else {
+                return Ok(());
+            };
+            tables.retain(|t| !sessions.iter().any(|s| is_thread(t, host, s)));
+            if tables.is_empty() {
+                doc.remove("threads");
+            }
+            Ok(())
+        })
+    }
+
     /// Takes a folder (a base) out of the config file at `path`; its host
     /// stays.
     pub fn remove_folder(path: &Path, base: &Base) -> Result<()> {
@@ -475,13 +527,27 @@ fn edit(path: &Path, change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<
 
 /// The `[[bases]]` tables, if the file has any.
 fn bases_mut(doc: &mut toml_edit::DocumentMut) -> Result<Option<&mut toml_edit::ArrayOfTables>> {
-    match doc.get_mut("bases") {
+    tables_mut(doc, "bases")
+}
+
+/// The `[[key]]` tables, if the file has any.
+fn tables_mut<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    key: &str,
+) -> Result<Option<&'a mut toml_edit::ArrayOfTables>> {
+    match doc.get_mut(key) {
         None => Ok(None),
-        Some(bases) => bases
+        Some(tables) => tables
             .as_array_of_tables_mut()
             .map(Some)
-            .context("bases in the config is not a list of [[bases]] tables"),
+            .with_context(|| format!("{key} in the config is not a list of [[{key}]] tables")),
     }
+}
+
+/// Whether a `[[threads]]` table is that of `session` on `host`.
+fn is_thread(table: &toml_edit::Table, host: &str, session: &str) -> bool {
+    let field = |key| table.get(key).and_then(|v| v.as_str());
+    field("host") == Some(host) && field("session") == Some(session)
 }
 
 /// Whether a `[[bases]]` table is `base`'s.
@@ -695,6 +761,48 @@ collapsed = true
         assert!(at("name = \"agent\"") < at("# this app"), "{saved}");
         assert!(at("# this app") < at("name = \"local\""), "{saved}");
         assert!(at("name = \"local\"") < at("# the api"), "{saved}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_threads_keeps_one_entry_per_session() {
+        let path = std::env::temp_dir().join(format!("lemur-threads-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "# keep me\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n",
+        )
+        .unwrap();
+        let thread = |session: &str, id: &str| ClaudeThread {
+            host: "agent".into(),
+            session: session.into(),
+            path: "/srv/api".into(),
+            claude_session: id.into(),
+        };
+        let threads = |path: &Path| -> Vec<ClaudeThread> {
+            toml::from_str::<Config>(&std::fs::read_to_string(path).unwrap())
+                .unwrap()
+                .threads
+        };
+        Config::save_thread(&path, &thread("api/a--calm-heron", "1")).unwrap();
+        Config::save_thread(&path, &thread("api/b--bold-wren", "2")).unwrap();
+        // A new ID for a session replaces its entry.
+        Config::save_thread(&path, &thread("api/a--calm-heron", "3")).unwrap();
+        assert_eq!(
+            threads(&path),
+            [
+                thread("api/b--bold-wren", "2"),
+                thread("api/a--calm-heron", "3")
+            ]
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep me"), "{saved}");
+
+        Config::remove_threads(&path, "other", &["api/b--bold-wren".into()]).unwrap();
+        assert_eq!(threads(&path).len(), 2, "another host's session stays");
+        let sessions = ["api/a--calm-heron".into(), "api/b--bold-wren".into()];
+        Config::remove_threads(&path, "agent", &sessions).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("threads"), "{saved}");
         let _ = std::fs::remove_file(path);
     }
 

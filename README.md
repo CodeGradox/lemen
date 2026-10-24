@@ -45,7 +45,7 @@ name = "agent"
 ssh = "agent"                     # user@host or a ~/.ssh/config alias; "local" runs here
 # upload_dir = "~/.lemur/uploads"
 # tmux_socket = "work"            # tmux -L; default server if unset
-# claude = "claude"               # command typed into new sessions
+# claude = "claude"               # command typed into new sessions; lemur adds --session-id, or --resume
 
 [[bases]]
 host = "agent"
@@ -60,7 +60,7 @@ path = "~/projects/api"
 # hidden_open = true              # the Hidden section is open
 ```
 
-Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, and the sidebar writes a project's `collapsed`, `worktree_order`, `worktree_colors`, `hidden_worktrees`, `collapsed_worktrees` and `hidden_open`, and the order of the `[[bases]]`; the rest of the file, comments included, stays as it is.
+Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, and the sidebar writes a project's `collapsed`, `worktree_order`, `worktree_colors`, `hidden_worktrees`, `collapsed_worktrees` and `hidden_open`, and the order of the `[[bases]]`. lemur also keeps a `[[threads]]` entry for each Claude thread (its `host`, tmux `session`, `path` and `claude_session` ID) to resume it. The rest of the file, comments included, stays as it is.
 
 New worktrees go in `worktree_dir` (relative to the repo, absolute, or `~/...`): lemur runs `git worktree add` there, then starts Claude in it.
 
@@ -72,6 +72,7 @@ Run `lemur`. The sidebar lists each base's worktrees and their sessions, in the 
 - Click a session to show it. Each opened session keeps its own terminal, so switching is instant. lemur reopens the last session on launch.
 - **New worktree** starts a thread in a new worktree; **+** on a worktree, or `⌘J` for the worktree of the thread on show, starts another session in it: **Claude**, or a plain **Shell**, picked in the spotlight with ↑↓ or a click. A spotlight asks for a label (`claude` or `shell` to start with, following the pick until you type one; a free random name for a new worktree): press Enter to take it, or type your own; Esc or a click outside cancels. For a new worktree it also asks for a **Branch** to create, empty for a detached worktree, and what to start **From**, picked from the host's branches; that starts at the default branch (`origin/HEAD`, like `origin/main`). A remote's branch is fetched first; if that fails, the worktree starts where it was last fetched, and the header says so. Several sessions can share a label: lemur names the tmux session `<label>--<random words>`, like `claude--calm-heron`, and shows only the label. Claude sessions get Claude's spark as their icon, shells a terminal.
 - **×** on a session, clicked twice, kills it. The worktree stays.
+- When a thread's tmux session is gone, as after the host restarts, lemur still knows its Claude conversation: the thread stays under its worktree, dimmed. Click it, or its **▶**, to start its session again and resume the conversation there (`claude --resume`); a project's **⋯** → **Resume all threads** brings back each of its threads, and right-click → **Forget** drops one instead. New Claude threads start with `claude --session-id`, and while threads run lemur keeps their IDs up to date from `claude agents`, after a `/clear` too; a thread started before lemur kept IDs gets one once lemur sees it running. Killing a thread in lemur, or removing its worktree, forgets it.
 - Right-click a worktree → **Remove worktree…** to take it out of git; its branch stays. If threads are running in it, the dialog names them: **Close and remove** closes them first, and **Cancel** keeps them and the worktree. lemur checks the host too, so a thread the sidebar hasn't shown yet, or one whose terminal has `cd`'d into the worktree, is asked about the same way. Its folder stays on the host as plain files unless you tick **Also delete**, which deletes it, read-only parts included. One that's locked (Claude Code locks the worktree its session runs in) asks again before **Remove anyway**, which unlocks it; so does deleting one with uncommitted changes, which drops them. These asks all come before any thread closes, so cancelling one keeps the threads running. The main checkout and plain folders can't be removed this way.
 - Click a project's name to fold it away, or open it again, and a worktree to fold its threads. What's folded stays so, across restarts too.
 - Right-click a worktree → **Color** to give its folder icon one of ten colors.

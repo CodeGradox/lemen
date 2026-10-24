@@ -37,6 +37,8 @@ pub struct Threads {
     /// Tells lists apart: a thread only drops into its own.
     pub key: SharedString,
     pub rows: Vec<Thread>,
+    /// Threads whose session is gone, dimmed under the rest.
+    pub gone: Vec<Thread>,
     pub reorder: Reorder,
 }
 
@@ -408,7 +410,7 @@ fn worktree(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let has_threads = !threads.rows.is_empty();
+    let has_threads = !threads.rows.is_empty() || !threads.gone.is_empty();
     let is_open = has_threads && !look.folded;
     let toggle = look.toggle;
     let fold = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
@@ -575,7 +577,33 @@ fn draggable(
 }
 
 fn thread_list(threads: Threads, window: &mut Window, cx: &mut App) -> AnyElement {
-    let Threads { key, rows, reorder } = threads;
+    let Threads {
+        key,
+        rows,
+        gone,
+        reorder,
+    } = threads;
+    let gone: Vec<_> = gone
+        .into_iter()
+        .enumerate()
+        .map(|(ix, t)| {
+            let (on_click, menu) = (t.on_click, t.menu);
+            let id = format!("gone-{ix}");
+            let suffix = (t.suffix)(window, cx);
+            row(
+                SharedString::from(id.clone()),
+                t.icon,
+                t.label,
+                false,
+                suffix,
+                cx,
+            )
+            .debug_selector(move || id)
+            .opacity(0.6)
+            .on_click(move |event, window, cx| on_click(event, window, cx))
+            .context_menu(move |m, window, cx| menu(m, window, cx))
+        })
+        .collect();
     v_flex()
         .gap_1()
         .children(rows.into_iter().enumerate().map(|(ix, t)| {
@@ -593,5 +621,6 @@ fn thread_list(threads: Threads, window: &mut Window, cx: &mut App) -> AnyElemen
             draggable(row, key.clone(), ix, t.label, reorder.clone(), cx)
                 .context_menu(move |m, window, cx| menu(m, window, cx))
         }))
+        .children(gone)
         .into_any_element()
 }

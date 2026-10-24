@@ -2,9 +2,9 @@
 //! a rename, and what happens once one is given.
 
 use super::sidebar::claude_icon;
-use super::{Ask, Key, Lemur, Prompt, sessions, spotlight, worktree_label};
+use super::{Ask, Lemur, Prompt, sessions, spotlight, worktree_label};
 use crate::actions;
-use crate::config::leaf;
+use crate::config::{ClaudeThread, leaf};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectState};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, IndexPath, Sizable, h_flex, v_flex};
@@ -41,7 +41,7 @@ pub(super) struct WorktreeFields {
 
 enum Done {
     /// With a note about how it went, if there's one.
-    Started(Key, Option<String>),
+    Started(actions::Started, Option<String>),
     Renamed {
         host: String,
         old: String,
@@ -352,9 +352,12 @@ impl Lemur {
             |this, done, window, cx| {
                 this.renaming = None;
                 match done {
-                    Ok(Done::Started((host, session), note)) => {
+                    Ok(Done::Started(started, note)) => {
                         this.status = note.map(|note| (note, false));
-                        this.open(host, session, window, cx);
+                        if let Some(claude) = started.claude {
+                            this.keep_thread(claude, cx);
+                        }
+                        this.open(started.host, started.session, window, cx);
                     }
                     Ok(Done::Renamed { host, old, new }) => {
                         this.status = None;
@@ -368,8 +371,20 @@ impl Lemur {
         .detach();
     }
 
-    /// Moves the open terminal and the selection to a renamed session.
+    /// Moves the open terminal, the selection and the thread kept to
+    /// resume to a renamed session.
     fn follow_rename(&mut self, host: String, old: String, new: String, cx: &mut Context<Self>) {
+        let kept = self
+            .cfg
+            .threads
+            .iter()
+            .find(|t| t.host == host && t.session == old)
+            .cloned();
+        if let Some(thread) = kept {
+            self.forget_threads(&host, std::slice::from_ref(&old), cx);
+            let session = new.clone();
+            self.keep_thread(ClaudeThread { session, ..thread }, cx);
+        }
         let old_key = (host.clone(), old);
         let new_key = (host.clone(), new.clone());
         if let Some(view) = self.terminals.remove(&old_key) {

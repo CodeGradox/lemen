@@ -11,6 +11,7 @@ mod notes;
 mod notification;
 mod projects;
 mod prompt;
+mod resume;
 mod rows;
 mod settings;
 mod sidebar;
@@ -430,6 +431,7 @@ impl Lemur {
         }
         self.snap = snap;
         self.loaded = true;
+        self.keep_claude_ids(cx);
         self.notify_news(news, window, cx);
         if let Some((host, session)) = restore {
             self.open(host, session, window, cx);
@@ -623,12 +625,15 @@ impl Lemur {
         self.confirm_kill = None;
         let cfg = self.cfg.clone();
         let (host, session) = key;
+        let killed = (host.clone(), vec![session.clone()]);
         self.in_background(
             cx,
             move || actions::kill_session(&cfg, &host, &session),
-            |this, killed, _, cx| {
-                if let Err(e) = killed {
-                    this.fail(e, cx);
+            move |this, result, _, cx| {
+                match result {
+                    // Killed, it's not to come back.
+                    Ok(()) => this.forget_threads(&killed.0, &killed.1, cx),
+                    Err(e) => this.fail(e, cx),
                 }
                 this.refresh(cx).detach();
             },
@@ -988,6 +993,7 @@ mod tests {
                 waiting_for: None,
                 started_claude: false,
                 order: None,
+                claude: None,
             })
             .collect();
         Snapshot {
@@ -996,6 +1002,7 @@ mod tests {
                 error: None,
                 bases: vec![],
                 other,
+                gone: vec![],
             }],
         }
     }
@@ -1258,6 +1265,7 @@ mod tests {
             .hosts
             .remove(0)
             .other,
+            gone: vec![],
         };
         let snap = Snapshot {
             hosts: vec![HostView {
@@ -1277,6 +1285,7 @@ mod tests {
                     ],
                 }],
                 other: vec![],
+                gone: vec![],
             }],
         };
         cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
@@ -1317,6 +1326,7 @@ mod tests {
             head: head.map(str::to_string),
             main: false,
             sessions: vec![],
+            gone: vec![],
         };
         let label = |b, h| super::worktree_label(&worktree(b, h));
         assert_eq!(
@@ -1729,6 +1739,159 @@ mod tests {
         assert_eq!(current("loose"), "", "detached");
     }
 
+    /// A Claude thread lemur starts is kept to resume. Once its session is
+    /// gone, as after the host restarts, it stays under its worktree,
+    /// dimmed: a click resumes it, so does Resume all, Forget drops it, and
+    /// killing a thread forgets it.
+    #[gpui::test]
+    fn gone_threads_resume_their_claude(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("gone");
+        let dir = TempDir::new("gone");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let path = repo.canonicalize().unwrap().to_string_lossy().into_owned();
+        let mut cfg = server.config();
+        // Prints what Claude would get.
+        cfg.hosts[0].claude = "echo claude".into();
+        cfg.bases.push(Base::new("local", &path));
+        let (app, cx) = rooted(cfg, cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let kept = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.cfg.threads.clone());
+        let refresh = |cx: &mut VisualTestContext| {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+        };
+        let restart = |cx: &mut VisualTestContext| {
+            server.tmux(&["kill-server"]);
+            refresh(cx);
+        };
+        let shown = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector).is_some()
+        };
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let ask = Ask::NewThread {
+                    base: 0,
+                    worktree: path.clone(),
+                    shell: false,
+                };
+                app.ask_name(ask, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        // As the other prompts' tests do: Enter on the selected label
+        // would replace it here.
+        cx.simulate_input("claude");
+        cx.simulate_keystrokes("enter");
+        wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            !kept(cx).is_empty()
+        });
+        let threads = kept(cx);
+        let [thread] = threads.as_slice() else {
+            let status = app.read_with(cx, |app, _| app.status.clone());
+            panic!("kept {threads:?}, status {status:?}");
+        };
+        assert!(crate::actions::is_uuid(&thread.claude_session));
+        assert_eq!(thread.path, path);
+        let typed = |text: &str| {
+            let pane = format!("={}:", thread.session);
+            wait_until(Duration::from_secs(5), || {
+                server
+                    .tmux(&["capture-pane", "-p", "-t", &pane])
+                    .contains(text)
+            })
+        };
+        assert!(typed(&format!(
+            "claude --session-id {}",
+            thread.claude_session
+        )));
+        let resumed = format!("claude --resume {}", thread.claude_session);
+
+        restart(cx);
+        assert!(shown("gone-0", cx) && !shown("thread-0", cx));
+        let row = cx.debug_bounds("gone-0").unwrap().center();
+        cx.simulate_click(row, Modifiers::none());
+        cx.run_until_parked();
+        assert!(typed(&resumed), "{resumed} never ran");
+        refresh(cx);
+        assert!(shown("thread-0", cx) && !shown("gone-0", cx));
+
+        restart(cx);
+        app.update(cx, |app, cx| {
+            let gone = app.gone_in(0);
+            assert_eq!(gone.len(), 1);
+            app.resume(gone, cx)
+        });
+        cx.run_until_parked();
+        assert!(typed(&resumed), "Resume all never ran it");
+        refresh(cx);
+        assert!(shown("thread-0", cx));
+
+        // Killed in lemur, it's forgotten.
+        let key: Key = ("local".into(), thread.session.clone());
+        for _ in 0..2 {
+            app.update(cx, |app, cx| app.kill(key.clone(), cx));
+        }
+        cx.run_until_parked();
+        assert!(kept(cx).is_empty());
+        assert!(!shown("thread-0", cx) && !shown("gone-0", cx));
+
+        // Forgotten, it's gone for good.
+        app.update(cx, |app, cx| app.keep_thread(thread.clone(), cx));
+        refresh(cx);
+        assert!(shown("gone-0", cx));
+        app.update(cx, |app, cx| {
+            app.forget_threads("local", std::slice::from_ref(&thread.session), cx)
+        });
+        cx.run_until_parked();
+        assert!(kept(cx).is_empty() && !shown("gone-0", cx));
+        refresh(cx);
+        assert!(!shown("gone-0", cx));
+    }
+
+    /// Refreshes keep each running Claude's session ID: a thread lemur
+    /// didn't start gets kept, `/clear`ing it keeps the new ID, and the
+    /// conversation going on under another name moves it there.
+    #[gpui::test]
+    fn refreshes_keep_claude_ids_current(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("ids");
+        let (app, cx) = rooted(server.config(), cx);
+        let id = |n: u8| format!("0fdfabeb-ca80-4916-a103-275bbb5e86{n:02}");
+        let running = |runs: &[(&str, String)], cx: &mut VisualTestContext| {
+            let names: Vec<_> = runs.iter().map(|(s, _)| (*s, Activity::Idle)).collect();
+            let mut snap = snapshot(&names);
+            for (s, (_, id)) in snap.hosts[0].other.iter_mut().zip(runs) {
+                s.claude = Some(snapshot::ClaudeRun {
+                    id: id.clone(),
+                    path: "/srv/api".into(),
+                });
+            }
+            cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
+        };
+        let kept = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                app.cfg
+                    .threads
+                    .iter()
+                    .map(|t| (t.session.clone(), t.claude_session.clone()))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        running(&[("a", id(1)), ("b", "not-an-id".into())], cx);
+        assert_eq!(kept(cx), [("a".into(), id(1))]);
+        running(&[("a", id(2))], cx);
+        assert_eq!(kept(cx), [("a".into(), id(2))], "after /clear");
+        running(&[("c", id(2))], cx);
+        assert_eq!(kept(cx), [("c".into(), id(2))], "renamed by hand");
+    }
+
     /// ⌘J asks for a new thread in the worktree on show: Claude or Shell,
     /// picked with ↑↓ or a click, and its name, which follows the pick until
     /// you type one.
@@ -1755,9 +1918,11 @@ mod tests {
                         head: None,
                         main: false,
                         sessions: snapshot(&[("api/t", Activity::Idle)]).hosts.remove(0).other,
+                        gone: vec![],
                     }],
                 }],
                 other: vec![],
+                gone: vec![],
             }],
         };
         cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));

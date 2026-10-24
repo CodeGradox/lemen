@@ -433,11 +433,13 @@ impl Lemur {
     }
 
     /// Forgets a removed worktree's color, place in the order, that it was
-    /// hidden, and its fold, so a new one in its folder starts open.
+    /// hidden, and its fold, so a new one in its folder starts open; and
+    /// the threads kept to resume in it.
     fn forget_worktree(&mut self, index: usize, worktree: &str, cx: &mut Context<Self>) {
         let Some(base) = self.cfg.bases.get_mut(index) else {
             return;
         };
+        let host = base.host.clone();
         let mut changed = base.worktree_colors.remove(worktree).is_some();
         let lists = [
             &mut base.worktree_order,
@@ -452,6 +454,16 @@ impl Lemur {
         if changed {
             self.save_look(index, cx);
         }
+        // Nothing resumes where it was.
+        let inside = format!("{worktree}/");
+        let threads: Vec<String> = self
+            .cfg
+            .threads
+            .iter()
+            .filter(|t| t.host == host && (t.path == worktree || t.path.starts_with(&inside)))
+            .map(|t| t.session.clone())
+            .collect();
+        self.forget_threads(&host, &threads, cx);
     }
 }
 

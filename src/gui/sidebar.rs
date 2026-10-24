@@ -3,7 +3,7 @@
 
 use super::{Ask, Key, Lemur, List, key, rows, worktree_label};
 use crate::actions;
-use crate::config::{Base, COLORS};
+use crate::config::{Base, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
@@ -156,8 +156,8 @@ impl Lemur {
                             .disable(true),
                     ))),
                 ));
-            } else if !h.other.is_empty() {
-                let threads = self.threads(&h.name, None, &h.other, "", cx);
+            } else if !h.other.is_empty() || !h.gone.is_empty() {
+                let threads = self.threads(&h.name, None, &h.other, &h.gone, "", cx);
                 groups.push(
                     rows::Group::new(
                         "other",
@@ -298,18 +298,19 @@ impl Lemur {
             suffix: Rc::new(move |window, cx| add(window, cx).into_any_element()),
             menu,
             color,
-            threads: self.threads(host, Some(&w.path), &w.sessions, prefix, cx),
+            threads: self.threads(host, Some(&w.path), &w.sessions, &w.gone, prefix, cx),
             folded,
             toggle,
         }
     }
 
-    /// Threads that can be dragged into a new order.
+    /// Threads that can be dragged into a new order, then those `gone`.
     fn threads(
         &self,
         host: &str,
         worktree: Option<&str>,
         sessions: &[Session],
+        gone: &[ClaudeThread],
         prefix: &str,
         cx: &mut Context<Self>,
     ) -> rows::Threads {
@@ -321,6 +322,7 @@ impl Lemur {
                 .iter()
                 .map(|s| self.session_item(host, s, prefix, cx))
                 .collect(),
+            gone: gone.iter().map(|t| gone_item(t, prefix, cx)).collect(),
             reorder: Rc::new(move |from, to, _, cx| {
                 this.update(cx, |this, cx| this.reorder(list.clone(), from, to, cx))
                     .ok();
@@ -427,12 +429,24 @@ impl Lemur {
         }
     }
 
-    /// A project's menu: removing it.
+    /// A project's menu: resuming its gone threads, and removing it.
     fn project_menu(&self, index: usize, cx: &mut Context<Self>) -> rows::MenuBuilder {
         let this = cx.entity().downgrade();
         let project = self.cfg.bases[index].clone();
+        let gone = self.gone_in(index);
         Rc::new(move |menu, _, _| {
             let (this, project) = (this.clone(), project.clone());
+            let menu = if gone.is_empty() {
+                menu
+            } else {
+                let (this, gone) = (this.clone(), gone.clone());
+                let all = format!("Resume all threads ({})", gone.len());
+                menu.item(PopupMenuItem::new(all).on_click(move |_, _, cx| {
+                    this.update(cx, |this, cx| this.resume(gone.clone(), cx))
+                        .ok();
+                }))
+                .separator()
+            };
             menu.item(
                 PopupMenuItem::new("Remove project…").on_click(move |_, window, cx| {
                     this.update(cx, |this, cx| {
@@ -484,6 +498,55 @@ impl Lemur {
                     .on_click(set(None)),
             )
         }
+    }
+}
+
+/// A thread whose session is gone, dimmed: clicking it or its button
+/// resumes it, and its right-click menu can forget it instead.
+fn gone_item(t: &ClaudeThread, prefix: &str, cx: &mut Context<Lemur>) -> rows::Thread {
+    let this = cx.entity().downgrade();
+    let label = actions::label(t.session.strip_prefix(prefix).unwrap_or(&t.session)).to_string();
+    let resume = {
+        let (this, t) = (this.clone(), t.clone());
+        Rc::new(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            // The button's click would reach the row too.
+            cx.stop_propagation();
+            this.update(cx, |this, cx| this.resume(vec![t.clone()], cx))
+                .ok();
+        })
+    };
+    let menu = {
+        let (t, resume) = (t.clone(), resume.clone());
+        move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+            let (this, t, resume) = (this.clone(), t.clone(), resume.clone());
+            menu.item(PopupMenuItem::new("Resume").on_click(move |e, w, cx| resume(e, w, cx)))
+                .item(PopupMenuItem::new("Forget").on_click(move |_, _, cx| {
+                    let session = std::slice::from_ref(&t.session);
+                    this.update(cx, |this, cx| this.forget_threads(&t.host, session, cx))
+                        .ok();
+                }))
+        }
+    };
+    let suffix = {
+        let resume = resume.clone();
+        move |_: &mut Window, _: &mut App| {
+            let resume = resume.clone();
+            Button::new("resume")
+                .icon(IconName::Play)
+                .ghost()
+                .xsmall()
+                .tooltip("Its session is gone: resume Claude")
+                .on_click(move |e, w, cx| resume(e, w, cx))
+                .into_any_element()
+        }
+    };
+    rows::Thread {
+        icon: claude_icon(),
+        label: label.into(),
+        active: false,
+        on_click: resume,
+        menu: Rc::new(menu),
+        suffix: Rc::new(suffix),
     }
 }
 

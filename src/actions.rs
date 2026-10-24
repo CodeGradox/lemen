@@ -1,5 +1,5 @@
 use crate::attach::Active;
-use crate::config::{Config, Host};
+use crate::config::{ClaudeThread, Config, Host};
 use crate::remote::{Remote, quote, sh_path, target};
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -54,6 +54,37 @@ pub fn random_name(taken: impl Fn(&str) -> bool) -> String {
         }
     }
     name
+}
+
+/// A random version 4 UUID, as Claude Code's `--session-id` takes one.
+pub fn random_uuid() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    // A fresh RandomState hashes nothing into a random u64.
+    let random = || {
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    };
+    let high = (random() & !0xf000) | 0x4000;
+    let low = (random() & !(0b11 << 62)) | (0b10 << 62);
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        high >> 32,
+        (high >> 16) & 0xffff,
+        high & 0xffff,
+        low >> 48,
+        low & 0xffff_ffff_ffff
+    )
+}
+
+/// Whether `s` is a UUID like `random_uuid`'s, in lowercase hex: all a
+/// Claude session ID that lemur types into a shell may be.
+pub fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => matches!(c, '0'..='9' | 'a'..='f'),
+        })
 }
 
 /// Separates a thread's label from the random words that keep its tmux name
@@ -138,11 +169,20 @@ fn parse_branches(out: &str) -> Vec<String> {
         .collect()
 }
 
+/// A thread just started: its host and session, and for Claude, what
+/// resumes it.
+#[derive(Debug)]
+pub struct Started {
+    pub host: String,
+    pub session: String,
+    pub claude: Option<ClaudeThread>,
+}
+
 /// Starts Claude in a new worktree `name` of `base`, in a session for
 /// thread `thread`. The worktree checks out a new `branch`, or with none
 /// its start, detached. It starts from `from`, or the default branch; a
-/// remote's branch is fetched first. Returns (host, session), and a note
-/// if that fetch failed and the worktree starts where it was last fetched.
+/// remote's branch is fetched first. Returns the thread, and a note if
+/// that fetch failed and the worktree starts where it was last fetched.
 pub fn new_worktree_thread(
     cfg: &Config,
     base: usize,
@@ -150,7 +190,7 @@ pub fn new_worktree_thread(
     thread: &str,
     branch: Option<&str>,
     from: Option<&str>,
-) -> Result<((String, String), Option<String>)> {
+) -> Result<(Started, Option<String>)> {
     validate_name(name)?;
     if let Some(branch) = branch {
         validate_branch(branch)?;
@@ -161,12 +201,13 @@ pub fn new_worktree_thread(
         Some(branch) => format!("--no-track -b {}", quote(branch)),
         None => "--detach".to_string(),
     };
-    let started = start_session(cfg, base, thread, |host, tmux, session| {
+    let id = random_uuid();
+    let started = start_session(cfg, base, thread, Some(&id), |host, tmux, session| {
         let (repo, wt, s) = (sh_path(&b.path), sh_path(&b.worktree_dir), quote(session));
         format!(
             "cd {repo}\nmkdir -p {wt}\ngit worktree add -q {checkout} {wt}/{name} {}\ndir=\"$(cd {wt}/{name} && pwd -P)\"\n{tmux} new-session -d -s {s} -c \"$dir\"\n{}",
             quote(&from),
-            launch(tmux, session, &host.claude),
+            launch(tmux, session, &format!("{} --session-id {id}", host.claude)),
         )
     })?;
     let note = (!fetched)
@@ -201,19 +242,19 @@ printf '%s\n%s\n' "$from" "$fetched"
 }
 
 /// Starts Claude, or with `shell` just a shell, in an existing worktree, in
-/// a session for thread `thread`. Returns (host, session).
+/// a session for thread `thread`.
 pub fn new_thread_in(
     cfg: &Config,
     base: usize,
     worktree: &str,
     thread: &str,
     shell: bool,
-) -> Result<(String, String)> {
-    start_session(cfg, base, thread, |host, tmux, session| {
-        let start = if shell {
-            tag(tmux, session, "shell")
-        } else {
-            launch(tmux, session, &host.claude)
+) -> Result<Started> {
+    let id = (!shell).then(random_uuid);
+    start_session(cfg, base, thread, id.as_deref(), |host, tmux, session| {
+        let start = match &id {
+            None => tag(tmux, session, "shell"),
+            Some(id) => launch(tmux, session, &format!("{} --session-id {id}", host.claude)),
         };
         format!(
             "dir={}\n{tmux} new-session -d -s {} -c \"$dir\"\n{start}",
@@ -224,26 +265,60 @@ pub fn new_thread_in(
 }
 
 /// Creates the session for thread `thread` of `base`. `body` gets the host,
-/// the tmux command and the session name, and must run `new-session`.
-/// Returns (host, session).
+/// the tmux command and the session name, and must run `new-session` in
+/// `$dir`. With `claude`, the Claude session ID it starts with, the thread
+/// comes back with what resumes it.
 fn start_session(
     cfg: &Config,
     base: usize,
     thread: &str,
+    claude: Option<&str>,
     body: impl FnOnce(&Host, &str, &str) -> String,
-) -> Result<(String, String)> {
+) -> Result<Started> {
     validate_name(thread)?;
     let b = &cfg.bases[base];
     let host = cfg.host_or_err(&b.host)?;
     let r = Remote::new(host);
     let tmux = r.tmux();
     let session = b.session_name(thread);
-    r.run(&format!(
-        "set -e\n{}\n{}\n",
+    let out = r.run(&format!(
+        "set -e\n{}\n{}\nprintf '%s\\n' \"$dir\"\n",
         refuse_existing(&tmux, &session),
         body(host, &tmux, &session)
     ))?;
-    Ok((host.name.clone(), session))
+    let dir = out.lines().last().unwrap_or_default().to_string();
+    Ok(Started {
+        host: host.name.clone(),
+        session: session.clone(),
+        claude: claude.map(|id| ClaudeThread {
+            host: host.name.clone(),
+            session,
+            path: dir,
+            claude_session: id.to_string(),
+        }),
+    })
+}
+
+/// Starts a thread's session again, once it's gone, as after its host
+/// restarted, and resumes its Claude conversation in it.
+pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<()> {
+    if !is_uuid(&thread.claude_session) {
+        bail!("{} isn't a Claude session ID", thread.claude_session);
+    }
+    let host = cfg.host_or_err(&thread.host)?;
+    let r = Remote::new(host);
+    let tmux = r.tmux();
+    let session = &thread.session;
+    let resume = format!("{} --resume {}", host.claude, thread.claude_session);
+    r.run(&format!(
+        "set -e\n{}\ndir={}\nif [ ! -d \"$dir\" ]; then echo {} >&2; exit 1; fi\n{tmux} new-session -d -s {} -c \"$dir\"\n{}\n",
+        refuse_existing(&tmux, session),
+        quote(&thread.path),
+        quote(&format!("{} is gone", thread.path)),
+        quote(session),
+        launch(&tmux, session, &resume),
+    ))?;
+    Ok(())
 }
 
 fn refuse_existing(tmux: &str, session: &str) -> String {
@@ -781,10 +856,17 @@ mod tests {
         let worktree = |name: &str| repo.join(".claude/worktrees").join(name);
         let subject = |name: &str| git_out(&worktree(name), &["log", "-1", "--format=%s"]);
 
-        let ((_, session), note) =
+        let (started, note) =
             new_worktree_thread(&cfg, 0, "feat", "feat--a", Some("feature/x"), None).unwrap();
         assert_eq!(note, None);
-        assert!(session.ends_with("feat--a"), "{session}");
+        assert!(started.session.ends_with("feat--a"), "{}", started.session);
+        // Claude resumes in the worktree it starts in.
+        let claude = started.claude.expect("a Claude thread");
+        assert_eq!(claude.session, started.session);
+        assert_eq!(
+            claude.path,
+            worktree("feat").canonicalize().unwrap().to_string_lossy()
+        );
         assert_eq!(
             git_out(&worktree("feat"), &["branch", "--show-current"]),
             "feature/x"
@@ -814,6 +896,94 @@ mod tests {
         assert_eq!(subject("offline"), "two");
 
         assert!(new_worktree_thread(&cfg, 0, "bad", "bad--a", Some("a b"), None).is_err());
+    }
+
+    /// A Claude thread starts with a session ID of lemur's, and comes back
+    /// with what resumes it; once its session is gone, resuming starts it
+    /// again in its folder, with that conversation.
+    #[test]
+    fn claude_threads_start_with_an_id_and_resume_with_it() {
+        let server = TmuxServer::new("resume");
+        let (dir, mut cfg) = cloned("resume", &server);
+        // Prints what Claude would get.
+        cfg.hosts[0].claude = "echo claude".into();
+        let typed = |session: &str, text: &str| {
+            wait_until(Duration::from_secs(5), || {
+                server
+                    .tmux(&["capture-pane", "-p", "-t", &format!("={session}:")])
+                    .contains(text)
+            })
+        };
+        let repo = dir.join("repo").canonicalize().unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        let started = new_thread_in(&cfg, 0, &path, "claude--a", false).unwrap();
+        let claude = started.claude.expect("a Claude thread");
+        assert!(is_uuid(&claude.claude_session), "{}", claude.claude_session);
+        assert_eq!(
+            (claude.host.as_str(), claude.path.as_str()),
+            ("local", path.as_str())
+        );
+        let first = format!("claude --session-id {}", claude.claude_session);
+        assert!(typed(&started.session, &first), "{first} never ran");
+        assert!(
+            new_thread_in(&cfg, 0, &path, "shell--a", true)
+                .unwrap()
+                .claude
+                .is_none()
+        );
+
+        // Its session is there: resuming would start a second.
+        assert!(resume_thread(&cfg, &claude).is_err());
+        server.tmux(&["kill-session", "-t", &format!("={}", started.session)]);
+        resume_thread(&cfg, &claude).unwrap();
+        let again = format!("claude --resume {}", claude.claude_session);
+        assert!(typed(&started.session, &again), "{again} never ran");
+        let at = |option: &str| {
+            server.tmux(&[
+                "display",
+                "-p",
+                "-t",
+                &format!("={}:", started.session),
+                option,
+            ])
+        };
+        assert_eq!(at("#{pane_current_path}"), path);
+        assert_eq!(at("#{@lemur_kind}"), "claude");
+
+        // Nothing starts where its folder was, or with an ID that isn't one.
+        let gone = ClaudeThread {
+            session: "repo/gone--a".into(),
+            path: dir.join("deleted").to_string_lossy().into_owned(),
+            ..claude.clone()
+        };
+        let err = resume_thread(&cfg, &gone).unwrap_err();
+        assert!(format!("{err:#}").contains("is gone"), "{err:#}");
+        let odd = ClaudeThread {
+            session: "repo/odd--a".into(),
+            claude_session: "x; rm -rf ~".into(),
+            ..claude
+        };
+        assert!(resume_thread(&cfg, &odd).is_err());
+        let alive = |s: &str| {
+            server
+                .tmux(&["list-sessions", "-F", "#{session_name}"])
+                .lines()
+                .any(|l| l == s)
+        };
+        assert!(alive(&started.session));
+        assert!(!alive("repo/gone--a") && !alive("repo/odd--a"));
+    }
+
+    #[test]
+    fn uuids_are_version_4() {
+        let (a, b) = (random_uuid(), random_uuid());
+        assert!(is_uuid(&a) && is_uuid(&b), "{a} {b}");
+        assert_ne!(a, b);
+        assert_eq!(&a[14..15], "4");
+        assert!(matches!(&a[19..20], "8" | "9" | "a" | "b"), "{a}");
+        assert!(!is_uuid("0FDFABEB-CA80-4916-A103-275BBB5E8614"));
+        assert!(!is_uuid("0fdfabeb-ca80-4916-a103-275bbb5e861"));
+        assert!(is_uuid("0fdfabeb-ca80-4916-a103-275bbb5e8614"));
     }
 
     #[test]

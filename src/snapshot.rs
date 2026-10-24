@@ -1,10 +1,10 @@
 //! One round trip per host: worktrees of every base, all tmux sessions, and
 //! what Claude is doing in each.
 
-use crate::config::{Config, Host};
+use crate::config::{ClaudeThread, Config, Host};
 use crate::remote::{Remote, quote, sh_path};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -19,6 +19,16 @@ impl Snapshot {
             .filter(move |h| h.name == host)
             .flat_map(|h| h.bases.iter().flat_map(|b| b.worktrees.iter()))
     }
+
+    /// Drops the gone threads `keep` turns down.
+    pub fn retain_gone(&mut self, keep: impl Fn(&ClaudeThread) -> bool) {
+        for h in &mut self.hosts {
+            h.gone.retain(&keep);
+            for w in h.bases.iter_mut().flat_map(|b| b.worktrees.iter_mut()) {
+                w.gone.retain(&keep);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +38,9 @@ pub struct HostView {
     pub bases: Vec<BaseView>,
     /// Sessions that don't belong to any base's worktrees.
     pub other: Vec<Session>,
+    /// Threads kept to resume whose session is gone, outside every base's
+    /// worktrees.
+    pub gone: Vec<ClaudeThread>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +65,9 @@ pub struct Worktree {
     /// folder: the project itself rather than a linked worktree.
     pub main: bool,
     pub sessions: Vec<Session>,
+    /// Threads kept to resume whose session is gone, as after the host
+    /// restarted.
+    pub gone: Vec<ClaudeThread>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +85,16 @@ pub struct Session {
     pub started_claude: bool,
     /// Its place in its worktree once threads were dragged into an order.
     pub order: Option<u32>,
+    /// The Claude conversation running in it, as `claude agents` reports.
+    pub claude: Option<ClaudeRun>,
+}
+
+/// A Claude conversation running in a session: its ID, and the folder it
+/// runs in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaudeRun {
+    pub id: String,
+    pub path: String,
 }
 
 impl Session {
@@ -152,6 +178,7 @@ fn fetch_host(cfg: &Config, host: &Host) -> HostView {
             error: Some(format!("{e:#}")),
             bases: vec![],
             other: vec![],
+            gone: vec![],
         },
     }
 }
@@ -253,13 +280,15 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
     // doesn't list has no Claude, whatever a hook last recorded.
     if let Some(claude) = claude_activity(&agents, &panes, &parents) {
         for s in &mut sessions {
-            (s.activity, s.waiting_for) = claude
-                .get(&s.name)
-                .cloned()
-                .unwrap_or((Activity::Unknown, None));
+            let found = claude.get(&s.name);
+            (s.activity, s.waiting_for) = found.map_or((Activity::Unknown, None), |f| {
+                (f.activity, f.waiting_for.clone())
+            });
+            s.claude = found.and_then(|f| f.run.clone()).map(|(_, run)| run);
         }
     }
 
+    let live: HashSet<String> = sessions.iter().map(|s| s.name.clone()).collect();
     let mut other = vec![];
     for s in sessions {
         match find_worktree(&bases, &s.path) {
@@ -271,11 +300,24 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
         sort(&mut w.sessions);
     }
     sort(&mut other);
+    // Threads kept to resume whose session is gone go where they ran.
+    let mut gone = vec![];
+    for t in cfg
+        .threads
+        .iter()
+        .filter(|t| t.host == host.name && !live.contains(&t.session))
+    {
+        match find_worktree(&bases, &t.path) {
+            Some((bi, wi)) => bases[bi].worktrees[wi].gone.push(t.clone()),
+            None => gone.push(t.clone()),
+        }
+    }
     HostView {
         name: host.name.clone(),
         error: None,
         bases,
         other,
+        gone,
     }
 }
 
@@ -298,6 +340,7 @@ fn parse_worktree_line(base: &mut BaseView, line: &str) {
             head: None,
             main: true,
             sessions: vec![],
+            gone: vec![],
         });
     } else if let Some(p) = line.strip_prefix("worktree ") {
         let main = base.worktrees.is_empty();
@@ -307,6 +350,7 @@ fn parse_worktree_line(base: &mut BaseView, line: &str) {
             head: None,
             main,
             sessions: vec![],
+            gone: vec![],
         });
     } else if let Some(h) = line.strip_prefix("HEAD ")
         && let Some(w) = base.worktrees.last_mut()
@@ -340,6 +384,7 @@ fn parse_session(line: &str, now: u64) -> Option<Session> {
         waiting_for: None,
         started_claude: f[6] == "claude",
         order: f[7].parse().or_else(|_| f[8].parse()).ok(),
+        claude: None,
     })
 }
 
@@ -350,6 +395,20 @@ struct Agent {
     status: Option<String>,
     #[serde(rename = "waitingFor")]
     waiting_for: Option<serde_json::Value>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    cwd: Option<String>,
+    #[serde(rename = "startedAt")]
+    started_at: Option<u64>,
+}
+
+/// What `claude agents` says of the Claudes in one tmux session.
+struct InSession {
+    /// The most pressing one's activity, and what it waits on.
+    activity: Activity,
+    waiting_for: Option<String>,
+    /// The newest one's conversation, and when it started.
+    run: Option<(u64, ClaudeRun)>,
 }
 
 /// Maps `claude agents --json` output to tmux sessions: each interactive
@@ -358,10 +417,10 @@ fn claude_activity(
     agents: &str,
     panes: &HashMap<u32, String>,
     parents: &HashMap<u32, u32>,
-) -> Option<HashMap<String, (Activity, Option<String>)>> {
+) -> Option<HashMap<String, InSession>> {
     // No answer means an older Claude Code, or none: hooks report instead.
     let agents: Vec<Agent> = serde_json::from_str(agents.trim()).ok()?;
-    let mut found: HashMap<String, (Activity, Option<String>)> = HashMap::new();
+    let mut found: HashMap<String, InSession> = HashMap::new();
     for agent in agents {
         let (Some("interactive"), Some(pid)) = (agent.kind.as_deref(), agent.pid) else {
             continue;
@@ -376,14 +435,25 @@ fn claude_activity(
             serde_json::Value::String(s) => s,
             other => other.to_string(),
         });
+        let run = match (agent.session_id, agent.cwd) {
+            (Some(id), Some(path)) => Some((agent.started_at.unwrap_or(0), ClaudeRun { id, path })),
+            _ => None,
+        };
         let mut p = pid;
         for _ in 0..32 {
             if let Some(session) = panes.get(&p) {
-                let entry = found
-                    .entry(session.clone())
-                    .or_insert((Activity::Unknown, None));
-                if activity > entry.0 {
-                    *entry = (activity, waiting_for);
+                let entry = found.entry(session.clone()).or_insert(InSession {
+                    activity: Activity::Unknown,
+                    waiting_for: None,
+                    run: None,
+                });
+                if activity > entry.activity {
+                    (entry.activity, entry.waiting_for) = (activity, waiting_for);
+                }
+                if let Some(run) = run
+                    && entry.run.as_ref().is_none_or(|(at, _)| run.0 >= *at)
+                {
+                    entry.run = Some(run);
                 }
                 break;
             }
@@ -516,6 +586,59 @@ mod tests {
         assert!(wts[1].sessions[0].runs_claude());
         assert!(tests.runs_claude());
         assert!(!h.other[0].runs_claude());
+    }
+
+    /// Each session learns its Claude's conversation, the newest one's if
+    /// it has several; kept threads whose session is gone are filed where
+    /// they ran.
+    #[test]
+    fn claude_conversations_and_gone_threads() {
+        let mut cfg = cfg();
+        let thread = |session: &str, path: &str| ClaudeThread {
+            host: "agent".into(),
+            session: session.into(),
+            path: path.into(),
+            claude_session: "0fdfabeb-ca80-4916-a103-275bbb5e8614".into(),
+        };
+        let auth = "/home/agent/projects/api/.claude/worktrees/auth";
+        cfg.threads = vec![
+            thread("api/tests", "/home/agent/projects/api"),
+            thread("api/review--calm-heron", auth),
+            thread("scratch--bold-wren", "/tmp/x"),
+            ClaudeThread {
+                host: "other".into(),
+                ..thread("elsewhere", "/tmp")
+            },
+        ];
+        let out = format!(
+            "@@base 0\nworktree /home/agent/projects/api\nworktree {auth}\n\
+            @@now\n1000\n@@tmux\n\
+            api/tests|::|/home/agent/projects/api|::|0|::|400|::||::||::||::||::|\n\
+            @@panes\napi/tests|::|100\n@@ps\n 100     1\n 200   100\n 300   100\n\
+            @@agents\n[\n\
+              {{\"kind\":\"interactive\",\"pid\":200,\"status\":\"busy\",\"sessionId\":\"old\",\"cwd\":\"/a\",\"startedAt\":5}},\n\
+              {{\"kind\":\"interactive\",\"pid\":300,\"status\":\"idle\",\"sessionId\":\"new\",\"cwd\":\"/b\",\"startedAt\":9}}\n\
+            ]\n"
+        );
+        let h = parse(&cfg, &cfg.hosts[0], &out);
+        let tests = &h.bases[0].worktrees[0].sessions[0];
+        assert_eq!(tests.activity, Activity::Working);
+        assert_eq!(
+            tests.claude,
+            Some(ClaudeRun {
+                id: "new".into(),
+                path: "/b".into()
+            })
+        );
+        let gone = |list: &[ClaudeThread]| -> Vec<String> {
+            list.iter().map(|t| t.session.clone()).collect()
+        };
+        assert!(h.bases[0].worktrees[0].gone.is_empty(), "api/tests runs");
+        assert_eq!(
+            gone(&h.bases[0].worktrees[1].gone),
+            ["api/review--calm-heron"]
+        );
+        assert_eq!(gone(&h.gone), ["scratch--bold-wren"]);
     }
 
     #[test]

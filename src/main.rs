@@ -102,7 +102,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("unknown base {base}"))?;
             actions::validate_name(&name)?;
             let thread = actions::unique_thread(&name, |_| false);
-            let (host, session) = match worktree {
+            let started = match worktree {
                 Some(w) => actions::new_thread_in(&cfg, b, &w, &thread, shell)?,
                 None => {
                     let (started, note) = actions::new_worktree_thread(
@@ -119,7 +119,11 @@ fn main() -> Result<()> {
                     started
                 }
             };
-            println!("started {session} on {host}");
+            // Kept, so it can be resumed once its session is gone.
+            if let Some(claude) = &started.claude {
+                Config::save_thread(&Config::path()?, claude)?;
+            }
+            println!("started {} on {}", started.session, started.host);
             Ok(())
         }
         Cmd::Attach { host, session } => {
@@ -132,6 +136,20 @@ fn main() -> Result<()> {
             name,
         } => {
             let new = actions::rename_session(&cfg, &host, &session, &name)?;
+            // The thread kept to resume follows.
+            if let Some(thread) = cfg
+                .threads
+                .iter()
+                .find(|t| t.host == host && t.session == session)
+            {
+                let path = Config::path()?;
+                Config::remove_threads(&path, &host, std::slice::from_ref(&session))?;
+                let renamed = config::ClaudeThread {
+                    session: new.clone(),
+                    ..thread.clone()
+                };
+                Config::save_thread(&path, &renamed)?;
+            }
             println!("renamed {session} to {new}");
             Ok(())
         }
